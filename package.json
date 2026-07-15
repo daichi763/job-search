@@ -9,7 +9,9 @@
     "cf-typegen": "wrangler types --env-interface CloudflareBindings"
   },
   "dependencies": {
-    "hono": "^4.12.30"
+    "hono": "^4.12.30",
+    "js-yaml": "^5.2.1",
+    "openai": "^6.47.0"
   },
   "devDependencies": {
     "@hono/vite-build": "^1.11.1",

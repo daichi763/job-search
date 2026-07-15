@@ -1,0 +1,15 @@
+{
+  "name": "job-scraper-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "①circusAGENT ②ヒトリンク ③ジョビンズ をスクレイピングし、Cloudflare側へ求人を払い出す外部ワーカー(手元PC/VPS用)",
+  "scripts": {
+    "postinstall": "playwright install chromium",
+    "start": "node index.js",
+    "start:once": "node index.js --once"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0",
+    "dotenv": "^16.4.5"
+  }
+}
