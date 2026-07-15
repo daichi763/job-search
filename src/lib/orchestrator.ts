@@ -247,18 +247,23 @@ async function runKintoneWorker(
   }
 }
 
-// スクレイピング系DB担当（フェーズ2で外部ワーカーサーバーが担当）
-// 現状は「未接続」状態を可視化するプレースホルダー
-async function runPlaceholderWorker(
+// スクレイピング系DB担当（手元PC/VPSの外部ワーカーが担当）
+// phase='skipped' は「外部ワーカーの取り込み待ち」を表す。
+// 外部ワーカーが /api/ingest/pending でこのジョブを拾い、
+// /api/ingest/state で phase を更新していく。
+async function runExternalWorkerQueued(
   env: Env,
   searchJobId: string,
   source: SourceId
 ): Promise<void> {
   await updateWorkerState(env.DB, searchJobId, source, {
     phase: 'skipped',
-    message: 'フェーズ2で接続予定(外部ワーカー未稼働)',
+    message: '担当を割り当て中（外部ワーカーの応答待ち）…',
   })
 }
+
+// 外部ワーカーが担当するソース
+const EXTERNAL_SOURCES: SourceId[] = ['circus', 'hitolink', 'jobins']
 
 // メインオーケストレーション
 export async function runSearch(
@@ -278,26 +283,70 @@ export async function runSearch(
   }
 
   // 並列でワーカー起動
+  const hasExternal = criteria.sources.some((s) => EXTERNAL_SOURCES.includes(s))
   for (const src of criteria.sources) {
     if (src === 'kintone') {
       workers.push(runKintoneWorker(env, searchJobId, criteria, cHash))
     } else {
-      workers.push(runPlaceholderWorker(env, searchJobId, src))
+      // 外部ワーカー(手元PC/VPS)の取り込み待ちキューに入れる
+      workers.push(runExternalWorkerQueued(env, searchJobId, src))
     }
   }
 
   await Promise.allSettled(workers)
 
-  // 集計してジョブ完了
-  const totals: any = await env.DB.prepare(
-    `SELECT COALESCE(SUM(scanned),0) as scanned, COALESCE(SUM(matched),0) as matched FROM worker_states WHERE search_job_id=?`
-  )
+  // 集計（現時点の途中経過）
+  await refreshSearchTotals(env.DB, searchJobId)
+
+  // 外部ソースが無い（内部処理のみ）ならここで完了。
+  // 外部ソースがある場合はジョブを running のまま維持し、
+  // 外部ワーカーの完了報告(/api/ingest/state phase=done)で完了させる。
+  if (!hasExternal) {
+    await env.DB.prepare(
+      `UPDATE search_jobs SET status='done', finished_at=datetime('now') WHERE id=?`
+    )
+      .bind(searchJobId)
+      .run()
+  }
+}
+
+// worker_states を集計して search_jobs の合計を更新する
+export async function refreshSearchTotals(db: D1, searchJobId: string): Promise<void> {
+  const totals: any = await db
+    .prepare(
+      `SELECT COALESCE(SUM(scanned),0) as scanned, COALESCE(SUM(matched),0) as matched FROM worker_states WHERE search_job_id=?`
+    )
     .bind(searchJobId)
     .first()
-
-  await env.DB.prepare(
-    `UPDATE search_jobs SET status='done', finished_at=datetime('now'), total_scanned=?, total_matched=? WHERE id=?`
-  )
+  await db
+    .prepare(`UPDATE search_jobs SET total_scanned=?, total_matched=? WHERE id=?`)
     .bind(totals?.scanned ?? 0, totals?.matched ?? 0, searchJobId)
     .run()
+}
+
+// 全ソースがdone/errorに達していれば search_jobs を完了させる
+export async function maybeCompleteSearch(db: D1, searchJobId: string): Promise<boolean> {
+  const job: any = await db
+    .prepare(`SELECT criteria_json, status FROM search_jobs WHERE id=?`)
+    .bind(searchJobId)
+    .first()
+  if (!job || job.status === 'done') return job?.status === 'done'
+  const criteria = JSON.parse(job.criteria_json) as SearchCriteria
+  const states: any = await db
+    .prepare(`SELECT source, phase FROM worker_states WHERE search_job_id=?`)
+    .bind(searchJobId)
+    .all()
+  const rows = states.results || []
+  const done = criteria.sources.every((src) => {
+    const st = rows.find((r: any) => r.source === src)
+    return st && (st.phase === 'done' || st.phase === 'error')
+  })
+  if (done) {
+    await refreshSearchTotals(db, searchJobId)
+    await db
+      .prepare(`UPDATE search_jobs SET status='done', finished_at=datetime('now') WHERE id=?`)
+      .bind(searchJobId)
+      .run()
+  }
+  return done
 }

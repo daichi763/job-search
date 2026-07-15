@@ -31,3 +31,7 @@ lerna-debug.log*
 
 # misc
 .DS_Store
+
+# Worker investigation/probe scripts (temporary)
+worker/probe_*.js
+worker/inspect.js

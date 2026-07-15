@@ -15,7 +15,10 @@
 //   npm start              # 常駐ポーリング  /  npm run start:once で1回だけ
 // ============================================================
 
-import 'dotenv/config'
+import dotenv from 'dotenv'
+// override:true → シェルに既存の同名環境変数があっても .env の値を優先する
+// （サンドボックスには無効な OPENAI_API_KEY が設定済みのことがあるため必須）
+dotenv.config({ override: true })
 import { chromium } from 'playwright'
 import { ADAPTERS } from './adapters.js'
 import { mechanicalFilter } from './filter.js'
@@ -89,6 +92,8 @@ async function processSource(browser, source, searchJobId, criteria) {
 
     await reportState(searchJobId, source, { phase: 'filtering', scanned, totalInDb: scanned, message: `${scanned}件を絞り込み中…` })
     const filtered = mechanicalFilter(collected, criteria)
+    console.log(`[${source}] 取得${collected.length}件 → フィルタ通過${filtered.length}件`)
+    if (filtered.length) console.log(`[${source}] preScore上位:`, filtered.slice(0, 5).map((f) => `${f.preScore}(${(f.job.locations || []).join(',')})`).join(' '))
     await reportState(searchJobId, source, { phase: 'scoring', candidates: filtered.length, message: 'AIで採点中…' })
 
     const useAI = (criteria.freeText || '').trim().length > 0
@@ -109,6 +114,7 @@ async function processSource(browser, source, searchJobId, criteria) {
         const scored = results
           .map((r) => ({ job: batch[r.index], score: r.score, reason: r.reason }))
           .sort((a, b) => b.score - a.score)
+        console.log(`[${source}] AIスコア:`, scored.map((s) => s.score).join(','))
         for (const s of scored) {
           if (s.score >= THRESHOLD) {
             await pushResult(searchJobId, s.job, s.score, s.reason)
@@ -120,7 +126,8 @@ async function processSource(browser, source, searchJobId, criteria) {
     }
 
     await reportState(searchJobId, source, {
-      phase: 'done', matched, tokensUsed: tokens, totalInDb: scanned,
+      phase: 'done', matched, tokensUsed: tokens, totalInDb: scanned, scanned,
+      candidates: filtered.length,
       message: `完了: ${matched}件を提案 (消費トークン約${tokens})`,
     })
   } catch (e) {

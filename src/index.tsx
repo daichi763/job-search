@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import type { Env } from './lib/orchestrator'
-import { runSearch } from './lib/orchestrator'
+import { runSearch, maybeCompleteSearch, refreshSearchTotals } from './lib/orchestrator'
 import { fetchKintoneCount } from './lib/kintone'
 import type { SearchCriteria, SourceId } from './lib/types'
 import { SOURCE_LABELS } from './lib/types'
@@ -219,6 +219,12 @@ app.post('/api/ingest/state', async (c) => {
       body.tokensUsed || 0, body.totalInDb || 0
     )
     .run()
+
+  // 途中経過の合計を更新。完了報告なら全ソース完了かチェックしてジョブ完了。
+  await refreshSearchTotals(c.env.DB, body.searchJobId)
+  if (body.phase === 'done' || body.phase === 'error') {
+    await maybeCompleteSearch(c.env.DB, body.searchJobId)
+  }
   return c.json({ ok: true })
 })
 
@@ -238,6 +244,7 @@ app.post('/api/ingest/result', async (c) => {
   )
     .bind(searchJobId, job.source, job.sourceJobId, score || 0, reason || '', JSON.stringify(job))
     .run()
+  await refreshSearchTotals(c.env.DB, searchJobId)
   return c.json({ ok: true })
 })
 
