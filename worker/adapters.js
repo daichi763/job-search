@@ -103,6 +103,44 @@ export const CIRCUS_LOGIC = {
   AND: 'and', OR: 'or', NOT_AND: 'excludeAnd', NOT_OR: 'excludeOr',
 }
 
+// 機能A: 「さらに詳しい条件」画面の操作対象マップ（Playwrightで実測確定）。
+// チェックボックスはラベル完全一致テキストでクリック、select/inputはname属性で操作する。
+export const CIRCUS_COND = {
+  // select[name] で選択（値はラベル文字列）
+  selects: {
+    gender: { name: 'requiredGenders', options: ['男性', '女性'] },
+    education: { name: 'education', options: ['高卒', '専門卒', '短大卒', '大卒', '大学院卒', '学歴不問'] },
+    overtime: { name: 'averageOvertimes', options: ['残業なし', '10時間以下', '20時間以下', '30時間以下', '40時間以下', '50時間以下'] },
+  },
+  // input[name] に文字入力（数値）
+  inputs: {
+    age: 'age',
+    salaryInclude: 'annualSalary.include',
+    salaryMin: 'annualSalary.min',
+    salaryMax: 'annualSalary.max',
+  },
+  // チェックボックス（ラベル完全一致でクリック）。カテゴリごとに整理。
+  checkboxes: {
+    employment: ['正社員', '契約社員', 'アルバイト', '業務委託'],
+    position: ['新卒採用', '中途採用'],
+    rank: ['経営陣', '事業責任者', '管理職（課長・部長）', 'リーダー', 'メンバー'],
+    background: ['欠員募集', '増員募集', '新規部署立ち上げ', '更なる組織強化', '組織・事業立て直し', 'IPOに向けて'],
+    companyPhase: ['中小', 'ベンチャー', 'メガベンチャー', '大手'],
+    listing: ['上場企業', '非上場企業'],
+    employeeCount: ['10名未満', '10 ~ 30名', '31 ~ 50名', '51 ~ 100名', '101 ~ 300名', '301 ~ 500名', '501 ~ 1000名', '1001 ~ 5000名', '5001名以上'],
+    businessService: ['C向けサービス', 'B向けサービス', '10億円以上の資金調達をしている', '3年以内に上場を目指している', '過去3年以内にM&Aをした', '過去3年以内に上場をした', '新規事業開発（事業多角化）に意欲的'],
+    salaryReward: ['インセンティブ制度あり', '賞与あり', 'ストックオプションあり'],
+    holiday: ['土日祝休み', '土日休み', '週休2日（土日以外）', 'シフト制', 'その他'],
+    workEnv: ['年間休日120日以上', 'フレックス勤務', '時短勤務あり', '副業OK', 'リモートワークOK', '転勤なし'],
+    benefits: ['社会保険完備', '交通費支給', '住宅手当', '社宅・寮', '健康診断', '家族手当', '役職手当', '資格手当', '退職金制度', '資格取得制度', '持株会制度', '社員割引制度'],
+    workStyle: ['客先常駐勤務', '自社内勤務'],
+    coworkers: ['20代が多い', '30代が多い', '40代が多い', '男性が多い', '女性が多い'],
+    culture: ['競争環境（個人主義・一気通貫型）', '協業環境（全体主義・プロジェクト型）', '論理的な人が多い（ロジカルタイプ）', '行動的な人が多い（パッションタイプ）'],
+    // 応募資格系の絞り込みチェック（画面上部）
+    experience: ['職種未経験OK', '職種未経験NG', '業種未経験OK', '業種未経験NG', '外国籍OK'],
+  },
+}
+
 export const circusAdapter = {
   source: 'circus',
   base: 'https://circus-job.com',
@@ -200,8 +238,16 @@ export const circusAdapter = {
 
   // 検索結果の総件数を読み取る（「28,817件」等）。取得できなければ null。
   async readTotalCount(page) {
+    // 総件数は「検索結果一覧」直後の数字。DOMは
+    //   検索結果一覧<div>{N}</div>件 (1-25件目を表示)
+    // という構造。innerText では「検索結果一覧\n{N}\n件 (1-25件目を表示)」。
+    // 「詳しい条件」パネルを開くと本文に "3件以上" 等のラベルが混ざるため、
+    // 単純な /([\d,]+)\s*件/ では誤検知する。必ず「検索結果一覧」を起点に読む。
     const body = await page.innerText('body').catch(() => '')
-    const m = body.match(/([\d,]+)\s*\n?\s*件/)
+    // パターン1: 検索結果一覧 <数字> 件 (1-25件目を表示)
+    let m = body.match(/検索結果一覧\s*([\d,]+)\s*件/)
+    // パターン2: <数字>件 (X-Y件目を表示) — 一覧見出しが取れない場合の保険
+    if (!m) m = body.match(/([\d,]+)\s*件\s*\(\s*\d+\s*[-–]\s*\d+\s*件目を表示/)
     if (!m) return null
     const n = parseInt(m[1].replace(/,/g, ''), 10)
     return Number.isFinite(n) ? n : null
@@ -550,6 +596,219 @@ export const circusAdapter = {
         holiday: (pick('休日休暇') || '').slice(0, 500),
         business: (pick('事業内容') || '').slice(0, 500),
       },
+    }
+  },
+
+  // ------------------------------------------------------------
+  // 機能A: AIが組み立てた検索プランをUI操作で適用して件数を取得する。
+  //
+  // 「詳しい条件」の絞り込み(年齢/性別/学歴/年収/雇用形態/残業/各種チェック)は
+  // URLに載らずJS state管理のため、Playwrightでフォーム操作→検索ボタン押下が必須。
+  //
+  // plan の形（全て任意。指定された項目だけ設定する）:
+  // {
+  //   keyword: '営業',               // キーワード（qJson[1].keyword=OR に入れる）
+  //   keywordField: 8,               // 検索対象フィールド option番号（既定8=全文）
+  //   age: 30,                       // 求職者の年齢
+  //   gender: '男性',                // requiredGenders
+  //   education: '大卒',             // education
+  //   salaryMin: 400,                // annualSalary.min（万円）
+  //   salaryMax: 800,
+  //   overtime: '30時間以下',        // averageOvertimes
+  //   checks: { employment:['正社員'], workEnv:['リモートワークOK'], ... }, // チェック群
+  // }
+  // 戻り値: { total, appliedUrl }  total=絞り込み後の総件数
+  // ------------------------------------------------------------
+  // React制御コンポーネント(input/select)へ、ネイティブsetter+input/changeイベントで
+  // 値を確実に反映する。page.fill だけでは React state に伝わらず、絞り込み件数
+  // プレビューが更新されないケースがあるため。
+  async _setReactValue(page, selector, value) {
+    return await page.evaluate(({ sel, val }) => {
+      const el = document.querySelector(sel)
+      if (!el) return false
+      const proto = el.tagName === 'SELECT'
+        ? window.HTMLSelectElement.prototype
+        : window.HTMLInputElement.prototype
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value')
+      if (desc && desc.set) desc.set.call(el, String(val))
+      else el.value = String(val)
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+      el.dispatchEvent(new Event('change', { bubbles: true }))
+      el.dispatchEvent(new Event('blur', { bubbles: true }))
+      return true
+    }, { sel: selector, val: value }).catch(() => false)
+  },
+
+  async applyConditions(page, plan = {}) {
+    const field = plan.keywordField || parseInt(process.env.CIRCUS_SEARCH_OPTION || '8', 10)
+    // まずキーワードだけURLで投入した状態から開始（qJsonにキーワードを載せておく）
+    const baseUrl = this.buildSearchUrl(
+      { keyword: plan.keyword || '', freeText: '' },
+      1
+    ).replace(/"option":\d+/g, `"option":${field}`)
+    await page.goto(baseUrl, { waitUntil: 'networkidle', timeout: 60000 })
+    await page.waitForTimeout(2500)
+
+    // 「さらに詳しい条件で検索する」を開く。開くと select[name=education] 等が
+    // DOMに現れるので、その出現を明示的に待つ（クリックの不安定さ対策）。
+    const alreadyOpen = await page.$('select[name="education"]')
+    if (!alreadyOpen) {
+      const openBtn = page.getByText('さらに詳しい条件').first()
+      if (await openBtn.count()) {
+        await openBtn.click().catch(() => {})
+      }
+      // education select が出るまで最大10秒待つ
+      await page.waitForSelector('select[name="education"]', { timeout: 10000 }).catch(() => {})
+      await page.waitForTimeout(1000)
+    }
+
+    // --- select群（性別・学歴・残業）: React setter で確実に ---
+    if (plan.gender && CIRCUS_COND.selects.gender.options.includes(plan.gender)) {
+      await this._setReactValue(page, `select[name="${CIRCUS_COND.selects.gender.name}"]`, plan.gender)
+      await page.waitForTimeout(400)
+    }
+    if (plan.education && CIRCUS_COND.selects.education.options.includes(plan.education)) {
+      await this._setReactValue(page, `select[name="${CIRCUS_COND.selects.education.name}"]`, plan.education)
+      await page.waitForTimeout(400)
+    }
+    if (plan.overtime && CIRCUS_COND.selects.overtime.options.includes(plan.overtime)) {
+      await this._setReactValue(page, `select[name="${CIRCUS_COND.selects.overtime.name}"]`, plan.overtime)
+      await page.waitForTimeout(400)
+    }
+
+    // --- input群（年齢・年収）: React setter で確実に ---
+    // 年収は「annualSalary.include（=この年収以上を含む）」が主入力。plan.salaryMin を
+    // ここへ入れる。min/max の範囲指定が来た場合は従来の text 入力へ。
+    if (plan.age != null) {
+      await this._setReactValue(page, `input[name="${CIRCUS_COND.inputs.age}"]`, plan.age)
+      await page.waitForTimeout(400)
+    }
+    if (plan.salaryMin != null && plan.salaryMax == null) {
+      await this._setReactValue(page, `input[name="${CIRCUS_COND.inputs.salaryInclude}"]`, plan.salaryMin)
+      await page.waitForTimeout(400)
+    } else {
+      if (plan.salaryMin != null) {
+        await this._setReactValue(page, `input[name="${CIRCUS_COND.inputs.salaryMin}"]`, plan.salaryMin)
+        await page.waitForTimeout(400)
+      }
+      if (plan.salaryMax != null) {
+        await this._setReactValue(page, `input[name="${CIRCUS_COND.inputs.salaryMax}"]`, plan.salaryMax)
+        await page.waitForTimeout(400)
+      }
+    }
+
+    // --- チェックボックス群 ---
+    if (plan.checks && typeof plan.checks === 'object') {
+      for (const [cat, labels] of Object.entries(plan.checks)) {
+        const valid = CIRCUS_COND.checkboxes[cat]
+        if (!valid || !Array.isArray(labels)) continue
+        for (const label of labels) {
+          if (!valid.includes(label)) continue
+          const cb = page.getByText(label, { exact: true }).first()
+          if (await cb.count()) {
+            await cb.click().catch(() => {})
+            await page.waitForTimeout(200)
+          }
+        }
+      }
+    }
+    await page.waitForTimeout(800)
+
+    // 検索実行ボタン。circusのボタンは「条件に合う求人{N}件を検索する」という
+    // 動的テキスト。件数プレビューがボタンに埋まっているので、まずこのボタンの
+    // 件数が安定するまで待ってから押す。
+    const btnRe = /条件に合う求人\s*([\d,]+)\s*件を検索する/
+    const findBtn = () => page.getByText(/条件に合う求人.*件を検索する/).first()
+
+    // ボタンのプレビュー件数が安定するまで待つ（フォーム反映のデバウンス対策）
+    let preview = null
+    let prevPrev = null
+    for (let i = 0; i < 10; i++) {
+      const txt = await findBtn().textContent().catch(() => '')
+      const m = txt && txt.match(btnRe)
+      const n = m ? parseInt(m[1].replace(/,/g, ''), 10) : null
+      if (n != null) {
+        if (n === prevPrev) { preview = n; break }
+        prevPrev = n
+        preview = n
+      }
+      await page.waitForTimeout(800)
+    }
+
+    // ボタンをクリックして検索確定
+    const searchBtn = findBtn()
+    if (await searchBtn.count()) {
+      await searchBtn.scrollIntoViewIfNeeded().catch(() => {})
+      await searchBtn.click().catch(() => {})
+    }
+    await page.waitForTimeout(3500)
+
+    // 検索結果一覧の総件数が安定するまで待つ（プレビューと一致するはず）。
+    let total = null
+    let prev = null
+    let stable = 0
+    for (let i = 0; i < 10; i++) {
+      const t = await this.readTotalCount(page)
+      if (t != null) {
+        if (t === prev) { stable++; if (t > 0 && stable >= 1) { total = t; break } }
+        else { stable = 0 }
+        prev = t
+        total = t
+      }
+      await page.waitForTimeout(1000)
+    }
+    // 結果一覧が0でプレビューが正の場合はプレビュー件数を採用（描画遅延対策）
+    if ((total == null || total === 0) && preview != null) total = preview
+    return { total, preview, appliedUrl: page.url() }
+  },
+
+  // 機能A: プラン適用後の絞り込み状態から、ページネーションで求人を取得する。
+  // applyConditions を呼んだ後の page をそのまま渡す。onPage は fetchJobsPaged と同じ契約。
+  // 絞り込み状態(JS state)を保つため、goto せず「次へ」ページ送り or page= URL 変更で辿る。
+  async fetchJobsAfterConditions(page, onPage, opts = {}) {
+    const PAGE_SIZE = 25
+    const maxPages = opts.maxPages || 200
+    const appliedUrl = page.url()
+    const globalSeen = new Set()
+    let total = null
+    let metaSent = false
+
+    for (let pageNo = 1; pageNo <= maxPages; pageNo++) {
+      if (pageNo > 1) {
+        // 絞り込み状態を保ったままページ送り: URLの page= だけ差し替えて遷移
+        const nextUrl = appliedUrl.replace(/([?&]page=)\d+/, `$1${pageNo}`)
+        // page= が無い場合は付与
+        const url2 = /[?&]page=/.test(nextUrl) ? nextUrl : `${nextUrl}&page=${pageNo}`
+        await page.goto(url2, { waitUntil: 'networkidle', timeout: 60000 })
+        await page.waitForTimeout(2000)
+      }
+      const { total: pageTotal, ok } = await this.waitForResults(page)
+      if (total == null) { total = pageTotal; console.log(`[circus] 絞込後 総件数=${total} 件`) }
+      if (!ok) { if (!metaSent) await onPage([], { total }); break }
+
+      const pageJobs = []
+      const pageSeen = new Set()
+      let stagnant = 0
+      for (let step = 0; step < 50; step++) {
+        const cards = await this.readVisibleCards(page)
+        let fresh = 0
+        for (const card of cards) {
+          if (!card.id || pageSeen.has(card.id)) continue
+          pageSeen.add(card.id); fresh++
+          if (globalSeen.has(card.id)) continue
+          globalSeen.add(card.id)
+          try { const job = this.cardToJob(card); if (job) pageJobs.push(job) } catch {}
+        }
+        if (fresh === 0) stagnant++; else stagnant = 0
+        if (stagnant >= 8 || pageSeen.size >= PAGE_SIZE) break
+        await page.mouse.wheel(0, 1200)
+        await page.waitForTimeout(650)
+      }
+      if (pageSeen.size === 0) { if (!metaSent) await onPage([], { total }); break }
+      const meta = metaSent ? {} : { total }
+      metaSent = true
+      const cont = await onPage(pageJobs, meta)
+      if (cont === false) break
     }
   },
 }
