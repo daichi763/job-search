@@ -1,0 +1,7 @@
+# Webアプリ側の環境変数テンプレート（VPSでこれをコピーして .dev.vars を作成）
+# cp .dev.vars.example .dev.vars して値を編集してください。
+# .dev.vars は .gitignore 済みなのでGitHubには上がりません。
+
+# ワーカーと共有する取り込み用トークン。
+# worker/.env の INGEST_TOKEN と「完全に同じ値」にしてください。
+INGEST_TOKEN=change-me-please
