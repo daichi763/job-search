@@ -61,3 +61,53 @@ export async function scoreBatch(env, criteria, jobs) {
   })
   return { results, tokensUsed }
 }
+
+// ------------------------------------------------------------
+// 1次粗選別（安く大量に）
+// タイトル＋職種＋勤務地＋給与だけの最小情報で採点し、理由は返さない。
+// 1件あたりのトークンを最小化し、数百件を数バッチで捌く。
+// ここで一定スコア以上だけを2次（scoreBatch＝全文精読）に送る。
+// ------------------------------------------------------------
+function jobToTiny(job) {
+  const salary = job.salaryMin || job.salaryMax ? `年収${job.salaryMin ?? '?'}〜${job.salaryMax ?? '?'}` : ''
+  return [
+    job.title ? String(job.title).slice(0, 80) : '',
+    job.jobCategory ? `職種:${String(job.jobCategory).slice(0, 40)}` : '',
+    (job.locations || []).length ? `地:${job.locations.join('/')}` : '',
+    salary,
+  ].filter(Boolean).join(' / ')
+}
+
+const SYSTEM_BRIEF = `あなたは人材紹介のプロです。求職者の要望と各求人の一致度を「ざっくり」0〜100で採点します。
+これは1次粗選別です。要望のフリー記述(価値観・志向・働き方)と各求人の相性を、限られた情報から推測して採点してください。
+情報が少ない求人でも、要望に合いそうなら高め、明確に外れていれば低めに。理由は不要。
+必ず次のJSON形式のみ: {"scores":[{"i":0,"score":72},...]}`
+
+export async function scoreBriefBatch(env, criteria, jobs) {
+  if (!jobs.length) return { results: [], tokensUsed: 0 }
+  const lines = jobs.map((j, i) => `[${i}] ${jobToTiny(j)}`).join('\n')
+  const user = `求職者の要望:\n${criteriaToText(criteria)}\n\n求人一覧(${jobs.length}件):\n${lines}\n\n各求人[i]をざっくり採点しJSONで返してください。`
+
+  const res = await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+    body: JSON.stringify({
+      model: env.OPENAI_MODEL || 'gpt-5-nano',
+      messages: [{ role: 'system', content: SYSTEM_BRIEF }, { role: 'user', content: user }],
+      response_format: { type: 'json_object' },
+      reasoning_effort: 'minimal',
+      max_completion_tokens: 1500,
+    }),
+  })
+  if (!res.ok) throw new Error(`OpenAI(brief) ${res.status}: ${(await res.text()).slice(0, 200)}`)
+  const data = await res.json()
+  const tokensUsed = data.usage?.total_tokens ?? 0
+  let parsed = {}
+  try { parsed = JSON.parse(data.choices?.[0]?.message?.content ?? '{}') } catch {}
+  const scores = parsed.scores || []
+  const results = jobs.map((_, i) => {
+    const s = scores.find((x) => x.i === i || x.index === i)
+    return { index: i, score: s ? Math.max(0, Math.min(100, Math.round(s.score))) : 40 }
+  })
+  return { results, tokensUsed }
+}

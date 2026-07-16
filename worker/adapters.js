@@ -145,14 +145,23 @@ export const circusAdapter = {
   // 検索ページのURLを構築。
   // キーワードは or ロジックに入れる（短い語のみ。無ければ全求人）。
   // フリー記述の細かなニュアンスは後段のAI採点で反映する。
-  buildSearchUrl(criteria, pageNo) {
+  // circus /search の qJson の option は「検索対象範囲」を表す:
+  //   option=1: ごく狭い(会社名等) 22件 / option=2: 職種名等 28,817件
+  //   option=3: 中程度 6,608件 / option=4: 全文検索(最広) 48,736件  (keyword=営業の場合)
+  // 「見つけづらい求人も網羅」する理想には option=4(全文) が最適。
+  // キーワードは or に入れる（AIが抽出した短い語。無ければ全126,575件が対象）。
+  //
+  // /search は 1ページ25件のページネーション型。&page=N で正しくページ送りできる
+  // （option=4 で数万件ヒットする状態では page=1,2,3... が重複なく機能することを確認済み）。
+  buildSearchUrl(criteria, pageNo = 1) {
     const kw = this.extractKeyword(criteria)
+    const option = parseInt(process.env.CIRCUS_SEARCH_OPTION || '4', 10) // 既定=全文
     const qJson = encodeURIComponent(
       JSON.stringify([
-        { option: 1, keyword: '', logicType: 'and' },
-        { option: 1, keyword: kw, logicType: 'or' },
-        { option: 1, keyword: '', logicType: 'excludeAnd' },
-        { option: 1, keyword: '', logicType: 'excludeOr' },
+        { option, keyword: '', logicType: 'and' },
+        { option, keyword: kw, logicType: 'or' },
+        { option, keyword: '', logicType: 'excludeAnd' },
+        { option, keyword: '', logicType: 'excludeOr' },
       ])
     )
     return (
@@ -162,68 +171,120 @@ export const circusAdapter = {
     )
   },
 
-  async fetchJobs(page, criteria, onJob) {
-    // circus /search は「仮想スクロール」。1ページ25件だがDOM上には常に2〜3枚しか無い。
-    // ページ内をゆっくりスクロールしながらカードを収集する。
-    // 取得しすぎると時間がかかるため、topN の数倍 or env上限で頭打ち。
-    const cap = parseInt(process.env.CIRCUS_MAX_SCAN || '75', 10)
-    const maxScan = criteria._maxScan || Math.min(cap, Math.max(25, (criteria.topN || 10) * 5))
+  // 検索結果の総件数を読み取る（「28,817件」等）。取得できなければ null。
+  async readTotalCount(page) {
+    const body = await page.innerText('body').catch(() => '')
+    const m = body.match(/([\d,]+)\s*\n?\s*件/)
+    if (!m) return null
+    const n = parseInt(m[1].replace(/,/g, ''), 10)
+    return Number.isFinite(n) ? n : null
+  },
+
+  // SPAの検索初期化を待つ。qJson付きURLへ直接gotoすると、件数やカードが
+  // 非同期で確定するまで 0件/中途半端な件数 になる。件数が安定し、かつ
+  // カードが最低1枚描画されるまで待つ。ダメなら reload する。
+  // 戻り値: { total, ok } — ok=false ならこのページは取得不能。
+  async waitForResults(page) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let stableCount = null
+      let sameStreak = 0
+      // 件数が2回連続同じになるまで（最大 ~12秒）待つ
+      for (let t = 0; t < 12; t++) {
+        const n = await this.readTotalCount(page)
+        if (n != null && n === stableCount) {
+          sameStreak++
+          if (sameStreak >= 1 && n > 0) break // 安定 & 0件でない
+        } else {
+          stableCount = n
+          sameStreak = 0
+        }
+        await page.waitForTimeout(1000)
+      }
+      // カード描画を待つ（少しスクロールして誘発）
+      for (let t = 0; t < 8; t++) {
+        const c = await page.$$eval('[data-testid="job-search-result-card"]', (x) => x.length).catch(() => 0)
+        if (c > 0) return { total: stableCount ?? 0, ok: true }
+        await page.mouse.wheel(0, 600)
+        await page.waitForTimeout(800)
+      }
+      // カードが出ない → reload して再試行
+      if (attempt < 2) {
+        await page.reload({ waitUntil: 'networkidle', timeout: 60000 }).catch(() => {})
+        await page.waitForTimeout(3000)
+      }
+    }
+    const finalTotal = await this.readTotalCount(page)
+    const finalCards = await page.$$eval('[data-testid="job-search-result-card"]', (x) => x.length).catch(() => 0)
+    return { total: finalTotal ?? 0, ok: finalCards > 0 }
+  },
+
+  // ページネーション型の /search を1ページ(25件)ずつ深掘りし、
+  // 1ページ収集するごとに onPage(jobs[], meta) を呼ぶ。
+  // onPage の戻り値が false なら探索を打ち切る（自律探索エージェント用）。
+  // 総件数は最初の onPage 呼び出しで meta.total として渡す。
+  // ページ番号は無制限に進めるが、実際の停止判断は呼び出し側(onPage)が行う。
+  async fetchJobsPaged(page, criteria, onPage) {
     const PAGE_SIZE = 25
-    const maxPages = Math.ceil(maxScan / PAGE_SIZE)
+    const HARD_MAX_PAGES = parseInt(process.env.CIRCUS_HARD_MAX_PAGES || '5100', 10)
+    const globalSeen = new Set()
+    let total = null
+    let metaSent = false
 
-    const seenIds = new Set()
-    let scanned = 0
-
-    for (let pageNo = 1; pageNo <= maxPages && scanned < maxScan; pageNo++) {
+    for (let pageNo = 1; pageNo <= HARD_MAX_PAGES; pageNo++) {
       const url = this.buildSearchUrl(criteria, pageNo)
       await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 })
-      await page.waitForTimeout(3000)
+      await page.waitForTimeout(2500)
 
-      // カードの初回描画を待つ（最大20秒）。0件検索ならスキップ。
-      const appeared = await page
-        .waitForSelector('[data-testid="job-search-result-card"]', { timeout: 20000, state: 'attached' })
-        .then(() => true)
-        .catch(() => false)
-      if (!appeared) {
-        // 件数表示があるのにカードが出ない場合、少しスクロールして再待機
-        await page.mouse.wheel(0, 500)
-        await page.waitForTimeout(2500)
-        const retry = await page.$('[data-testid="job-search-result-card"]')
-        if (!retry) break // 本当に0件
+      // SPA初期化を待つ（件数安定＋カード描画。ダメならreload）
+      const { total: pageTotal, ok } = await this.waitForResults(page)
+      if (total == null) {
+        total = pageTotal
+        console.log(`[circus] 検索結果 総件数=${total} 件`)
+      }
+      if (!ok) {
+        // このページにカードが無い = 末尾 or 取得不能
+        if (!metaSent) await onPage([], { total })
+        break
       }
 
-      // このページで収集済みのカードIDを追跡。scrollHが伸びなくなるまで（＝末尾到達）繰り返す。
-      let pageSeen = new Set()
+      // このページ内のカードを仮想スクロールで集めきる（DOMには常時2〜3枚）
+      const pageJobs = []
+      const pageSeen = new Set()
       let stagnant = 0
-      for (let step = 0; step < 40 && scanned < maxScan; step++) {
+      for (let step = 0; step < 50; step++) {
         const cards = await this.readVisibleCards(page)
         let newInThisStep = 0
         for (const card of cards) {
-          if (!card.id || seenIds.has(card.id)) continue
-          seenIds.add(card.id)
+          if (!card.id || pageSeen.has(card.id)) continue
           pageSeen.add(card.id)
           newInThisStep++
-          scanned++
+          if (globalSeen.has(card.id)) continue // 別ページで既出（重複防止）
+          globalSeen.add(card.id)
           try {
             const job = this.cardToJob(card)
-            if (job) await onJob(job)
+            if (job) pageJobs.push(job)
           } catch (e) {
             console.error(`circus カード解析失敗 id=${card.id}:`, e.message)
           }
-          if (scanned >= maxScan) break
         }
-        // 末尾判定: 新規カードが数ステップ連続で0なら終了
         if (newInThisStep === 0) stagnant++
         else stagnant = 0
-        if (stagnant >= 5) break
-        // このページで25件そろったら次ページへ
+        if (stagnant >= 8) break
         if (pageSeen.size >= PAGE_SIZE) break
-        await page.mouse.wheel(0, 700)
-        await page.waitForTimeout(550)
+        await page.mouse.wheel(0, 1200)
+        await page.waitForTimeout(650)
       }
 
-      // このページでカードが1件も取れなければ、それ以上ページは無いとみなす
-      if (pageSeen.size === 0) break
+      // このページで1件も取れなければ末尾
+      if (pageSeen.size === 0) {
+        if (!metaSent) await onPage([], { total })
+        break
+      }
+
+      const meta = metaSent ? {} : { total }
+      metaSent = true
+      const cont = await onPage(pageJobs, meta)
+      if (cont === false) break
     }
   },
 

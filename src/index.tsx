@@ -204,19 +204,27 @@ app.post('/api/ingest/state', async (c) => {
   const auth = c.req.header('X-Ingest-Token')
   if (auth !== (c.env as any).INGEST_TOKEN) return c.json({ error: 'unauthorized' }, 401)
   const body = await c.req.json<any>()
+  // 部分更新に対応: 渡されなかった数値項目(null)は既存値を保持する(COALESCE)。
+  // これにより fetching 途中で scanned だけ送っても total_in_db 等が 0 に消えない。
+  const numOrNull = (v: any) => (v === undefined || v === null ? null : v)
   await c.env.DB.prepare(
     `INSERT INTO worker_states
      (search_job_id, source, phase, message, scanned, candidates, matched, from_memory, tokens_used, total_in_db, updated_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))
      ON CONFLICT(search_job_id, source) DO UPDATE SET
-      phase=excluded.phase, message=excluded.message, scanned=excluded.scanned,
-      candidates=excluded.candidates, matched=excluded.matched, tokens_used=excluded.tokens_used,
-      total_in_db=excluded.total_in_db, updated_at=datetime('now')`
+      phase=excluded.phase, message=excluded.message,
+      scanned=COALESCE(excluded.scanned, worker_states.scanned),
+      candidates=COALESCE(excluded.candidates, worker_states.candidates),
+      matched=COALESCE(excluded.matched, worker_states.matched),
+      from_memory=COALESCE(excluded.from_memory, worker_states.from_memory),
+      tokens_used=COALESCE(excluded.tokens_used, worker_states.tokens_used),
+      total_in_db=COALESCE(excluded.total_in_db, worker_states.total_in_db),
+      updated_at=datetime('now')`
   )
     .bind(
       body.searchJobId, body.source, body.phase || 'fetching', body.message || '',
-      body.scanned || 0, body.candidates || 0, body.matched || 0, body.fromMemory || 0,
-      body.tokensUsed || 0, body.totalInDb || 0
+      numOrNull(body.scanned), numOrNull(body.candidates), numOrNull(body.matched),
+      numOrNull(body.fromMemory), numOrNull(body.tokensUsed), numOrNull(body.totalInDb)
     )
     .run()
 
