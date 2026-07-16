@@ -155,14 +155,32 @@ app.get('/api/stats', async (c) => {
     cacheMap[(r as any).source] = { cached: (r as any).cnt, open: (r as any).open_cnt }
   }
 
+  // 媒体ごとの「最終検索時の総求人数」（外部ワーカーが検索完了時に報告した値）
+  const { results: totalRows } = await c.env.DB.prepare(
+    `SELECT source, total, updated_at FROM source_totals`
+  ).all()
+  const totalMap: Record<string, any> = {}
+  for (const r of totalRows || []) {
+    totalMap[(r as any).source] = { total: (r as any).total, updatedAt: (r as any).updated_at }
+  }
+
   const sources: SourceId[] = ['kintone', 'circus', 'hitolink', 'jobins']
   for (const s of sources) {
+    // 総求人数の優先順位:
+    //   kintone → ライブカウント
+    //   その他  → 最終検索時の総求人数(source_totals) → 無ければキャッシュ件数
+    const lastTotal = totalMap[s]?.total ?? null
+    const total = s === 'kintone'
+      ? kintoneTotal
+      : (lastTotal != null ? lastTotal : (cacheMap[s]?.cached ?? 0))
     stats[s] = {
       label: SOURCE_LABELS[s],
-      total: s === 'kintone' ? kintoneTotal : (cacheMap[s]?.cached ?? 0),
+      total,
+      lastSearchedTotal: lastTotal,          // 最終検索時の総求人数(null=未検索)
+      lastSearchedAt: totalMap[s]?.updatedAt ?? null,
       cached: cacheMap[s]?.cached ?? 0,
       openCached: cacheMap[s]?.open ?? 0,
-      connected: s === 'kintone', // 現状kintoneのみ接続済み
+      connected: s === 'kintone' || s === 'circus', // circusも接続済み
     }
   }
 
@@ -231,6 +249,16 @@ app.post('/api/ingest/state', async (c) => {
       numOrNull(body.fromMemory), numOrNull(body.tokensUsed), numOrNull(body.totalInDb)
     )
     .run()
+
+  // 完了報告(done)なら、その媒体の「最終検索時の総求人数」を保存。
+  //   フロント右上の総求人数はこの値の合算で表示する。
+  if (body.phase === 'done' && body.totalInDb != null && Number(body.totalInDb) > 0) {
+    await c.env.DB.prepare(
+      `INSERT INTO source_totals (source, total, updated_at)
+       VALUES (?, ?, datetime('now'))
+       ON CONFLICT(source) DO UPDATE SET total=excluded.total, updated_at=datetime('now')`
+    ).bind(body.source, Math.round(Number(body.totalInDb))).run()
+  }
 
   // 途中経過の合計を更新。完了報告なら全ソース完了かチェックしてジョブ完了。
   await refreshSearchTotals(c.env.DB, body.searchJobId)

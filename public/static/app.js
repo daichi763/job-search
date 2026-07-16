@@ -176,6 +176,94 @@ function renderWorkers(workers) {
   });
 }
 
+// ------------------------------------------------------------
+// 成果報酬（紹介手数料）の表示テキスト＆比較用スコアを算出
+//   reward = { type:'rate'|'fixed'|'unknown', rate, amount, text }
+//   rate型: 「理論年収×30%」＋実額(理論年収=salaryMax×rate%)を併記
+//   fixed型: 「一律60万円」
+//   戻り値: { text, sortValue }  sortValue=比較用の推定報酬額(円)。rate型を優先評価。
+// ------------------------------------------------------------
+function rewardInfo(job) {
+  const r = job.reward || {};
+  // 理論年収の推定: salaryMax(円) を優先、無ければsalaryMin。job.salaryMin/Maxは万円単位なので円換算。
+  const theoryMan = (job.salaryMax != null ? job.salaryMax : job.salaryMin); // 万円
+  const theoryYen = theoryMan != null ? theoryMan * 10000 : null;
+
+  if (r.type === 'rate' && r.rate != null) {
+    let text = `理論年収 × ${r.rate}%`;
+    let estimate = null;
+    if (theoryYen != null) {
+      estimate = Math.round(theoryYen * r.rate / 100);
+      text += `（目安 約${(estimate / 10000).toLocaleString()}万円）`;
+    }
+    // rate型は優先（同一求人グループで先頭に来やすいよう +1e12 のゲタ）
+    const sortValue = (estimate != null ? estimate : (r.rate * 10000)) + 1e12;
+    return { text, sortValue, isRate: true };
+  }
+  if (r.type === 'fixed' && r.amount != null) {
+    const man = Math.round(r.amount / 10000);
+    return { text: `一律 ${man.toLocaleString()}万円`, sortValue: r.amount, isRate: false };
+  }
+  if (r.text) {
+    return { text: r.text, sortValue: 0, isRate: false };
+  }
+  return { text: '', sortValue: -1, isRate: false };
+}
+
+// 求人カードのHTML（1件分）。グループ内の2件目以降は compact=true で少しコンパクトに。
+function jobCardInner(it, opts) {
+  opts = opts || {};
+  const j = it.job || {};
+  const color = it.score >= 80 ? '#16a34a' : it.score >= 65 ? '#ca8a04' : '#64748b';
+  const salary = (j.salaryMin || j.salaryMax) ? `${j.salaryMin||'?'}〜${j.salaryMax||'?'}万円` : '年収非公開';
+  const memBadge = it.fromMemory ? '<span class="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded"><i class="fas fa-lightbulb"></i>記憶</span>' : '';
+  // 条件緩和レコメンドのバッジ
+  const recBadge = j.isRecommend ? '<span class="text-[10px] bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-semibold"><i class="fas fa-wand-magic-sparkles mr-0.5"></i>条件緩和レコメンド</span>' : '';
+  // 成果報酬
+  const rw = rewardInfo(j);
+  const rewardBadge = rw.text
+    ? `<span class="reward-badge inline-flex items-center gap-1 text-[11px] ${rw.isRate ? 'bg-emerald-100 text-emerald-700' : 'bg-teal-100 text-teal-700'} px-2 py-0.5 rounded font-semibold"><i class="fas fa-hand-holding-yen"></i>成果報酬: ${escapeHtml(rw.text)}</span>`
+    : '';
+  // 理由（200字/300字）— レコメンドはオレンジ、通常はインディゴ
+  const reasonBox = it.reason
+    ? `<p class="text-xs ${j.isRecommend ? 'text-orange-700 bg-orange-50' : 'text-indigo-700 bg-indigo-50'} mt-2 rounded px-3 py-2 leading-relaxed"><i class="fas fa-quote-left mr-1 opacity-50"></i>${escapeHtml(it.reason)}</p>`
+    : '';
+  return `
+    <div class="flex items-start gap-3">
+      <div class="score-ring flex-shrink-0 w-14 h-14 rounded-full flex items-center justify-center" style="--c:${color};--p:${it.score}">
+        <div class="w-11 h-11 bg-white rounded-full flex items-center justify-center">
+          <span class="font-bold text-sm" style="color:${color}">${it.score}</span>
+        </div>
+      </div>
+      <div class="flex-1 min-w-0">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-[10px] bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded">${it.sourceLabel}</span>
+          ${recBadge}
+          ${memBadge}
+          <span class="text-xs text-slate-400">${escapeHtml(j.company||'')}</span>
+        </div>
+        <h3 class="font-bold text-slate-800 mt-1 leading-snug">${escapeHtml(j.title||'(無題)')}</h3>
+        <div class="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-slate-500 mt-1">
+          <span><i class="fas fa-briefcase mr-1"></i>${escapeHtml(j.jobCategory||'-')}</span>
+          <span><i class="fas fa-location-dot mr-1"></i>${escapeHtml((j.locations||[]).join('/')||'-')}</span>
+          <span><i class="fas fa-yen-sign mr-1"></i>${salary}</span>
+          <span><i class="fas fa-file-signature mr-1"></i>${escapeHtml(j.employment||'-')}</span>
+        </div>
+        ${rewardBadge ? `<div class="mt-1.5">${rewardBadge}</div>` : ''}
+        ${reasonBox}
+        ${j.url ? `<a href="${escapeHtml(j.url)}" target="_blank" class="text-xs text-blue-500 hover:underline mt-1 inline-block"><i class="fas fa-external-link mr-1"></i>詳細を見る</a>` : ''}
+      </div>
+    </div>`;
+}
+
+// 同一求人判定用のグループキー: 企業名 + 職種の先頭カテゴリ で正規化
+function groupKey(job) {
+  const company = String(job.company || '').replace(/\s|株式会社|有限会社|（株）|\(株\)/g, '').toLowerCase();
+  const cat = String(job.jobCategory || '').split('・')[0].trim();
+  if (!company) return null; // 企業名不明はグループ化しない
+  return `${company}||${cat}`;
+}
+
 // 結果カードのレンダリング（追記型）
 const shownResults = new Set();
 function renderResults(items) {
@@ -193,41 +281,77 @@ function renderResults(items) {
   });
   window._allResults.sort((a,b) => b.score - a.score);
 
-  box.innerHTML = '';
+  // ---- 同一求人グルーピング（企業名＋職種が同じものを1グループに） ----
+  //   グループ内は「報酬が高い順（理論年収×%型を優先）」に並べ、
+  //   先頭を代表として表示、2件目以降はアコーディオンで折りたたむ。
+  const groups = [];
+  const groupIndex = {}; // key -> groups配列のindex
   window._allResults.forEach(it => {
-    const j = it.job || {};
-    const color = it.score >= 80 ? '#16a34a' : it.score >= 65 ? '#ca8a04' : '#64748b';
-    const salary = (j.salaryMin || j.salaryMax) ? `${j.salaryMin||'?'}〜${j.salaryMax||'?'}万円` : '年収非公開';
-    const memBadge = it.fromMemory ? '<span class="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded"><i class="fas fa-lightbulb"></i>記憶</span>' : '';
+    const key = groupKey(it.job || {});
+    if (key && groupIndex[key] != null) {
+      groups[groupIndex[key]].items.push(it);
+    } else {
+      const g = { key, items: [it] };
+      if (key) groupIndex[key] = groups.length;
+      groups.push(g);
+    }
+  });
+
+  // 各グループ内を報酬高い順(rate優先)にソート。同点はスコア順。
+  groups.forEach(g => {
+    g.items.sort((a, b) => {
+      const ra = rewardInfo(a.job || {}).sortValue;
+      const rb = rewardInfo(b.job || {}).sortValue;
+      if (rb !== ra) return rb - ra;
+      return b.score - a.score;
+    });
+  });
+  // グループ自体は代表(先頭)のスコア順で並べる
+  groups.sort((a, b) => (b.items[0].score) - (a.items[0].score));
+
+  box.innerHTML = '';
+  groups.forEach((g, gi) => {
+    const head = g.items[0];
+    const dupCount = g.items.length;
     const card = document.createElement('div');
     card.className = 'result-in border border-slate-200 rounded-lg p-4 hover:shadow-md transition';
-    card.innerHTML = `
-      <div class="flex items-start gap-3">
-        <div class="score-ring flex-shrink-0 w-14 h-14 rounded-full flex items-center justify-center" style="--c:${color};--p:${it.score}">
-          <div class="w-11 h-11 bg-white rounded-full flex items-center justify-center">
-            <span class="font-bold text-sm" style="color:${color}">${it.score}</span>
-          </div>
-        </div>
-        <div class="flex-1 min-w-0">
-          <div class="flex items-center gap-2 flex-wrap">
-            <span class="text-[10px] bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded">${it.sourceLabel}</span>
-            ${memBadge}
-            <span class="text-xs text-slate-400">${j.company||''}</span>
-          </div>
-          <h3 class="font-bold text-slate-800 mt-1 leading-snug">${j.title||'(無題)'}</h3>
-          <div class="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-slate-500 mt-1">
-            <span><i class="fas fa-briefcase mr-1"></i>${j.jobCategory||'-'}</span>
-            <span><i class="fas fa-location-dot mr-1"></i>${(j.locations||[]).join('/')||'-'}</span>
-            <span><i class="fas fa-yen-sign mr-1"></i>${salary}</span>
-            <span><i class="fas fa-file-signature mr-1"></i>${j.employment||'-'}</span>
-          </div>
-          ${it.reason ? `<p class="text-xs text-indigo-600 mt-2 bg-indigo-50 rounded px-2 py-1"><i class="fas fa-quote-left mr-1 opacity-50"></i>${it.reason}</p>` : ''}
-          ${j.url ? `<a href="${j.url}" target="_blank" class="text-xs text-blue-500 hover:underline mt-1 inline-block"><i class="fas fa-external-link mr-1"></i>詳細を見る</a>` : ''}
-        </div>
-      </div>`;
+
+    // 代表カード（グループ先頭＝報酬最高）
+    let html = jobCardInner(head);
+
+    // 同一求人が複数ある場合、アコーディオンで残りを圧縮表示
+    if (dupCount > 1) {
+      const accId = `acc-${gi}`;
+      const rest = g.items.slice(1).map(it => `
+        <div class="border-t border-slate-100 pt-3 mt-3">${jobCardInner(it)}</div>
+      `).join('');
+      html += `
+        <div class="mt-3">
+          <button type="button" class="acc-toggle w-full text-left text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded px-3 py-2 flex items-center justify-between" data-target="${accId}">
+            <span><i class="fas fa-layer-group mr-1 text-indigo-500"></i>同一求人と思われる媒体違い・条件違い ${dupCount - 1}件（報酬が高い順・クリックで展開）</span>
+            <i class="fas fa-chevron-down acc-chevron transition-transform"></i>
+          </button>
+          <div id="${accId}" class="acc-body hidden mt-2 space-y-0">${rest}</div>
+        </div>`;
+    }
+    card.innerHTML = html;
     box.appendChild(card);
   });
-  document.getElementById('result-count').textContent = `(${window._allResults.length})`;
+
+  // アコーディオン開閉
+  box.querySelectorAll('.acc-toggle').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const target = document.getElementById(btn.getAttribute('data-target'));
+      const chevron = btn.querySelector('.acc-chevron');
+      if (!target) return;
+      const open = !target.classList.contains('hidden');
+      target.classList.toggle('hidden');
+      if (chevron) chevron.style.transform = open ? '' : 'rotate(180deg)';
+    });
+  });
+
+  // 表示件数はグループ数（同一求人は1件扱い）
+  document.getElementById('result-count').textContent = `(${groups.length})`;
 }
 
 // 検索実行
@@ -312,6 +436,8 @@ function pollStatus(jobId) {
         statusEl.textContent = `完了 (スキャン${status.totalScanned}件)`;
         clearInterval(pollTimer);
         resetBtn();
+        // 検索完了後、媒体ごとの最終検索時の総求人数が更新されているので右上を再取得
+        loadStats();
       } else {
         statusEl.textContent = '検索中…';
       }
@@ -323,7 +449,9 @@ function pollStatus(jobId) {
   pollTimer = setInterval(poll, 1500);
 }
 
-// 起動
-initForm();
-loadStats();
-document.getElementById('searchBtn').addEventListener('click', startSearch);
+// 起動（本番ページのみ。テスト等で要素が無い場合は安全にスキップ）
+if (document.getElementById('searchBtn')) {
+  initForm();
+  loadStats();
+  document.getElementById('searchBtn').addEventListener('click', startSearch);
+}

@@ -16,13 +16,14 @@ export function evaluateOne(job, c) {
   let hardFail = false
   let score = 0
   let maxScore = 0
+  const reasons = [] // hardFail要因（緩和レコメンド用: どの緩和可能条件で落ちたか）
 
   // --- HIGH: 勤務地（カードにあり／揺るぎない）---
   if (c.locations && c.locations.length) {
     maxScore += 35
     const hit = c.locations.some((loc) => (job.locations || []).some((jl) => jl.includes(loc) || loc.includes(jl)))
     if (hit) score += 35
-    else hardFail = true
+    else { hardFail = true; reasons.push(`勤務地(希望:${c.locations.join('/')})が不一致`) }
   }
   // --- HIGH: 年収（カードにあり）---
   if (c.salaryMin != null) {
@@ -30,14 +31,14 @@ export function evaluateOne(job, c) {
     const jobMax = job.salaryMax ?? job.salaryMin
     if (jobMax != null) {
       if (jobMax >= c.salaryMin) score += (job.salaryMin ?? jobMax) >= c.salaryMin ? 30 : 18
-      else hardFail = true
+      else { hardFail = true; reasons.push(`想定年収が希望(${c.salaryMin}万〜)に届かない`) }
     } else score += 10
   }
   // --- 雇用形態（カードにあり）---
   if (c.employment && c.employment.length) {
     maxScore += 15
     if (c.employment.some((e) => (job.employment || '').includes(e))) score += 15
-    else hardFail = true
+    else { hardFail = true; reasons.push(`雇用形態(希望:${c.employment.join('/')})が不一致`) }
   }
   // --- LOW: 職種（不正確な場合が多い。hardFailにせず軽い加点のみ）---
   if (c.jobCategories && c.jobCategories.length) {
@@ -60,7 +61,7 @@ export function evaluateOne(job, c) {
     if (c.holiday.some((h) => (job.holiday || '').includes(h))) score += 3
   }
   const preScore = maxScore > 0 ? Math.round((score / maxScore) * 100) : 50
-  return { job, preScore, hardFail }
+  return { job, preScore, hardFail, reasons }
 }
 
 // 学歴のランク（数値が大きいほど高い学歴要件）。求職者の学歴が求人の要件を満たすか判定用。

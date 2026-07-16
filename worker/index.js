@@ -22,7 +22,7 @@ dotenv.config({ override: true })
 import { chromium } from 'playwright'
 import { ADAPTERS } from './adapters.js'
 import { mechanicalFilter, evaluateOne, evaluateDetail } from './filter.js'
-import { scoreBatch, scoreBriefBatch, buildSearchPlans } from './scorer.js'
+import { scoreBatch, scoreBriefBatch, buildSearchPlans, scoreRelaxBatch } from './scorer.js'
 
 const env = process.env
 const APP_URL = env.APP_URL || 'http://localhost:3000'
@@ -140,6 +140,11 @@ async function processSource(browser, source, searchJobId, criteria) {
   let tokens = 0           // 消費トークン累計
   const pool = []          // 精読候補プール { job, preScore, briefScore }
   const seenIds = new Set() // プラン横断の重複除去（求人ID）
+  // 条件緩和レコメンド用プール:
+  //   「年齢/性別/学歴（=変更不可のHIGH情報）はOKだが、
+  //    年収/勤務地/雇用形態などの緩和可能条件で機械フィルタに落ちた」求人を溜める。
+  //   通常マッチが topN に満たない場合に、条件を緩めて提案する候補源。
+  const relaxPool = []     // { job, relaxedReasons: [落ちた条件...] }
 
   const timeUp = () => Date.now() - startedAt > EXPLORE.TIME_LIMIT_MS
 
@@ -150,6 +155,19 @@ async function processSource(browser, source, searchJobId, criteria) {
     await reportState(searchJobId, source, { phase: 'fetching', message: '認証トークン取得中…' })
     const token = await adapter.getAuthToken(page)
     console.log(`[${source}] 認証トークン取得OK`)
+
+    // ---- 媒体の総求人数（未フィルタ）を取得 ----
+    // フロント右上「総求人数」に表示するのは、この媒体が今この瞬間に
+    // 保有している求人の総数（＝検索条件を一切かけない全件）。
+    // 各プランの該当件数の合計(grandTotal)は重複で過大計上されるため使わない。
+    let mediaTotal = null
+    try {
+      const allQJson = adapter.buildQJson({ or: '' })
+      mediaTotal = await adapter.apiCount(page, token, { qJson: allQJson, filters: {} })
+      console.log(`[${source}] 媒体の総求人数(未フィルタ)=${mediaTotal ?? '?'}件`)
+    } catch (e) {
+      console.log(`[${source}] 媒体総数取得失敗: ${e.message}`)
+    }
 
     // ---- 機能A: AIが検索プラン(複数)を生成 ----
     await reportState(searchJobId, source, { phase: 'fetching', message: 'AIが検索プランを設計中…' })
@@ -195,7 +213,7 @@ async function processSource(browser, source, searchJobId, criteria) {
       console.log(`[${source}] plan[${pi}] "${plan.label}" 該当=${planTotal ?? '?'}件`)
       await reportState(searchJobId, source, {
         phase: 'fetching', scanned, candidates: pool.length, tokensUsed: tokens,
-        totalInDb: grandTotal || undefined,
+        totalInDb: mediaTotal ?? grandTotal ?? undefined,
         message: `プラン${pi + 1}/${plans.length}「${plan.label}」該当${(planTotal ?? 0).toLocaleString()}件を精査中…`,
       })
 
@@ -246,10 +264,16 @@ async function processSource(browser, source, searchJobId, criteria) {
         // + 揺るぎないHIGH情報(年齢/性別/学歴)による除外（API方式では最初から判定可能）
         const survivors = []
         for (const job of fresh) {
-          const ev = evaluateOne(job, criteria)
-          if (ev.hardFail) continue
           const dv = evaluateDetail(job, criteria)
-          if (dv.hardFail) continue // 年齢/性別/学歴ミスマッチは即除外
+          // 年齢/性別/学歴（=変更不可）のミスマッチは常に即除外（緩和対象にもしない）
+          if (dv.hardFail) continue
+          const ev = evaluateOne(job, criteria)
+          if (ev.hardFail) {
+            // 年収/勤務地/雇用など「緩和可能条件」で落ちた求人は
+            // 件数不足時のレコメンド候補として保持（年齢/性別/学歴はクリア済み）。
+            if (relaxPool.length < 400) relaxPool.push({ job, relaxedReasons: ev.reasons || [] })
+            continue
+          }
           survivors.push(ev)
         }
 
@@ -279,7 +303,7 @@ async function processSource(browser, source, searchJobId, criteria) {
         console.log(`[${source}] plan[${pi}] off${offset}: 取得${rawJobs.length} 新規${fresh.length}(計${scanned}) 通過${survivors.length} 候補計${pool.length} tok${tokens}`)
         await reportState(searchJobId, source, {
           phase: 'fetching', scanned, candidates: pool.length, tokensUsed: tokens,
-          totalInDb: grandTotal || undefined,
+          totalInDb: mediaTotal ?? grandTotal ?? undefined,
           message: `プラン${pi + 1}/${plans.length}「${plan.label}」${scanned.toLocaleString()}件走査 / 有望候補${pool.length}件`,
         })
       } // offset loop
@@ -321,15 +345,71 @@ async function processSource(browser, source, searchJobId, criteria) {
 
     // スコア順に並べ、上位から逐次払い出し（topN件）
     finalMatches.sort((a, b) => b.score - a.score)
+    const pushedIds = new Set()
     for (const m of finalMatches.slice(0, topN)) {
       await pushResult(searchJobId, m.job, m.score, m.reason)
+      if (m.job.sourceJobId) pushedIds.add(String(m.job.sourceJobId))
       matched++
     }
 
+    // ---- 件数不足時: 条件緩和レコメンド ----
+    // 通常マッチが払い出し件数(topN)に満たない場合、
+    // 年齢/性別/学歴は変更せず、緩和可能条件(年収/勤務地/雇用形態など)を
+    // 緩めれば提案できる求人を、AIに理由付き(300字)で推薦させて補充する。
+    const shortfall = topN - matched
+    if (shortfall > 0 && useAI && relaxPool.length && tokens < EXPLORE.TOKEN_BUDGET) {
+      console.log(`[${source}] 通常${matched}件 < 希望${topN}件 → 条件緩和レコメンド開始 (候補${relaxPool.length}件)`)
+      await reportState(searchJobId, source, {
+        phase: 'scoring', scanned, candidates: pool.length, tokensUsed: tokens,
+        message: `希望${topN}件に対し${matched}件のみ合致。条件を緩めた提案を検討中…`,
+      })
+      // 既に払い出した求人は除外し、重複IDも除く
+      const seenRelax = new Set()
+      const relaxTargets = []
+      for (const e of relaxPool) {
+        const id = e.job.sourceJobId ? String(e.job.sourceJobId) : null
+        if (id && (pushedIds.has(id) || seenRelax.has(id))) continue
+        if (id) seenRelax.add(id)
+        relaxTargets.push(e)
+      }
+      // コスト管理: 精査するのは不足数の数倍まで（最大 shortfall*4, 上限40件）
+      const relaxCap = Math.min(relaxTargets.length, Math.max(shortfall * 4, 12), 40)
+      const relaxSlice = relaxTargets.slice(0, relaxCap)
+      const relaxMatches = []
+      for (let i = 0; i < relaxSlice.length; i += EXPLORE.DEEP_BATCH) {
+        if (tokens >= EXPLORE.TOKEN_BUDGET) break
+        const batch = relaxSlice.slice(i, i + EXPLORE.DEEP_BATCH)
+        try {
+          const { results, tokensUsed } = await scoreRelaxBatch(env, criteria, batch)
+          tokens += tokensUsed
+          for (const r of results) {
+            if (r.score >= EXPLORE.DEEP_THRESHOLD - 10) { // 緩和枠は閾値を少し下げる
+              relaxMatches.push({ entry: batch[r.index], score: r.score, reason: r.reason })
+            }
+          }
+        } catch (e) {
+          console.log(`[${source}] scoreRelaxBatch失敗: ${e.message}`)
+        }
+      }
+      relaxMatches.sort((a, b) => b.score - a.score)
+      for (const rm of relaxMatches.slice(0, shortfall)) {
+        // job に緩和レコメンドの目印を付けて払い出す（フロントで別扱い/バッジ表示）
+        const job = {
+          ...rm.entry.job,
+          isRecommend: true,
+          relaxedReasons: rm.entry.relaxedReasons || [],
+        }
+        await pushResult(searchJobId, job, rm.score, rm.reason)
+        matched++
+      }
+      console.log(`[${source}] 条件緩和レコメンド: ${relaxMatches.slice(0, shortfall).length}件を追加提案`)
+    }
+
     await reportState(searchJobId, source, {
-      phase: 'done', matched, tokensUsed: tokens, totalInDb: grandTotal || scanned, scanned,
+      phase: 'done', matched, tokensUsed: tokens,
+      totalInDb: mediaTotal ?? grandTotal ?? scanned, scanned,
       candidates: pool.length,
-      message: `完了: 該当延べ${(grandTotal || scanned).toLocaleString()}件から${scanned}件走査→${pool.length}件精査→${matched}件を提案 (トークン約${tokens})`,
+      message: `完了: 媒体総求人${(mediaTotal ?? scanned).toLocaleString()}件 / 該当延べ${(grandTotal || scanned).toLocaleString()}件を走査→${pool.length}件精査→${matched}件を提案 (トークン約${tokens})`,
     })
   } catch (e) {
     console.error(`[${source}] error:`, e)

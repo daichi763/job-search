@@ -378,6 +378,11 @@ export const circusAdapter = {
     const requiredGender = labelOf(REQUIRED_GENDERS, raw.requiredGender) // null=不問
     const requiredEducation = labelOf(EDUCATION, raw.requiredEducation)  // null=不明
 
+    // 成果報酬（紹介手数料）— circus APIの生データから柔軟に抽出。
+    //   媒体により「理論年収×N%」型 と「一律◯万円」型 がある。
+    //   フィールド名は媒体差があるため候補を総当たりで拾う。
+    const reward = this.extractReward(raw)
+
     return {
       source: 'circus',
       sourceJobId: String(raw.id),
@@ -397,18 +402,98 @@ export const circusAdapter = {
       requiredAgeMax,
       requiredGender,
       requiredEducation,
+      reward,                     // 成果報酬（{ type, rate, amount, text }）
       requirements: raw.minimumQualification || '',
       description: raw.jobDescriptions || '',
       positions: (Array.isArray(raw.positions) ? raw.positions : [])
         .map((c) => labelOf(POSITIONS, c)).filter(Boolean),
       careerStage: labelOf(CAREER_STAGES, raw.careerStage),
-      url: `${this.base}/jobs/${raw.id}`,
+      url: `${this.base}/search/${raw.id}`,
       isOpen: raw.open !== false,
       publishStartedAt: raw.publishStartedAt || null,
       lastUpdatedAt: raw.lastUpdatedAt || null,
       _raw: raw,                  // 生データも保持（デバッグ・追加抽出用）
     }
   }, // mapApiJob
+
+  // ==========================================================
+  // 成果報酬（紹介手数料）抽出
+  //   circus API 生データから報酬情報を柔軟に拾う。
+  //   フィールド名は媒体/バージョンで揺れるため候補を総当たり。
+  //   戻り値: { type:'rate'|'fixed'|'unknown', rate, amount, text }
+  //     rate  : 理論年収に対する％（数値、例 30）
+  //     amount: 固定額（円、例 600000）
+  //     text  : 表示用の元テキスト（あれば）
+  // ==========================================================
+  extractReward(raw) {
+    if (!raw || typeof raw !== 'object') return { type: 'unknown', rate: null, amount: null, text: '' }
+
+    // ％系フィールド候補（理論年収×N%）
+    const rateKeys = [
+      'rewardRate', 'feeRate', 'commissionRate', 'referralFeeRate',
+      'successFeeRate', 'rewardPercentage', 'feePercentage', 'refundRate',
+    ]
+    // 固定額系フィールド候補（円 or 万円）
+    const amountKeys = [
+      'rewardAmount', 'feeAmount', 'commissionAmount', 'referralFee',
+      'successFee', 'reward', 'fee', 'commission',
+    ]
+    // テキスト系（そのまま表示できる説明）
+    const textKeys = [
+      'rewardText', 'feeText', 'rewardDescription', 'feeDescription',
+      'rewardNote', 'commissionText',
+    ]
+
+    const num = (v) => {
+      if (typeof v === 'number' && !isNaN(v)) return v
+      if (typeof v === 'string') {
+        const m = v.replace(/[, ]/g, '').match(/-?\d+(\.\d+)?/)
+        if (m) return parseFloat(m[0])
+      }
+      return null
+    }
+
+    // 1) ％
+    let rate = null
+    for (const k of rateKeys) {
+      if (raw[k] != null) { const n = num(raw[k]); if (n != null) { rate = n; break } }
+    }
+    // ネストした reward オブジェクトも探索
+    const rObj = (raw.reward && typeof raw.reward === 'object') ? raw.reward
+      : (raw.fee && typeof raw.fee === 'object') ? raw.fee : null
+    if (rate == null && rObj) {
+      for (const k of ['rate', 'percentage', 'percent']) {
+        if (rObj[k] != null) { const n = num(rObj[k]); if (n != null) { rate = n; break } }
+      }
+    }
+
+    // 2) 固定額（円換算。万円らしき小さい値は×10000）
+    let amount = null
+    for (const k of amountKeys) {
+      const v = raw[k]
+      if (v != null && typeof v !== 'object') { const n = num(v); if (n != null) { amount = n; break } }
+    }
+    if (amount == null && rObj) {
+      for (const k of ['amount', 'value', 'fixed']) {
+        if (rObj[k] != null) { const n = num(rObj[k]); if (n != null) { amount = n; break } }
+      }
+    }
+    // 万円判定: 1000未満なら万円とみなし円換算（例: 60 → 600,000円）
+    if (amount != null && amount > 0 && amount < 1000) amount = amount * 10000
+
+    // 3) テキスト
+    let text = ''
+    for (const k of textKeys) {
+      if (typeof raw[k] === 'string' && raw[k].trim()) { text = raw[k].trim(); break }
+    }
+    if (!text && rObj && typeof rObj.text === 'string') text = rObj.text.trim()
+
+    if (rate != null) return { type: 'rate', rate, amount, text }
+    if (amount != null) return { type: 'fixed', rate: null, amount, text }
+    if (text) return { type: 'unknown', rate: null, amount: null, text }
+    return { type: 'unknown', rate: null, amount: null, text: '' }
+  },
+
 
   // freeText からキーワード候補を抽出する。
   // circusの検索は「フレーズ的」で、長文を入れるとヒット0になりやすい。

@@ -123,14 +123,19 @@ function jobToFullFromDetail(job, d) {
 }
 
 const SYSTEM = `あなたは人材紹介のプロのキャリアアドバイザーです。求職者の要望と各求人の一致度を評価します。
-複数の求人に対し、それぞれ0〜100点の一致度スコアと、30文字以内の日本語の理由を返してください。
+複数の求人に対し、それぞれ0〜100点の一致度スコアと、その求人を求職者に薦める理由を返してください。
+【理由の書き方】
+- 200字程度（180〜220字）で、キャリアアドバイザーが求職者に提案する想定の丁寧な日本語で書く。
+- 単なる条件の羅列ではなく「なぜこの人に合うのか」を、要望のフリー記述(価値観・志向・働き方)と結びつけて具体的に説明する。
+- 勤務地・年収・仕事内容など求人の魅力ポイントを、要望と対応づけて明示する。
+- 懸念点(要望と一部合わない点)があれば正直に一言添えてよい。
 【最重要】要望のフリー記述(価値観・キャリア志向・働き方)を最重視する。
 【情報の確度による重み付け】
 - 「[確]」が付いた項目（勤務地・年齢・性別・学歴・国籍・年収・必須要件）は確度が高い揺るぎない情報。
   これらが要望と明確にミスマッチ（例: 年齢制限外、勤務地が合わない、必須資格を満たさない）なら大きく減点する。
 - 「[参考]」が付いた項目（職種名・未経験可タグ）は不正確な場合が多い。参考程度に留め、これだけで大きく増減点しない。
 - 情報が不足している項目は中立。
-必ず次のJSON形式のみで出力: {"scores":[{"i":0,"score":85,"reason":"..."},...]}`
+必ず次のJSON形式のみで出力: {"scores":[{"i":0,"score":85,"reason":"200字程度の理由..."},...]}`
 
 export async function scoreBatch(env, criteria, jobs) {
   if (!jobs.length) return { results: [], tokensUsed: 0 }
@@ -145,7 +150,8 @@ export async function scoreBatch(env, criteria, jobs) {
       messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: user }],
       response_format: { type: 'json_object' },
       reasoning_effort: 'low',
-      max_completion_tokens: 2000,
+      // 200字程度の理由 × バッチ件数分を賄うため増量
+      max_completion_tokens: 6000,
     }),
   })
   if (!res.ok) throw new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 200)}`)
@@ -156,7 +162,68 @@ export async function scoreBatch(env, criteria, jobs) {
   const scores = parsed.scores || []
   const results = jobs.map((_, i) => {
     const s = scores.find((x) => x.i === i || x.index === i)
-    return { index: i, score: s ? Math.max(0, Math.min(100, Math.round(s.score))) : 40, reason: s?.reason ? String(s.reason).slice(0, 60) : '' }
+    // 理由は200字程度。260字で安全カット。
+    return { index: i, score: s ? Math.max(0, Math.min(100, Math.round(s.score))) : 40, reason: s?.reason ? String(s.reason).slice(0, 260) : '' }
+  })
+  return { results, tokensUsed }
+}
+
+// ============================================================
+// 条件緩和レコメンド採点
+//   通常マッチが払い出し件数(topN)に満たない場合に呼ぶ。
+//   年齢/性別/学歴（=変更不可）はクリア済みだが、年収/勤務地/雇用形態などの
+//   「緩和可能条件」で外れた求人を対象に、
+//     ・それでも求職者に薦められるか(0〜100)
+//     ・どの条件をどう妥協すれば良いか＋薦める理由(300字程度)
+//   を返す。理由は「求職者様に提出する」丁寧な文面。
+// ============================================================
+const SYSTEM_RELAX = `あなたは人材紹介のプロのキャリアアドバイザーです。
+求職者の希望条件では該当求人が不足しているため、「変更可能な条件を少し緩和すれば提案できる求人」を評価します。
+各求人には「緩和が必要な条件(relaxed)」が付いています。年齢・性別・学歴は既にクリアしているので触れません。
+【厳守】
+- 年齢・性別・学歴は変更不可。これらを緩める提案は絶対にしない。
+- 緩和してよいのは年収・勤務地・職種・業種・雇用形態・残業・休日など。
+【各求人について返すもの】
+- score: この求人を(条件緩和込みで)求職者に薦められる度合い 0〜100。
+- reason: 求職者様に提出する想定の丁寧な日本語で300字程度(280〜320字)。
+  ・どの条件をどの程度妥協することになるかを最初に明示する(例:「ご希望年収より少し下がりますが」「勤務地は隣県になりますが」)。
+  ・その上で、なぜそれでも十分魅力的か(仕事内容・成長性・待遇・要望との合致点)を具体的に説明し、前向きに背中を押す文面にする。
+  ・要望のフリー記述(価値観・志向)と結びつける。
+必ず次のJSON形式のみ: {"scores":[{"i":0,"score":78,"reason":"300字程度の提案理由..."},...]}`
+
+export async function scoreRelaxBatch(env, criteria, entries) {
+  // entries: [{ job, relaxedReasons: [...] }]
+  if (!entries.length) return { results: [], tokensUsed: 0 }
+  const lines = entries.map((e, i) => {
+    const relaxed = (e.relaxedReasons || []).length ? ` / [要緩和]${e.relaxedReasons.join('、')}` : ''
+    return `[${i}] ${jobToFull(e.job)}${relaxed}`
+  }).join('\n')
+  const user = sanitizeText(`求職者の要望:\n${criteriaToText(criteria)}\n\n【条件を緩めれば提案できる求人】(${entries.length}件):\n${lines}\n\n各求人[i]について、緩和込みで薦められるかを採点し、求職者様への提案理由(300字程度)を書いてJSONで返してください。`)
+
+  const res = await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+    body: JSON.stringify({
+      model: env.OPENAI_MODEL || 'gpt-5-nano',
+      messages: [{ role: 'system', content: SYSTEM_RELAX }, { role: 'user', content: user }],
+      response_format: { type: 'json_object' },
+      reasoning_effort: 'low',
+      max_completion_tokens: 7000,
+    }),
+  })
+  if (!res.ok) throw new Error(`OpenAI(relax) ${res.status}: ${(await res.text()).slice(0, 200)}`)
+  const data = await res.json()
+  const tokensUsed = data.usage?.total_tokens ?? 0
+  let parsed = {}
+  try { parsed = JSON.parse(data.choices?.[0]?.message?.content ?? '{}') } catch {}
+  const scores = parsed.scores || []
+  const results = entries.map((_, i) => {
+    const s = scores.find((x) => x.i === i || x.index === i)
+    return {
+      index: i,
+      score: s ? Math.max(0, Math.min(100, Math.round(s.score))) : 0,
+      reason: s?.reason ? String(s.reason).slice(0, 400) : '',
+    }
   })
   return { results, tokensUsed }
 }
