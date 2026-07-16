@@ -185,9 +185,11 @@ function renderWorkers(workers) {
 // ------------------------------------------------------------
 function rewardInfo(job) {
   const r = job.reward || {};
-  // 理論年収の推定: salaryMax(円) を優先、無ければsalaryMin。job.salaryMin/Maxは万円単位なので円換算。
-  const theoryMan = (job.salaryMax != null ? job.salaryMax : job.salaryMin); // 万円
-  const theoryYen = theoryMan != null ? theoryMan * 10000 : null;
+  // 理論年収の推定: salaryMax(円) を優先、無ければsalaryMin。
+  //   ★ job.salaryMin/Max は adapters.js mapApiJob で「円」単位で保存済み
+  //     （expectedAnnualSalary.min(万円) * 10000 = 円）。実データ検証済み:
+  //     salaryMin:6000000 = 600万円。よって円換算のための追加乗算は不要。
+  const theoryYen = (job.salaryMax != null ? job.salaryMax : job.salaryMin); // 円
 
   if (r.type === 'rate' && r.rate != null) {
     let text = `理論年収 × ${r.rate}%`;
@@ -215,7 +217,9 @@ function jobCardInner(it, opts) {
   opts = opts || {};
   const j = it.job || {};
   const color = it.score >= 80 ? '#16a34a' : it.score >= 65 ? '#ca8a04' : '#64748b';
-  const salary = (j.salaryMin || j.salaryMax) ? `${j.salaryMin||'?'}〜${j.salaryMax||'?'}万円` : '年収非公開';
+  // salaryMin/Max は「円」単位で保存されている（adapters.js 実データ検証済み）ため万円に変換して表示
+  const toMan = (yen) => (yen != null ? Math.round(yen / 10000).toLocaleString() : '?');
+  const salary = (j.salaryMin || j.salaryMax) ? `${toMan(j.salaryMin)}〜${toMan(j.salaryMax)}万円` : '年収非公開';
   const memBadge = it.fromMemory ? '<span class="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded"><i class="fas fa-lightbulb"></i>記憶</span>' : '';
   // 条件緩和レコメンドのバッジ
   const recBadge = j.isRecommend ? '<span class="text-[10px] bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-semibold"><i class="fas fa-wand-magic-sparkles mr-0.5"></i>条件緩和レコメンド</span>' : '';
