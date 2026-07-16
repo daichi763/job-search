@@ -428,6 +428,25 @@ export const circusAdapter = {
   extractReward(raw) {
     if (!raw || typeof raw !== 'object') return { type: 'unknown', rate: null, amount: null, text: '' }
 
+    // ★ circus 実データで確定したフィールド（probe_reward.js検証済）:
+    //   raw.commissionFee = { id, fee }  fee は「理論年収に対する率(%)」（例 fee:45 → 理論年収×45%）
+    //   人材紹介の成果報酬は理論年収の30〜45%が業界標準のため、この値は率(%)として扱う。
+    //   （万一 fee が桁の大きい固定額で来た場合の保険も入れる: 200以上は円/万円とみなす）
+    if (raw.commissionFee && typeof raw.commissionFee === 'object' && raw.commissionFee.fee != null) {
+      const f = typeof raw.commissionFee.fee === 'number'
+        ? raw.commissionFee.fee
+        : parseFloat(String(raw.commissionFee.fee).replace(/[, ]/g, ''))
+      if (Number.isFinite(f) && f > 0) {
+        if (f <= 100) {
+          // 率(%)として扱う（通常ケース）
+          return { type: 'rate', rate: f, amount: null, text: '' }
+        }
+        // 100超 = 固定額の可能性。1000未満は万円とみなし円換算。
+        const amount = f < 1000 ? f * 10000 : f
+        return { type: 'fixed', rate: null, amount, text: '' }
+      }
+    }
+
     // ％系フィールド候補（理論年収×N%）
     const rateKeys = [
       'rewardRate', 'feeRate', 'commissionRate', 'referralFeeRate',
