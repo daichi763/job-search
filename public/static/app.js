@@ -178,6 +178,10 @@ async function startSearch() {
     holiday: getChecked('hol'),
     benefits: [],
     requirements: '',
+    // 応募条件（HIGH優先の確定データ）
+    age: parseInt(document.getElementById('age').value) || null,
+    gender: document.getElementById('gender').value,
+    education: document.getElementById('education').value,
     topN: parseInt(document.getElementById('topN').value) || 10,
     sources: getChecked('src'),
   };

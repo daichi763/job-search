@@ -22,7 +22,7 @@ dotenv.config({ override: true })
 import { chromium } from 'playwright'
 import { ADAPTERS } from './adapters.js'
 import { mechanicalFilter, evaluateOne, evaluateDetail } from './filter.js'
-import { scoreBatch, scoreBriefBatch } from './scorer.js'
+import { scoreBatch, scoreBriefBatch, buildSearchPlans } from './scorer.js'
 
 const env = process.env
 const APP_URL = env.APP_URL || 'http://localhost:3000'
@@ -66,6 +66,14 @@ const EXPLORE = {
   TOKEN_BUDGET: parseInt(env.TOKEN_BUDGET || '400000', 10),
   // 時間上限（ミリ秒）。既定2時間。
   TIME_LIMIT_MS: parseInt(env.TIME_LIMIT_MS || String(2 * 60 * 60 * 1000), 10),
+  // --- 機能A（AI条件反復検索・API直接方式）用 ---
+  // 1プランあたり取得する最大求人数（API pagination の上限）。
+  PLAN_MAX_FETCH: parseInt(env.PLAN_MAX_FETCH || '500', 10),
+  // API 1リクエストの取得件数（circus は最大25件/リクエスト）。
+  API_PAGE_SIZE: parseInt(env.API_PAGE_SIZE || '25', 10),
+  // プラン件数がこの上限を超えたら「絞りすぎ緩和/追加条件」は行わず先頭から取得。
+  // （ユーザ指示: 絞りすぎ禁物。広めヒットは許容し、AI採点で絞る方針）
+  PLAN_COUNT_CAP: parseInt(env.PLAN_COUNT_CAP || '3000', 10),
 }
 
 async function api(path, opts = {}) {
@@ -110,9 +118,15 @@ async function pushResult(searchJobId, job, score, reason) {
 async function processSource(browser, source, searchJobId, criteria) {
   const adapter = ADAPTERS[source]
   if (!adapter) return
-  // ページ単位のコールバックに対応したアダプタのみ自律探索を行う
-  if (typeof adapter.fetchJobsPaged !== 'function') {
-    await reportState(searchJobId, source, { phase: 'error', message: `${source} は未対応（ページ探索API未実装）` })
+
+  // circus は【API直接方式】で機能A(AI条件反復検索)＋機能B(詳細=mapApiJob)を実行する。
+  // 対応判定: getAuthToken/apiSearch/mapApiJob を持つアダプタのみ。
+  const apiCapable =
+    typeof adapter.getAuthToken === 'function' &&
+    typeof adapter.apiSearch === 'function' &&
+    typeof adapter.mapApiJob === 'function'
+  if (!apiCapable) {
+    await reportState(searchJobId, source, { phase: 'error', message: `${source} は未対応（API直接方式未実装）` })
     return
   }
 
@@ -122,164 +136,165 @@ async function processSource(browser, source, searchJobId, criteria) {
   const useAI = (criteria.freeText || '').trim().length > 0
   const topN = criteria.topN || 10
 
-  let scanned = 0          // スキャンした総求人数
-  let passed = 0           // 機械フィルタ通過数
+  let scanned = 0          // 収集(取得)した総求人数
   let tokens = 0           // 消費トークン累計
-  let pagesSeen = 0        // 見たページ数
-  let stallPages = 0       // 連続で精読候補ゼロだったページ数
   const pool = []          // 精読候補プール { job, preScore, briefScore }
-  const seenIds = new Set()
+  const seenIds = new Set() // プラン横断の重複除去（求人ID）
 
-  // このページ探索を止めるべきか
-  const shouldStop = () => {
-    if (Date.now() - startedAt > EXPLORE.TIME_LIMIT_MS) return '時間上限'
-    if (scanned >= EXPLORE.MAX_SCAN) return 'スキャン上限'
-    if (pagesSeen >= EXPLORE.MAX_PAGES) return 'ページ上限'
-    if (tokens >= EXPLORE.TOKEN_BUDGET) return 'トークン予算'
-    if (stallPages >= EXPLORE.STALL_PAGES) return '連続空振り'
-    return null
-  }
+  const timeUp = () => Date.now() - startedAt > EXPLORE.TIME_LIMIT_MS
 
   try {
+    // ---- ログイン → 認証トークン取得（API直接方式）----
     await reportState(searchJobId, source, { phase: 'fetching', message: 'ログイン中…' })
     await adapter.login(page, env)
-    await reportState(searchJobId, source, { phase: 'fetching', message: '探索を開始…' })
+    await reportState(searchJobId, source, { phase: 'fetching', message: '認証トークン取得中…' })
+    const token = await adapter.getAuthToken(page)
+    console.log(`[${source}] 認証トークン取得OK`)
 
-    let totalInSource = null // 検索結果の総件数（DB全体でこの条件に合う件数）
+    // ---- 機能A: AIが検索プラン(複数)を生成 ----
+    await reportState(searchJobId, source, { phase: 'fetching', message: 'AIが検索プランを設計中…' })
+    let plans = []
+    try {
+      const r = await buildSearchPlans(env, criteria)
+      plans = r.plans
+      tokens += r.tokensUsed
+    } catch (e) {
+      console.log(`[${source}] buildSearchPlans失敗 → 単一フォールバックプラン: ${e.message}`)
+    }
+    if (!plans.length) {
+      // 最終フォールバック: キーワードのみの1プラン
+      plans = [{ label: 'フォールバック', keywords: [], orKeyword: adapter.extractKeyword(criteria) || '', filters: {} }]
+    }
+    console.log(`[${source}] 検索プラン ${plans.length}件:`)
+    plans.forEach((p, i) => console.log(`  [${i}] ${p.label} kw="${p.orKeyword}" filters=${JSON.stringify(p.filters)}`))
+    await reportState(searchJobId, source, {
+      phase: 'fetching', tokensUsed: tokens,
+      message: `AIが${plans.length}通りの検索プランを設計。反復検索を開始…`,
+    })
 
-    // チャンク単位コールバック。求人配列＋meta(total)を受け取り、処理して
-    // 「探索を続けるか(true) / 止めるか(false)」を返す。
-    const onPage = async (jobsInPage, meta = {}) => {
-      if (meta.total != null && totalInSource == null) {
-        totalInSource = meta.total
-        await reportState(searchJobId, source, {
-          phase: 'fetching', totalInDb: totalInSource,
-          message: `該当${totalInSource.toLocaleString()}件を探索開始…`,
-        })
+    let grandTotal = 0 // 全プランの該当件数合計（参考表示用）
+
+    // ---- 機能A ループ: 各プランを count→取得→機械フィルタ→1次AI粗選別 ----
+    for (let pi = 0; pi < plans.length; pi++) {
+      if (timeUp()) { console.log(`[${source}] プラン反復中断: 時間上限`); break }
+      if (tokens >= EXPLORE.TOKEN_BUDGET) { console.log(`[${source}] プラン反復中断: トークン予算`); break }
+      if (scanned >= EXPLORE.MAX_SCAN) { console.log(`[${source}] プラン反復中断: スキャン上限`); break }
+
+      const plan = plans[pi]
+      const qJson = adapter.buildQJson({ or: plan.orKeyword })
+
+      // 件数確認（jobSearchMatches）: ユーザのFunction Aパターン
+      // 「絞り込んで件数を見る→条件を少し変えて再検索」を反映。
+      let planTotal = null
+      try {
+        planTotal = await adapter.apiCount(page, token, { qJson, filters: plan.filters })
+      } catch (e) {
+        console.log(`[${source}] apiCount失敗(plan ${pi}): ${e.message}`)
       }
-      pagesSeen++
-      // 重複除去
-      const fresh = []
-      for (const job of jobsInPage) {
-        const id = `${source}:${job.sourceJobId}`
-        if (job.sourceJobId && seenIds.has(id)) continue
-        if (job.sourceJobId) seenIds.add(id)
-        fresh.push(job)
-      }
-      scanned += fresh.length
+      if (planTotal != null) grandTotal += planTotal
+      console.log(`[${source}] plan[${pi}] "${plan.label}" 該当=${planTotal ?? '?'}件`)
+      await reportState(searchJobId, source, {
+        phase: 'fetching', scanned, candidates: pool.length, tokensUsed: tokens,
+        totalInDb: grandTotal || undefined,
+        message: `プラン${pi + 1}/${plans.length}「${plan.label}」該当${(planTotal ?? 0).toLocaleString()}件を精査中…`,
+      })
 
-      // 機械フィルタ（絶対条件で足切り・トークン0）
-      const survivors = []
-      for (const job of fresh) {
-        const ev = evaluateOne(job, criteria)
-        if (!ev.hardFail) survivors.push(ev)
-      }
-      passed += survivors.length
+      // 該当0件ならスキップ（次プランへ）
+      if (planTotal === 0) continue
 
-      let candidatesThisPage = 0
-      if (survivors.length) {
-        if (!useAI) {
-          // 要望フリー記述が無い場合は機械スコアで候補化
-          for (const ev of survivors) {
-            if (ev.preScore >= EXPLORE.BRIEF_THRESHOLD) {
-              pool.push({ job: ev.job, preScore: ev.preScore, briefScore: ev.preScore })
-              candidatesThisPage++
+      // このプランから取得する上限件数（絞りすぎ緩和はせず、上限内で収集しAI採点で絞る）
+      const fetchCap = Math.min(
+        EXPLORE.PLAN_MAX_FETCH,
+        planTotal != null ? planTotal : EXPLORE.PLAN_MAX_FETCH,
+      )
+
+      // ページネーションで収集
+      for (let offset = 0; offset < fetchCap; offset += EXPLORE.API_PAGE_SIZE) {
+        if (timeUp()) { console.log(`[${source}] 取得中断: 時間上限`); break }
+        if (scanned >= EXPLORE.MAX_SCAN) { console.log(`[${source}] 取得中断: スキャン上限`); break }
+        if (tokens >= EXPLORE.TOKEN_BUDGET) { console.log(`[${source}] 取得中断: トークン予算`); break }
+
+        const pageNo = Math.floor(offset / EXPLORE.API_PAGE_SIZE) + 1
+        let resp
+        try {
+          resp = await adapter.apiSearch(page, token, {
+            qJson, filters: plan.filters,
+            limit: EXPLORE.API_PAGE_SIZE, offset, pageNo,
+          })
+        } catch (e) {
+          console.log(`[${source}] apiSearch失敗(plan ${pi} off ${offset}): ${e.message}`)
+          break
+        }
+        const rawJobs = resp.jobs || []
+        if (!rawJobs.length) break // 末尾
+
+        // 機能B: 生API job → 内部 job 形状へ変換（詳細情報込み。別途取得不要）
+        const jobs = rawJobs.map((rj) => adapter.mapApiJob(rj)).filter(Boolean)
+
+        // プラン横断の重複除去
+        const fresh = []
+        for (const job of jobs) {
+          const id = `${source}:${job.sourceJobId}`
+          if (job.sourceJobId && seenIds.has(id)) continue
+          if (job.sourceJobId) seenIds.add(id)
+          fresh.push(job)
+        }
+        scanned += fresh.length
+        if (!fresh.length) continue
+
+        // 機械フィルタ（勤務地/年収/雇用=hardFail、職種/業種=加点のみ）
+        // + 揺るぎないHIGH情報(年齢/性別/学歴)による除外（API方式では最初から判定可能）
+        const survivors = []
+        for (const job of fresh) {
+          const ev = evaluateOne(job, criteria)
+          if (ev.hardFail) continue
+          const dv = evaluateDetail(job, criteria)
+          if (dv.hardFail) continue // 年齢/性別/学歴ミスマッチは即除外
+          survivors.push(ev)
+        }
+
+        // 1次AI粗選別（安く大量に） or 機械スコア候補化
+        if (survivors.length) {
+          if (!useAI) {
+            for (const ev of survivors) {
+              if (ev.preScore >= EXPLORE.BRIEF_THRESHOLD) {
+                pool.push({ job: ev.job, preScore: ev.preScore, briefScore: ev.preScore })
+              }
             }
-          }
-        } else {
-          // 1次AI粗選別（安く大量に）
-          for (let i = 0; i < survivors.length; i += EXPLORE.BRIEF_BATCH) {
-            const chunk = survivors.slice(i, i + EXPLORE.BRIEF_BATCH)
-            const { results, tokensUsed } = await scoreBriefBatch(env, criteria, chunk.map((s) => s.job))
-            tokens += tokensUsed
-            for (const r of results) {
-              if (r.score >= EXPLORE.BRIEF_THRESHOLD) {
-                pool.push({ job: chunk[r.index].job, preScore: chunk[r.index].preScore, briefScore: r.score })
-                candidatesThisPage++
+          } else {
+            for (let i = 0; i < survivors.length; i += EXPLORE.BRIEF_BATCH) {
+              if (tokens >= EXPLORE.TOKEN_BUDGET) break
+              const chunk = survivors.slice(i, i + EXPLORE.BRIEF_BATCH)
+              const { results, tokensUsed } = await scoreBriefBatch(env, criteria, chunk.map((s) => s.job))
+              tokens += tokensUsed
+              for (const r of results) {
+                if (r.score >= EXPLORE.BRIEF_THRESHOLD) {
+                  pool.push({ job: chunk[r.index].job, preScore: chunk[r.index].preScore, briefScore: r.score })
+                }
               }
             }
           }
         }
-      }
 
-      if (candidatesThisPage > 0) stallPages = 0
-      else stallPages++
-
-      console.log(`[${source}] p${pagesSeen}: scan+${fresh.length}(計${scanned}) 通過${survivors.length} 候補+${candidatesThisPage}(計${pool.length}) 空振り${stallPages} tok${tokens}`)
-      await reportState(searchJobId, source, {
-        phase: 'fetching', scanned, candidates: pool.length, tokensUsed: tokens,
-        totalInDb: totalInSource ?? undefined,
-        message: totalInSource
-          ? `探索中… ${scanned.toLocaleString()}/${totalInSource.toLocaleString()}件走査 / 有望候補${pool.length}件`
-          : `探索中… ${scanned}件走査 / 有望候補${pool.length}件`,
-      })
-
-      const stop = shouldStop()
-      if (stop) {
-        console.log(`[${source}] 探索停止: ${stop}`)
-        return false
-      }
-      return true
-    }
-
-    await adapter.fetchJobsPaged(page, criteria, onPage)
+        console.log(`[${source}] plan[${pi}] off${offset}: 取得${rawJobs.length} 新規${fresh.length}(計${scanned}) 通過${survivors.length} 候補計${pool.length} tok${tokens}`)
+        await reportState(searchJobId, source, {
+          phase: 'fetching', scanned, candidates: pool.length, tokensUsed: tokens,
+          totalInDb: grandTotal || undefined,
+          message: `プラン${pi + 1}/${plans.length}「${plan.label}」${scanned.toLocaleString()}件走査 / 有望候補${pool.length}件`,
+        })
+      } // offset loop
+    } // plan loop
 
     // ---- 2次精読フェーズ ----
     // プールを1次スコア順に並べ、上位 MAX_DEEP 件だけ全文精読する。
+    // 機能Bはすでに完了（mapApiJob が詳細情報を保持）なので詳細ページ取得は不要。
     pool.sort((a, b) => b.briefScore - a.briefScore)
-    const toDeep = pool.slice(0, EXPLORE.MAX_DEEP)
-    console.log(`[${source}] 探索完了: 走査${scanned} / 有望候補${pool.length} / 精読対象${toDeep.length}`)
-
-    // ---- 機能B: 詳細ページ取得フェーズ ----
-    // 精読対象のうち1次スコア上位 MAX_DETAIL 件だけ詳細ページを開き、
-    // 採用要件（年齢/性別/学歴 等の揺るぎない情報）を取得して job.detail に付与する。
-    // これにより次の精読(scoreBatch)の採点精度が上がる。
-    if (typeof adapter.fetchDetail === 'function') {
-      const detailTargets = toDeep.slice(0, EXPLORE.MAX_DETAIL)
-      await reportState(searchJobId, source, {
-        phase: 'scoring', scanned, candidates: pool.length, tokensUsed: tokens,
-        message: `上位${detailTargets.length}件の詳細情報を取得中…`,
-      })
-      let got = 0
-      for (const c of detailTargets) {
-        // 詳細取得フェーズでは時間上限のみで打ち切る（scan/page上限は探索専用のため無視）
-        if (Date.now() - startedAt > EXPLORE.TIME_LIMIT_MS) { console.log(`[${source}] 詳細取得中断: 時間上限`); break }
-        try {
-          const { detail } = await adapter.fetchDetail(page, c.job.sourceJobId)
-          c.job.detail = detail
-          // 詳細で確定した勤務地/年収でjobの基本項目も上書き（表示・機械評価用）
-          if (detail.locations && detail.locations.length) c.job.locations = detail.locations
-          if (detail.salaryMin != null) c.job.salaryMin = detail.salaryMin
-          if (detail.salaryMax != null) c.job.salaryMax = detail.salaryMax
-          // 揺るぎないHIGH情報(年齢/性別/学歴)で明確にミスマッチなら精読対象から除外
-          const dv = evaluateDetail(c.job, criteria)
-          if (dv.hardFail) {
-            c.excluded = true
-            c.excludeReason = dv.reasons.join('・')
-            console.log(`[${source}] 詳細除外 id=${c.job.sourceJobId}: ${c.excludeReason}`)
-          }
-          got++
-          if (got % 5 === 0) {
-            await reportState(searchJobId, source, {
-              phase: 'scoring', scanned, candidates: pool.length, tokensUsed: tokens,
-              message: `詳細情報を取得中… (${got}/${detailTargets.length}件)`,
-            })
-          }
-        } catch (e) {
-          console.log(`[${source}] fetchDetail失敗 id=${c.job.sourceJobId}: ${String(e.message).slice(0, 100)}`)
-        }
-      }
-      console.log(`[${source}] 詳細取得完了: ${got}件`)
-    }
-
-    // 揺るぎないHIGH情報で除外された候補を精読対象から外す
-    const scoreTargets = toDeep.filter((c) => !c.excluded)
-    const excludedCount = toDeep.length - scoreTargets.length
-    if (excludedCount > 0) console.log(`[${source}] 年齢/性別/学歴で${excludedCount}件除外`)
+    const scoreTargets = pool.slice(0, EXPLORE.MAX_DEEP)
+    console.log(`[${source}] 反復検索完了: 走査${scanned} / 有望候補${pool.length} / 精読対象${scoreTargets.length}`)
 
     await reportState(searchJobId, source, {
       phase: 'scoring', scanned, candidates: pool.length, tokensUsed: tokens,
-      message: `上位${scoreTargets.length}件を精読中…（${excludedCount}件は年齢/性別/学歴で除外）`,
+      message: `上位${scoreTargets.length}件を精読中…`,
     })
 
     let matched = 0
@@ -312,9 +327,9 @@ async function processSource(browser, source, searchJobId, criteria) {
     }
 
     await reportState(searchJobId, source, {
-      phase: 'done', matched, tokensUsed: tokens, totalInDb: totalInSource ?? scanned, scanned,
+      phase: 'done', matched, tokensUsed: tokens, totalInDb: grandTotal || scanned, scanned,
       candidates: pool.length,
-      message: `完了: 該当${(totalInSource ?? scanned).toLocaleString()}件中${scanned}件走査→${pool.length}件精査→${matched}件を提案 (トークン約${tokens})`,
+      message: `完了: 該当延べ${(grandTotal || scanned).toLocaleString()}件から${scanned}件走査→${pool.length}件精査→${matched}件を提案 (トークン約${tokens})`,
     })
   } catch (e) {
     console.error(`[${source}] error:`, e)

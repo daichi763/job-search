@@ -1,3 +1,8 @@
+import {
+  OCCUPATIONS, INDUSTRIES, PREFECTURES, EDUCATION, REQUIRED_GENDERS,
+  AVERAGE_OVERTIMES, EMPLOYMENT_TYPES, POSITIONS, CAREER_STAGES,
+} from './circus_master.js'
+
 // ============================================================
 // 各求人サイトのスクレイピング・アダプタ
 //
@@ -185,6 +190,225 @@ export const circusAdapter = {
       if (still) throw new Error('circusログイン失敗（認証情報またはダイアログ処理を確認）')
     }
   },
+
+  // ==========================================================
+  // 【API直接方式】 circus 内部REST API を直接叩く（画面操作を経由しない）。
+  // UI操作方式(fetchJobsPaged/applyConditions)より高速・確実。
+  //   認証: x-circus-authentication-token ヘッダ（UUID）。/search を一度
+  //         ロードすると発火するリクエストから捕捉できる。
+  //   検索: GET /api/jobSearch?qJson=...(×4)&<filters>&limit&offset&page
+  //   件数: GET /api/jobSearchMatches?...(同一params) → マッチ件数のみ
+  // ==========================================================
+
+  // /search をロードして x-circus-authentication-token を捕捉する。
+  // login(page, env) 済みの page を渡すこと。
+  async getAuthToken(page) {
+    let token = null
+    const handler = (r) => {
+      const h = r.headers()
+      if (h['x-circus-authentication-token'] && !token) token = h['x-circus-authentication-token']
+    }
+    page.on('request', handler)
+    try {
+      await page.goto(`${this.base}/search`, { waitUntil: 'networkidle', timeout: 60000 })
+      // トークンを載せたリクエストが飛ぶまで少し待つ
+      for (let t = 0; t < 10 && !token; t++) {
+        await page.waitForTimeout(700)
+      }
+    } finally {
+      page.off('request', handler)
+    }
+    if (!token) throw new Error('circus 認証トークン(x-circus-authentication-token)の取得に失敗しました')
+    return token
+  }, // getAuthToken
+
+  // qJson(4要素) を組み立てる。option=8=掲載内容全体（真の全文）が既定。
+  //   terms: { and, or, excludeAnd, excludeOr } いずれも文字列（空可）。
+  buildQJson(terms = {}, option) {
+    const opt = option || parseInt(process.env.CIRCUS_SEARCH_OPTION || '8', 10)
+    return [
+      { option: opt, keyword: terms.and || '', logicType: 'and' },
+      { option: opt, keyword: terms.or || '', logicType: 'or' },
+      { option: opt, keyword: terms.excludeAnd || '', logicType: 'excludeAnd' },
+      { option: opt, keyword: terms.excludeOr || '', logicType: 'excludeOr' },
+    ]
+  },
+
+  // filters(コード群)→ URLSearchParams用の extra オブジェクトへ変換。
+  // 値は配列可（複数選択）。circus APIは同名キーを複数回 append する形式。
+  //   filters: {
+  //     occupations:[..], industries:[..], prefectures:[..],
+  //     education:N, requiredGenders:N, averageOvertimes:N, age:N,
+  //     annualSalaryInclude:N, employmentTypes:[..], careerStage:N, ...
+  //   }
+  // 戻り値: [ [key, value], ... ] の配列（append 用に順序保持）
+  filtersToPairs(filters = {}) {
+    const pairs = []
+    const pushMulti = (key, val) => {
+      if (val == null) return
+      const arr = Array.isArray(val) ? val : [val]
+      for (const v of arr) if (v !== '' && v != null) pairs.push([key, String(v)])
+    }
+    pushMulti('occupations', filters.occupations)
+    pushMulti('industries', filters.industries)
+    pushMulti('prefectures', filters.prefectures)
+    pushMulti('employmentTypes', filters.employmentTypes)
+    if (filters.education != null) pairs.push(['education', String(filters.education)])
+    if (filters.requiredGenders != null) pairs.push(['requiredGenders', String(filters.requiredGenders)])
+    if (filters.averageOvertimes != null) pairs.push(['averageOvertimes', String(filters.averageOvertimes)])
+    if (filters.age != null) pairs.push(['age', String(filters.age)])
+    if (filters.careerStage != null) pairs.push(['careerStage', String(filters.careerStage)])
+    if (filters.annualSalaryInclude != null) pairs.push(['annualSalary.include', String(filters.annualSalaryInclude)])
+    if (filters.annualSalaryMin != null) pairs.push(['annualSalary.min', String(filters.annualSalaryMin)])
+    if (filters.annualSalaryMax != null) pairs.push(['annualSalary.max', String(filters.annualSalaryMax)])
+    // 任意の生パラメータ（将来拡張・未マップコード用）
+    if (filters.raw && typeof filters.raw === 'object') {
+      for (const [k, v] of Object.entries(filters.raw)) pushMulti(k, v)
+    }
+    return pairs
+  },
+
+  // ブラウザ内 fetch で API を叩く共通処理。
+  //   endpoint: 'jobSearch' | 'jobSearchMatches'
+  //   returns: jobSearch → { jobs:[], total:N }, jobSearchMatches → { matches:N } (rawも返す)
+  async _apiCall(page, token, endpoint, { qJson, filters, limit = 25, offset = 0, pageNo = 1 } = {}) {
+    const pairs = this.filtersToPairs(filters || {})
+    return await page.evaluate(async ({ token, endpoint, qJson, pairs, limit, offset, pageNo }) => {
+      const qs = new URLSearchParams()
+      for (const q of qJson) qs.append('qJson', JSON.stringify(q))
+      qs.set('limit', String(limit))
+      qs.set('offset', String(offset))
+      qs.set('page', String(pageNo))
+      qs.set('orderBy', 'recommendScore')
+      qs.set('order', 'desc')
+      for (const [k, v] of pairs) qs.append(k, v)
+      const url = `https://circus-job.com/api/${endpoint}?` + qs.toString()
+      const res = await fetch(url, {
+        credentials: 'include',
+        headers: { 'accept': 'application/json, text/plain, */*', 'x-circus-authentication-token': token },
+      })
+      const status = res.status
+      let json = null
+      try { json = await res.json() } catch {}
+      return { status, json }
+    }, { token, endpoint, qJson, pairs, limit, offset, pageNo })
+  },
+
+  // 求人検索（本体）。params = { qJson, filters, limit, offset, pageNo }
+  // 戻り値: { total:Number, jobs:[生API job], status }
+  async apiSearch(page, token, params = {}) {
+    const { status, json } = await this._apiCall(page, token, 'jobSearch', params)
+    if (status !== 200 || !json) {
+      throw new Error(`circus apiSearch 失敗 status=${status}`)
+    }
+    return { total: json.total ?? null, jobs: Array.isArray(json.jobs) ? json.jobs : [], status }
+  },
+
+  // マッチ件数のみ取得（機能Aの件数→条件調整ループ用。求人本体は取らないので軽量）。
+  // 戻り値: Number（件数）または null
+  async apiCount(page, token, params = {}) {
+    const { status, json } = await this._apiCall(page, token, 'jobSearchMatches', { ...params, limit: 1 })
+    if (status !== 200 || !json) return null
+    // レスポンスキーは環境により matches / total / count 等の可能性。総当たりで数値を拾う。
+    const cand = json.matches ?? json.total ?? json.count ?? json.totalCount ?? json.hitCount
+    if (typeof cand === 'number') return cand
+    // jobSearchMatches が {total} を返さない場合、jobSearch の total で代替（保険）
+    for (const v of Object.values(json)) if (typeof v === 'number') return v
+    return null
+  },
+
+  // ==========================================================
+  // 【機能B（詳細取得）＝API直接方式】
+  // /api/jobSearch の生 job オブジェクトを内部 NormalizedJob 形式へ変換する。
+  // 別途の詳細ページ取得は不要（jobSearch レスポンスに詳細情報が全部含まれる）。
+  //   生 job の主要フィールド（probe_apishape.js 実測）:
+  //     id, name(タイトル), occupations{main,sub[]}, employmentTypes[],
+  //     careerStage, positions[], jobDescriptions(仕事内容),
+  //     addresses[{prefecture}], expectedAnnualSalary{min,max}(万円),
+  //     requiredAges{min,max}, requiredGender, requiredEducation,
+  //     minimumQualification(応募資格), company{name,industries{main,sub},website},
+  //     open, publishStartedAt, lastUpdatedAt
+  // ==========================================================
+  mapApiJob(raw) {
+    if (!raw) return null
+    const labelOf = (map, code) => {
+      const e = map[String(code)]
+      return e ? (typeof e === 'object' ? e.label : e) : null
+    }
+
+    // 職種: main + sub をラベル化
+    const occCodes = []
+    if (raw.occupations) {
+      if (raw.occupations.main != null) occCodes.push(raw.occupations.main)
+      if (Array.isArray(raw.occupations.sub)) occCodes.push(...raw.occupations.sub)
+    }
+    const jobCategories = occCodes.map((c) => labelOf(OCCUPATIONS, c)).filter(Boolean)
+
+    // 業種: company.industries main + sub
+    const indCodes = []
+    const comp = raw.company || {}
+    if (comp.industries) {
+      if (comp.industries.main != null) indCodes.push(comp.industries.main)
+      if (Array.isArray(comp.industries.sub)) indCodes.push(...comp.industries.sub)
+    }
+    const industries = indCodes.map((c) => labelOf(INDUSTRIES, c)).filter(Boolean)
+
+    // 勤務地: addresses[].prefecture → 都道府県ラベル（重複除去）
+    const prefLabels = []
+    if (Array.isArray(raw.addresses)) {
+      for (const a of raw.addresses) {
+        const l = labelOf(PREFECTURES, a && a.prefecture)
+        if (l && !prefLabels.includes(l)) prefLabels.push(l)
+      }
+    }
+
+    // 雇用形態
+    const employment = (Array.isArray(raw.employmentTypes) ? raw.employmentTypes : [])
+      .map((c) => labelOf(EMPLOYMENT_TYPES, c)).filter(Boolean)
+
+    // 年収: 万円単位 → 円
+    const sal = raw.expectedAnnualSalary || {}
+    const salaryMin = typeof sal.min === 'number' ? Math.round(sal.min * 10000) : null
+    const salaryMax = typeof sal.max === 'number' ? Math.round(sal.max * 10000) : null
+
+    // 応募条件（年齢/性別/学歴）— HIGH優先の確定データ
+    const ages = raw.requiredAges || {}
+    const requiredAgeMin = typeof ages.min === 'number' ? ages.min : null
+    const requiredAgeMax = typeof ages.max === 'number' ? ages.max : null
+    const requiredGender = labelOf(REQUIRED_GENDERS, raw.requiredGender) // null=不問
+    const requiredEducation = labelOf(EDUCATION, raw.requiredEducation)  // null=不明
+
+    return {
+      source: 'circus',
+      sourceJobId: String(raw.id),
+      title: raw.name || '',
+      company: comp.name || '',
+      companyWebsite: comp.website || '',
+      jobCategory: jobCategories.join('・'),
+      jobCategories,              // 配列も保持（採点用）
+      industry: industries.join('・'),
+      industries,
+      employment: employment.join('・'),
+      locations: prefLabels,      // 県レベル（ユーザ指示: 県 or 市で十分）
+      salaryMin,
+      salaryMax,
+      // 応募条件（確定データ = HIGH優先）
+      requiredAgeMin,
+      requiredAgeMax,
+      requiredGender,
+      requiredEducation,
+      requirements: raw.minimumQualification || '',
+      description: raw.jobDescriptions || '',
+      positions: (Array.isArray(raw.positions) ? raw.positions : [])
+        .map((c) => labelOf(POSITIONS, c)).filter(Boolean),
+      careerStage: labelOf(CAREER_STAGES, raw.careerStage),
+      url: `${this.base}/jobs/${raw.id}`,
+      isOpen: raw.open !== false,
+      publishStartedAt: raw.publishStartedAt || null,
+      lastUpdatedAt: raw.lastUpdatedAt || null,
+      _raw: raw,                  // 生データも保持（デバッグ・追加抽出用）
+    }
+  }, // mapApiJob
 
   // freeText からキーワード候補を抽出する。
   // circusの検索は「フレーズ的」で、長文を入れるとヒット0になりやすい。

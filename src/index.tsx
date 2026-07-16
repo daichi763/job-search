@@ -36,6 +36,10 @@ app.post('/api/search', async (c) => {
     holiday: body.holiday || [],
     benefits: body.benefits || [],
     requirements: body.requirements || '',
+    // 応募条件（HIGH優先）
+    age: body.age != null && `${body.age}` !== '' ? Number(body.age) : null,
+    gender: body.gender || '',
+    education: body.education || '',
     topN: Math.max(1, Math.min(50, body.topN || 10)),
     sources: body.sources && body.sources.length ? body.sources : ['kintone', 'circus', 'hitolink', 'jobins'],
   }

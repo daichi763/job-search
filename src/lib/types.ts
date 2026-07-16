@@ -44,6 +44,10 @@ export interface SearchCriteria {
   holiday: string[] // 休日
   benefits: string[] // 福利厚生
   requirements: string // その他必須条件(テキスト)
+  // --- 応募条件（HIGH優先の確定データ。circus API で直接フィルタ／HIGH判定に使用）---
+  age: number | null // 求職者の年齢
+  gender: string // 求職者の性別（'男性'|'女性'|''）
+  education: string // 求職者の最終学歴（'高卒'|'専門卒'|'短大卒'|'大卒'|'大学院卒'|'学歴不問'|''）
   topN: number // 払い出す件数
   sources: SourceId[] // 検索対象DB
 }

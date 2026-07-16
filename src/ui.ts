@@ -53,6 +53,41 @@ export function renderPage(): string {
           </div>
         </div>
 
+        <!-- 応募条件（HIGH優先の確定データ）: 年齢/性別/最終学歴 -->
+        <div class="bg-indigo-50 border border-indigo-100 rounded-lg p-2 mb-3">
+          <p class="text-xs font-semibold text-indigo-700 mb-2"><i class="fas fa-user-check mr-1"></i>応募条件（求職者の属性）<span class="font-normal text-indigo-400">※確度が高くAIが重視</span></p>
+          <div class="grid grid-cols-3 gap-2">
+            <div>
+              <label class="block text-xs font-semibold mb-1">年齢</label>
+              <div class="flex items-center gap-1">
+                <input id="age" type="number" min="15" max="80" class="w-full border border-slate-300 rounded-lg p-2 text-sm" placeholder="30">
+                <span class="text-xs text-slate-500">歳</span>
+              </div>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold mb-1">性別</label>
+              <select id="gender" class="w-full border border-slate-300 rounded-lg p-2 text-sm">
+                <option value="">指定なし</option>
+                <option value="男性">男性</option>
+                <option value="女性">女性</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold mb-1">最終学歴</label>
+              <select id="education" class="w-full border border-slate-300 rounded-lg p-2 text-sm">
+                <option value="">指定なし</option>
+                <option value="高卒">高卒</option>
+                <option value="専門卒">専門卒</option>
+                <option value="短大卒">短大卒</option>
+                <option value="大卒">大卒</option>
+                <option value="大学院卒">大学院卒</option>
+                <option value="学歴不問">学歴不問</option>
+              </select>
+            </div>
+          </div>
+          <p class="text-[10px] text-slate-500 mt-1">※最終学歴は「この学歴以上で応募可能な求人」を対象にします</p>
+        </div>
+
         <label class="block text-sm font-semibold mb-1">勤務地（都道府県）</label>
         <div id="locations" class="flex flex-wrap gap-1 mb-3 max-h-28 overflow-y-auto border border-slate-100 rounded-lg p-2"></div>
 
@@ -70,6 +105,7 @@ export function renderPage(): string {
           <option value="20時間以下">20時間以下</option>
           <option value="30時間以下">30時間以下</option>
           <option value="40時間以下">40時間以下</option>
+          <option value="50時間以下">50時間以下</option>
         </select>
 
         <label class="block text-sm font-semibold mb-1">休日</label>
