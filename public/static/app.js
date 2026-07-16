@@ -360,6 +360,30 @@ function renderResults(items) {
 
 // 検索実行
 let pollTimer = null;
+// 添付されたPDF(職務経歴書/履歴書)を base64 文字列で読み込む。
+//   ・PDFのみ対応（拡張子/MIMEでチェック）
+//   ・未選択なら null を返す（書類なしでも検索可能）
+//   ・サイズ上限 8MB（大きすぎる添付を弾く）
+function readResumePdf() {
+  return new Promise((resolve, reject) => {
+    const input = document.getElementById('resumePdf');
+    if (!input || !input.files || input.files.length === 0) return resolve(null);
+    const file = input.files[0];
+    const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+    if (!isPdf) return reject(new Error('対応形式はPDFのみです。PDFファイルを選択してください。'));
+    if (file.size > 8 * 1024 * 1024) return reject(new Error('ファイルサイズが大きすぎます（上限8MB）。'));
+    const reader = new FileReader();
+    reader.onload = () => {
+      // reader.result は data:application/pdf;base64,XXXX の形式
+      const result = String(reader.result || '');
+      const comma = result.indexOf(',');
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(new Error('PDFの読み込みに失敗しました。'));
+    reader.readAsDataURL(file);
+  });
+}
+
 async function startSearch() {
   const btn = document.getElementById('searchBtn');
   btn.disabled = true;
@@ -390,6 +414,17 @@ async function startSearch() {
     topN: parseInt(document.getElementById('topN').value) || 10,
     sources: getChecked('src'),
   };
+
+  // 添付書類(職務経歴書/履歴書。PDFのみ)。選択されていれば base64 で送る。
+  // 未添付でもそのまま検索可能（書類なしでも動作）。
+  try {
+    const b64 = await readResumePdf();
+    if (b64) criteria.resumePdfBase64 = b64;
+  } catch (e) {
+    document.getElementById('search-status').textContent = String(e.message || e);
+    resetBtn();
+    return;
+  }
 
   try {
     const res = await fetch('/api/search', {

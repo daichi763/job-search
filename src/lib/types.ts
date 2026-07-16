@@ -50,6 +50,10 @@ export interface SearchCriteria {
   education: string // 求職者の最終学歴（'高卒'|'専門卒'|'短大卒'|'大卒'|'大学院卒'|'学歴不問'|''）
   topN: number // 払い出す件数
   sources: SourceId[] // 検索対象DB
+  // --- 添付書類(職務経歴書/履歴書。PDFのみ)。任意（未添付でも動作）---
+  resumePdfBase64?: string // フロントから送られる生PDF(base64)。worker解析後に破棄される（永続化しない想定）
+  resumeText?: string      // worker側でPDF解析＋PIIマスク＋要約したテキスト（検索プラン/採点に利用）
+  resumeAnalysis?: any     // worker側の構造化解析結果（任意）
 }
 
 // AI採点結果

@@ -23,6 +23,59 @@ import { chromium } from 'playwright'
 import { ADAPTERS } from './adapters.js'
 import { mechanicalFilter, evaluateOne, evaluateDetail } from './filter.js'
 import { scoreBatch, scoreBriefBatch, buildSearchPlans, scoreRelaxBatch } from './scorer.js'
+import { analyzeResumePdf, resumeAnalysisToText } from './resume.js'
+
+// 職務経歴書(PDF)解析結果のキャッシュ。
+//   同一検索ジョブは複数媒体(circus/hitolink...)で processSource が呼ばれるため、
+//   PDF解析(pdf-parse + OpenAI)を searchJobId 単位で1回だけ実行して使い回す。
+//   値: { text: 反映用テキスト, analysis: 構造化, done: true }
+const resumeCache = new Map()
+
+// 検索ジョブの criteria に添付PDFがあれば解析し、criteria.resumeText へ反映する。
+//   ・解析後、元の base64(criteria.resumePdfBase64) は削除する（＝完了後に破棄）。
+//   ・PDFが無い/解析失敗でも criteria はそのまま使える（書類なしでも動作）。
+async function ensureResumeAnalyzed(searchJobId, criteria) {
+  if (!criteria) return
+  // 既に反映済みなら何もしない
+  if (criteria.resumeText) return
+  const b64 = criteria.resumePdfBase64
+  if (!b64) return
+
+  // キャッシュヒット（他媒体で解析済み）
+  if (resumeCache.has(searchJobId)) {
+    const cached = resumeCache.get(searchJobId)
+    if (cached && cached.text) {
+      criteria.resumeText = cached.text
+      criteria.resumeAnalysis = cached.analysis
+    }
+    delete criteria.resumePdfBase64 // 破棄
+    return { status: cached ? cached.status : 'skipped' }
+  }
+
+  console.log(`[resume] 職務経歴書PDFを解析中… job=${searchJobId}`)
+  try {
+    const r = await analyzeResumePdf(env, b64)
+    if (r.ok) {
+      const text = resumeAnalysisToText(r.analysis)
+      resumeCache.set(searchJobId, { text, analysis: r.analysis, done: true, status: 'ok' })
+      criteria.resumeText = text
+      criteria.resumeAnalysis = r.analysis
+      console.log(`[resume] 解析成功 tokens=${r.tokensUsed} 経験職種=${(r.analysis?.jobTypes || []).join(',')}`)
+      return { status: 'ok', analysis: r.analysis }
+    } else {
+      resumeCache.set(searchJobId, { text: '', analysis: null, done: true, status: 'failed', error: r.error })
+      console.log(`[resume] 解析スキップ: ${r.error}`)
+      return { status: 'failed', error: r.error }
+    }
+  } catch (e) {
+    resumeCache.set(searchJobId, { text: '', analysis: null, done: true, status: 'failed', error: e.message })
+    console.log(`[resume] 解析失敗(書類なしとして続行): ${e.message}`)
+    return { status: 'failed', error: e.message }
+  } finally {
+    // 生PDF(base64)は完了後に破棄（保存しない）
+    delete criteria.resumePdfBase64
+  }
+}
 
 const env = process.env
 const APP_URL = env.APP_URL || 'http://localhost:3000'
@@ -167,6 +220,20 @@ async function processSource(browser, source, searchJobId, criteria) {
       console.log(`[${source}] 媒体の総求人数(未フィルタ)=${mediaTotal ?? '?'}件`)
     } catch (e) {
       console.log(`[${source}] 媒体総数取得失敗: ${e.message}`)
+    }
+
+    // ---- 添付PDF(職務経歴書/履歴書)があれば解析し criteria に反映 ----
+    // 個人情報(氏名/住所等)をマスクした上で優秀モデルが要約し、検索プランに活かす。
+    // PDFが無くてもそのまま続行（書類なしでも動作）。
+    if (criteria.resumePdfBase64 && !criteria.resumeText) {
+      await reportState(searchJobId, source, { phase: 'fetching', message: '添付書類（職務経歴書）を解析中…' })
+      const rr = await ensureResumeAnalyzed(searchJobId, criteria)
+      if (rr && rr.status === 'ok') {
+        const jt = (rr.analysis?.jobTypes || []).slice(0, 3).join('・')
+        await reportState(searchJobId, source, { phase: 'fetching', message: `書類を解析しました${jt ? `（経験職種: ${jt}）` : ''}。この経歴も踏まえて検索します。` })
+      } else if (rr && rr.status === 'failed') {
+        await reportState(searchJobId, source, { phase: 'fetching', message: '添付書類からテキストを抽出できませんでした（画像PDF等の可能性）。希望条件のみで検索します。' })
+      }
     }
 
     // ---- 機能A: AIが検索プラン(複数)を生成 ----

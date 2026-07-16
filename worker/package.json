@@ -9,7 +9,8 @@
     "start:once": "node index.js --once"
   },
   "dependencies": {
-    "playwright": "^1.48.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "pdf-parse": "^1.1.4",
+    "playwright": "^1.48.0"
   }
 }

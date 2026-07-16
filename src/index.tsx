@@ -42,6 +42,11 @@ app.post('/api/search', async (c) => {
     education: body.education || '',
     topN: Math.max(1, Math.min(50, body.topN || 10)),
     sources: body.sources && body.sources.length ? body.sources : ['kintone', 'circus', 'hitolink', 'jobins'],
+    // 添付書類(PDF)。base64のまま criteria_json に一時保存し、worker が解析後に破棄する。
+    // 未添付なら undefined のまま（書類なしでも動作）。
+    resumePdfBase64: typeof body.resumePdfBase64 === 'string' && body.resumePdfBase64.length > 0
+      ? body.resumePdfBase64
+      : undefined,
   }
 
   const searchJobId = uuid()

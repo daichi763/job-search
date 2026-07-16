@@ -343,9 +343,16 @@ export async function maybeCompleteSearch(db: D1, searchJobId: string): Promise<
   })
   if (done) {
     await refreshSearchTotals(db, searchJobId)
+    // 添付書類(PDF)の破棄: 検索完了後、criteria_json から生PDF(base64)を除去する。
+    // ユーザー方針「書類は完了後に破棄」を満たすため、DB上にも残さない。
+    let cleanedCriteriaJson = job.criteria_json
+    if (criteria.resumePdfBase64) {
+      delete (criteria as any).resumePdfBase64
+      cleanedCriteriaJson = JSON.stringify(criteria)
+    }
     await db
-      .prepare(`UPDATE search_jobs SET status='done', finished_at=datetime('now') WHERE id=?`)
-      .bind(searchJobId)
+      .prepare(`UPDATE search_jobs SET status='done', finished_at=datetime('now'), criteria_json=? WHERE id=?`)
+      .bind(cleanedCriteriaJson, searchJobId)
       .run()
   }
   return done

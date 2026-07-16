@@ -66,6 +66,16 @@ export function renderPage(): string {
         <textarea id="freeText" rows="4" class="w-full border border-slate-300 rounded-lg p-2 text-sm mb-3"
           placeholder="例）風通しの良い風土で、裁量を持って若手のうちから成長できる環境。マネジメントより現場志向。転勤は避けたい。"></textarea>
 
+        <label class="block text-sm font-semibold mb-1">
+          <i class="fas fa-file-pdf mr-1 text-rose-500"></i>職務経歴書・履歴書（任意・PDFのみ）
+          <span class="text-xs text-slate-400 font-normal">※添付するとAIが経歴を読み、目指せる求人も提案</span>
+        </label>
+        <input id="resumePdf" type="file" accept="application/pdf,.pdf"
+          class="w-full text-sm mb-1 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:bg-indigo-50 file:text-indigo-700 file:text-sm file:font-semibold hover:file:bg-indigo-100 border border-slate-200 rounded-lg p-1.5">
+        <p class="text-[11px] text-slate-400 mb-3">
+          氏名・住所などの個人情報はAI送信前にマスクされ、書類は検索完了後に破棄されます。未添付でも検索できます。
+        </p>
+
         <div class="grid grid-cols-2 gap-3 mb-3">
           <div>
             <label class="block text-sm font-semibold mb-1">希望年収 下限</label>
