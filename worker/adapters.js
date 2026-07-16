@@ -428,22 +428,26 @@ export const circusAdapter = {
   extractReward(raw) {
     if (!raw || typeof raw !== 'object') return { type: 'unknown', rate: null, amount: null, text: '' }
 
-    // ★ circus 実データで確定したフィールド（probe_reward.js検証済）:
-    //   raw.commissionFee = { id, fee }  fee は「理論年収に対する率(%)」（例 fee:45 → 理論年収×45%）
-    //   人材紹介の成果報酬は理論年収の30〜45%が業界標準のため、この値は率(%)として扱う。
-    //   （万一 fee が桁の大きい固定額で来た場合の保険も入れる: 200以上は円/万円とみなす）
+    // ★ circus 実データで確定したフィールド（probe_reward.js / probe_reward2.js で300件検証済）:
+    //   raw.commissionFee = { id, fee }
+    //   fee は「率(%)」と「固定額(円)」の2種類が同じフィールドに混在する。
+    //   種別フィールドは存在しないが、実データの値分布が明確に2群に分かれる:
+    //     ・率型   : fee = 25〜60         → 理論年収 × fee%     （例 fee:45 → 理論年収×45%）
+    //     ・固定額 : fee = 500,000〜2,500,000（円） → 一律 fee円  （例 fee:600000 → 一律60万円）
+    //   60 と 500000 の間は完全に空白のため、しきい値で誤判定なく区別できる。
+    //   判定: fee <= 1000 は率(%)、fee >= 10000 は固定額(円)。
+    //   （id はプランIDで報酬額ではないので使わない）
     if (raw.commissionFee && typeof raw.commissionFee === 'object' && raw.commissionFee.fee != null) {
       const f = typeof raw.commissionFee.fee === 'number'
         ? raw.commissionFee.fee
         : parseFloat(String(raw.commissionFee.fee).replace(/[, ]/g, ''))
       if (Number.isFinite(f) && f > 0) {
-        if (f <= 100) {
-          // 率(%)として扱う（通常ケース）
+        if (f <= 1000) {
+          // 率(%)として扱う（実データ上は 25〜60 の範囲）
           return { type: 'rate', rate: f, amount: null, text: '' }
         }
-        // 100超 = 固定額の可能性。1000未満は万円とみなし円換算。
-        const amount = f < 1000 ? f * 10000 : f
-        return { type: 'fixed', rate: null, amount, text: '' }
+        // 固定額（円）として扱う（実データ上は 50万〜250万円）
+        return { type: 'fixed', rate: null, amount: f, text: '' }
       }
     }
 
