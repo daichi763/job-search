@@ -77,6 +77,32 @@ export function parseLocations(text) {
 // ------------------------------------------------------------
 // ①circusAGENT (Next.js SPA / MUIテーブル)
 // ------------------------------------------------------------
+
+// circus /search の qJson `option` = 検索対象フィールド（Playwrightで実測確定）。
+// 機能A（AIが検索条件を自動構築）で、AIに「どのフィールドを検索対象にするか」を
+// 選ばせる際のマッピングとして使用する。
+export const CIRCUS_FIELD = {
+  COMPANY_NAME: 1,    // 求人企業名
+  JOB_TITLE: 2,       // 求人タイトル
+  BUSINESS: 3,        // 事業内容と今後の事業展開
+  JOB_CONTENT: 4,     // 仕事内容
+  QUALIFICATION: 5,   // 応募資格・内定の可能性が高い人
+  AGENT_NAME: 6,      // 求人取扱企業名
+  JOB_ID: 7,          // 求人ID
+  FULLTEXT: 8,        // 掲載内容全体（＝真の全文検索。最も網羅的）
+  COMPANY_ID: 9,      // 企業ID
+}
+// option 番号 → 表示名（デバッグ/ログ用の逆引き）
+export const CIRCUS_FIELD_LABEL = {
+  1: '求人企業名', 2: '求人タイトル', 3: '事業内容と今後の事業展開', 4: '仕事内容',
+  5: '応募資格・内定の可能性が高い人', 6: '求人取扱企業名', 7: '求人ID',
+  8: '掲載内容全体', 9: '企業ID',
+}
+// circus のロジック種別（キーワード欄の各行に指定できる論理）
+export const CIRCUS_LOGIC = {
+  AND: 'and', OR: 'or', NOT_AND: 'excludeAnd', NOT_OR: 'excludeOr',
+}
+
 export const circusAdapter = {
   source: 'circus',
   base: 'https://circus-job.com',
@@ -145,17 +171,18 @@ export const circusAdapter = {
   // 検索ページのURLを構築。
   // キーワードは or ロジックに入れる（短い語のみ。無ければ全求人）。
   // フリー記述の細かなニュアンスは後段のAI採点で反映する。
-  // circus /search の qJson の option は「検索対象範囲」を表す:
-  //   option=1: ごく狭い(会社名等) 22件 / option=2: 職種名等 28,817件
-  //   option=3: 中程度 6,608件 / option=4: 全文検索(最広) 48,736件  (keyword=営業の場合)
-  // 「見つけづらい求人も網羅」する理想には option=4(全文) が最適。
-  // キーワードは or に入れる（AIが抽出した短い語。無ければ全126,575件が対象）。
+  //
+  // circus /search の qJson の option は「検索対象フィールド」を表す（実測で確定）:
+  //   CIRCUS_FIELD 定数参照。option=8=掲載内容全体 が真の全文検索（最も網羅的）。
+  //   ※前回 option=4 を「全文」と誤記していたが、実際は「仕事内容」フィールドだった。
+  // 「見つけづらい求人も網羅」する理想には option=8(掲載内容全体) が最適。
+  // キーワードは or に入れる（AIが抽出した短い語。無ければ全求人が対象）。
   //
   // /search は 1ページ25件のページネーション型。&page=N で正しくページ送りできる
-  // （option=4 で数万件ヒットする状態では page=1,2,3... が重複なく機能することを確認済み）。
+  // （数万件ヒットする状態では page=1,2,3... が重複なく機能することを確認済み）。
   buildSearchUrl(criteria, pageNo = 1) {
     const kw = this.extractKeyword(criteria)
-    const option = parseInt(process.env.CIRCUS_SEARCH_OPTION || '4', 10) // 既定=全文
+    const option = parseInt(process.env.CIRCUS_SEARCH_OPTION || '8', 10) // 既定=8(掲載内容全体=真の全文)
     const qJson = encodeURIComponent(
       JSON.stringify([
         { option, keyword: '', logicType: 'and' },
@@ -373,6 +400,156 @@ export const circusAdapter = {
       description: (description || '').slice(0, 1500),
       url: `${this.base}/search/${card.id}`,
       isOpen: true, // /search は公開中求人のみが対象
+    }
+  },
+
+  // ------------------------------------------------------------
+  // 機能B: 詳細ページ取得
+  // 詳細ページ /search/{id} を開いて「選定の鍵」となる構造化情報を抽出する。
+  // 検索結果カードには載っていない採用要件（年齢/性別/学歴 等）が取れる。
+  // コスト管理のため、粗選別を通過した上位候補にのみ呼び出す想定。
+  //
+  // 実測で判明した構造:
+  //  ・th/td 表: 勤務地・勤務時間 / 給与・年収例 / 仕事内容 / 休日休暇・福利厚生 等
+  //  ・「採用要件」ブロック: 応募必須条件に
+  //      「22歳~50歳」(年齢) / 「性別不問」(性別) / 「高卒以上」(学歴) /
+  //      「職種未経験OK」「業種未経験OK」(未経験可) が縦に並ぶ
+  //  ・「■必須要件：」以下に自由記述の必須条件
+  //  ・「内定の可能性が高い人」ブロック
+  // ------------------------------------------------------------
+  async fetchDetail(page, sourceJobId) {
+    const url = `${this.base}/search/${sourceJobId}`
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 })
+    await page.waitForTimeout(2500)
+    // SPA描画のためスクロールで全要素をレンダリング
+    for (let i = 0; i < 8; i++) {
+      await page.mouse.wheel(0, 1500)
+      await page.waitForTimeout(350)
+    }
+    await page.waitForTimeout(800)
+
+    // th/td 表を辞書として収集
+    const rows = await page
+      .$$eval('tr', (els) =>
+        els
+          .map((tr) => {
+            const th = tr.querySelector('th')
+            const td = tr.querySelector('td')
+            if (!th || !td) return null
+            return [th.innerText.trim(), td.innerText.trim()]
+          })
+          .filter(Boolean)
+      )
+      .catch(() => [])
+    const table = {}
+    for (const [k, v] of rows) if (k && !(k in table)) table[k] = v
+
+    const body = await page.innerText('body').catch(() => '')
+    return this.parseDetail(sourceJobId, table, body)
+  },
+
+  // fetchDetail が集めた table/body から構造化フィールドを取り出す（テスト容易化のため分離）
+  parseDetail(sourceJobId, table, body) {
+    const pick = (...keys) => {
+      for (const k of keys) {
+        for (const tk of Object.keys(table)) {
+          if (tk.includes(k)) return table[tk]
+        }
+      }
+      return ''
+    }
+
+    // 「採用要件 / 応募必須条件」ブロックを本文から切り出す（HIGH優先度情報の宝庫）
+    // 例: "採用要件\n応募必須条件...\n22歳~50歳\n性別不問\n外国籍NG\n高卒以上\n職種未経験OK\n業種未経験OK\n■必須要件：..."
+    let requirementBlock = ''
+    const ai = body.indexOf('応募必須条件')
+    if (ai >= 0) {
+      // 「■必須要件」or「内定の可能性が高い人」or 2000字先までを終端に
+      const rest = body.slice(ai)
+      const endIdx = Math.min(
+        ...['内定の可能性が高い人', 'エージェント向け情報']
+          .map((s) => rest.indexOf(s))
+          .filter((i) => i > 0)
+          .concat([2000])
+      )
+      requirementBlock = rest.slice(0, endIdx).trim()
+    }
+
+    // --- HIGH 優先度（揺るぎない情報）---
+    // 年齢制限: 「22歳~50歳」「22歳～50歳」等
+    let ageMin = null, ageMax = null, ageText = ''
+    const am = requirementBlock.match(/(\d{2})\s*歳\s*[~〜～\-ー]\s*(\d{2})\s*歳/)
+    if (am) { ageMin = parseInt(am[1], 10); ageMax = parseInt(am[2], 10); ageText = am[0] }
+    else {
+      const am2 = requirementBlock.match(/(\d{2})\s*歳\s*(以下|まで|未満)/)
+      if (am2) { ageMax = parseInt(am2[1], 10); ageText = am2[0] }
+      const am3 = requirementBlock.match(/(\d{2})\s*歳\s*(以上)/)
+      if (am3) { ageMin = parseInt(am3[1], 10); ageText = (ageText ? ageText + ' ' : '') + am3[0] }
+    }
+
+    // 性別: 性別不問 / 男性のみ / 女性のみ
+    let gender = ''
+    if (requirementBlock.includes('性別不問') || body.includes('性別不問')) gender = '不問'
+    else if (/女性(のみ|活躍|歓迎)/.test(requirementBlock)) gender = '女性'
+    else if (/男性(のみ|活躍|歓迎)/.test(requirementBlock)) gender = '男性'
+
+    // 学歴: 高卒以上 / 大卒以上 / 学歴不問 等（最初に一致したもの）
+    let education = ''
+    for (const e of ['学歴不問', '中卒以上', '高卒以上', '専門卒以上', '短大卒以上', '高専卒以上', '大卒以上', '大学院卒']) {
+      if (requirementBlock.includes(e) || body.includes(e)) { education = e; break }
+    }
+
+    // 国籍
+    let nationality = ''
+    if (requirementBlock.includes('外国籍NG') || body.includes('外国籍NG')) nationality = '外国籍NG'
+    else if (requirementBlock.includes('外国籍OK') || requirementBlock.includes('外国籍可')) nationality = '外国籍OK'
+
+    // 勤務地（th/td「勤務地」を優先。無ければ「勤務地・勤務時間」）
+    const locationText = pick('勤務地')
+    const locations = parseLocations(locationText)
+
+    // 給与・年収（長文の場合は「想定年収」行を優先して短く）
+    const salaryRaw = pick('年収', '給与・年収例', '月給')
+    const { min: salaryMin, max: salaryMax } = parseSalary(salaryRaw)
+    let salaryText = salaryRaw
+    const sm = salaryRaw.match(/想定年収[：: ]*[^\n]+/)
+    if (sm) salaryText = sm[0].replace(/想定年収[：: ]*/, '').trim()
+
+    // --- LOW 優先度（不正確な場合が多い）---
+    const jobCategory = pick('職種')
+    const uncertainTags = []
+    for (const t of ['職種未経験OK', '職種未経験可', '業種未経験OK', '業種未経験可', '未経験OK', '未経験可']) {
+      if (requirementBlock.includes(t) || body.includes(t)) uncertainTags.push(t)
+    }
+
+    // 必須要件（自由記述）
+    let mustText = ''
+    const mi = body.indexOf('■必須要件')
+    if (mi >= 0) mustText = body.slice(mi, mi + 500).trim()
+
+    return {
+      sourceJobId,
+      detail: {
+        // HIGH（揺るぎない）
+        ageMin, ageMax, ageText,
+        gender,
+        education,
+        nationality,
+        locations,
+        locationText: (locationText || '').slice(0, 500),
+        salaryMin, salaryMax, salaryText: (salaryText || '').slice(0, 300),
+        // 自由記述の必須条件
+        mustRequirements: mustText,
+        requirementBlock: requirementBlock.slice(0, 1200),
+        // LOW（不正確・参考程度）
+        jobCategory,
+        uncertainTags,
+        // 参考: 仕事内容・PR等の長文
+        jobContent: (pick('仕事内容') || '').slice(0, 2000),
+        prPoint: (pick('PRポイント', 'PR') || '').slice(0, 800),
+        holiday: (pick('休日休暇') || '').slice(0, 500),
+        business: (pick('事業内容') || '').slice(0, 500),
+      },
     }
   },
 }

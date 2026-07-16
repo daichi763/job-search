@@ -21,7 +21,7 @@ import dotenv from 'dotenv'
 dotenv.config({ override: true })
 import { chromium } from 'playwright'
 import { ADAPTERS } from './adapters.js'
-import { mechanicalFilter, evaluateOne } from './filter.js'
+import { mechanicalFilter, evaluateOne, evaluateDetail } from './filter.js'
 import { scoreBatch, scoreBriefBatch } from './scorer.js'
 
 const env = process.env
@@ -31,7 +31,11 @@ const POLL = parseInt(env.POLL_INTERVAL || '5000', 10)
 const HEADLESS = (env.HEADLESS || 'true') === 'true'
 const ONCE = process.argv.includes('--once')
 
-const SOURCES = ['circus', 'hitolink', 'jobins']
+// 処理対象ソース。環境変数 SOURCES（カンマ区切り）で上書き可能（テスト時に circus のみ等）。
+const SOURCES = (env.SOURCES || 'circus,hitolink,jobins')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
 
 // ============================================================
 // 自律探索エージェントのパラメータ（すべて環境変数で調整可能）
@@ -54,6 +58,9 @@ const EXPLORE = {
   STALL_PAGES: parseInt(env.STALL_PAGES || '15', 10),
   // 精読する候補数の上限（コスト管理の要）。topNの数倍を上限に。
   MAX_DEEP: parseInt(env.MAX_DEEP || '60', 10),
+  // 詳細ページを取得する候補数の上限（各詳細取得はページ遷移=数秒かかるので、
+  // 精読対象の中でも1次スコア上位のこの件数だけ詳細取得する。コスト/時間管理の要）。
+  MAX_DETAIL: parseInt(env.MAX_DETAIL || '30', 10),
   // トークン予算の上限（超えたら探索/精読を打ち切る）。
   // gpt-5-nano は安価だが100円以内を安全に守るための上限。
   TOKEN_BUDGET: parseInt(env.TOKEN_BUDGET || '400000', 10),
@@ -222,19 +229,67 @@ async function processSource(browser, source, searchJobId, criteria) {
     pool.sort((a, b) => b.briefScore - a.briefScore)
     const toDeep = pool.slice(0, EXPLORE.MAX_DEEP)
     console.log(`[${source}] 探索完了: 走査${scanned} / 有望候補${pool.length} / 精読対象${toDeep.length}`)
+
+    // ---- 機能B: 詳細ページ取得フェーズ ----
+    // 精読対象のうち1次スコア上位 MAX_DETAIL 件だけ詳細ページを開き、
+    // 採用要件（年齢/性別/学歴 等の揺るぎない情報）を取得して job.detail に付与する。
+    // これにより次の精読(scoreBatch)の採点精度が上がる。
+    if (typeof adapter.fetchDetail === 'function') {
+      const detailTargets = toDeep.slice(0, EXPLORE.MAX_DETAIL)
+      await reportState(searchJobId, source, {
+        phase: 'scoring', scanned, candidates: pool.length, tokensUsed: tokens,
+        message: `上位${detailTargets.length}件の詳細情報を取得中…`,
+      })
+      let got = 0
+      for (const c of detailTargets) {
+        // 詳細取得フェーズでは時間上限のみで打ち切る（scan/page上限は探索専用のため無視）
+        if (Date.now() - startedAt > EXPLORE.TIME_LIMIT_MS) { console.log(`[${source}] 詳細取得中断: 時間上限`); break }
+        try {
+          const { detail } = await adapter.fetchDetail(page, c.job.sourceJobId)
+          c.job.detail = detail
+          // 詳細で確定した勤務地/年収でjobの基本項目も上書き（表示・機械評価用）
+          if (detail.locations && detail.locations.length) c.job.locations = detail.locations
+          if (detail.salaryMin != null) c.job.salaryMin = detail.salaryMin
+          if (detail.salaryMax != null) c.job.salaryMax = detail.salaryMax
+          // 揺るぎないHIGH情報(年齢/性別/学歴)で明確にミスマッチなら精読対象から除外
+          const dv = evaluateDetail(c.job, criteria)
+          if (dv.hardFail) {
+            c.excluded = true
+            c.excludeReason = dv.reasons.join('・')
+            console.log(`[${source}] 詳細除外 id=${c.job.sourceJobId}: ${c.excludeReason}`)
+          }
+          got++
+          if (got % 5 === 0) {
+            await reportState(searchJobId, source, {
+              phase: 'scoring', scanned, candidates: pool.length, tokensUsed: tokens,
+              message: `詳細情報を取得中… (${got}/${detailTargets.length}件)`,
+            })
+          }
+        } catch (e) {
+          console.log(`[${source}] fetchDetail失敗 id=${c.job.sourceJobId}: ${String(e.message).slice(0, 100)}`)
+        }
+      }
+      console.log(`[${source}] 詳細取得完了: ${got}件`)
+    }
+
+    // 揺るぎないHIGH情報で除外された候補を精読対象から外す
+    const scoreTargets = toDeep.filter((c) => !c.excluded)
+    const excludedCount = toDeep.length - scoreTargets.length
+    if (excludedCount > 0) console.log(`[${source}] 年齢/性別/学歴で${excludedCount}件除外`)
+
     await reportState(searchJobId, source, {
       phase: 'scoring', scanned, candidates: pool.length, tokensUsed: tokens,
-      message: `上位${toDeep.length}件を精読中…`,
+      message: `上位${scoreTargets.length}件を精読中…（${excludedCount}件は年齢/性別/学歴で除外）`,
     })
 
     let matched = 0
     const finalMatches = []
     if (!useAI) {
-      for (const c of toDeep) finalMatches.push({ job: c.job, score: c.preScore, reason: '条件一致(機械評価)' })
+      for (const c of scoreTargets) finalMatches.push({ job: c.job, score: c.preScore, reason: '条件一致(機械評価)' })
     } else {
-      for (let i = 0; i < toDeep.length; i += EXPLORE.DEEP_BATCH) {
+      for (let i = 0; i < scoreTargets.length; i += EXPLORE.DEEP_BATCH) {
         if (tokens >= EXPLORE.TOKEN_BUDGET) { console.log(`[${source}] 精読中断: トークン予算`); break }
-        const batch = toDeep.slice(i, i + EXPLORE.DEEP_BATCH).map((c) => c.job)
+        const batch = scoreTargets.slice(i, i + EXPLORE.DEEP_BATCH).map((c) => c.job)
         const { results, tokensUsed } = await scoreBatch(env, criteria, batch)
         tokens += tokensUsed
         for (const r of results) {

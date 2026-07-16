@@ -26,16 +26,54 @@ function criteriaToText(c) {
   ].filter(Boolean).join(' / ')
 }
 
+// 詳細ページ取得済み(job.detail)の求人を、精読用フル情報テキストに変換。
+// ユーザー指定の優先度を明示: 勤務地/年齢/性別/学歴=確度が高い / 職種・未経験タグ=不正確。
+function jobToFull(job) {
+  const d = job.detail
+  if (!d) return jobToBrief(job) // 詳細未取得ならブリーフ版
+  const age =
+    d.ageMin || d.ageMax
+      ? `年齢:${d.ageMin ?? '?'}〜${d.ageMax ?? '?'}歳`
+      : d.ageText
+      ? `年齢:${d.ageText}`
+      : ''
+  const salary =
+    d.salaryMin || d.salaryMax ? `年収:${d.salaryMin ?? '?'}〜${d.salaryMax ?? '?'}万` : ''
+  return [
+    job.title ? `タイトル:${String(job.title).slice(0, 80)}` : '',
+    job.company ? `企業:${job.company}` : '',
+    // --- 確度が高い情報（重視）---
+    (d.locations || []).length ? `[確]勤務地:${d.locations.join('/')}` : '',
+    age ? `[確]${age}` : '',
+    d.gender ? `[確]性別:${d.gender}` : '',
+    d.education ? `[確]学歴:${d.education}` : '',
+    d.nationality ? `[確]国籍:${d.nationality}` : '',
+    salary ? `[確]${salary}` : '',
+    d.mustRequirements ? `[確]必須要件:${String(d.mustRequirements).replace(/\s+/g, ' ').slice(0, 300)}` : '',
+    // --- 参考（不正確な場合あり）---
+    d.jobCategory ? `[参考]職種:${String(d.jobCategory).slice(0, 80)}` : '',
+    d.uncertainTags && d.uncertainTags.length ? `[参考]未経験タグ:${d.uncertainTags.join(',')}` : '',
+    d.jobContent ? `仕事内容:${String(d.jobContent).replace(/\s+/g, ' ').slice(0, 700)}` : '',
+    d.prPoint ? `PR:${String(d.prPoint).replace(/\s+/g, ' ').slice(0, 300)}` : '',
+    d.holiday ? `休日:${String(d.holiday).replace(/\s+/g, ' ').slice(0, 200)}` : '',
+  ]
+    .filter(Boolean)
+    .join(' / ')
+}
+
 const SYSTEM = `あなたは人材紹介のプロのキャリアアドバイザーです。求職者の要望と各求人の一致度を評価します。
 複数の求人に対し、それぞれ0〜100点の一致度スコアと、30文字以内の日本語の理由を返してください。
-- 要望のフリー記述(価値観・キャリア志向・働き方)を最重視する
-- 勤務地/年収/雇用形態など明確な条件のミスマッチは大きく減点
-- 情報が不足している項目は中立
+【最重要】要望のフリー記述(価値観・キャリア志向・働き方)を最重視する。
+【情報の確度による重み付け】
+- 「[確]」が付いた項目（勤務地・年齢・性別・学歴・国籍・年収・必須要件）は確度が高い揺るぎない情報。
+  これらが要望と明確にミスマッチ（例: 年齢制限外、勤務地が合わない、必須資格を満たさない）なら大きく減点する。
+- 「[参考]」が付いた項目（職種名・未経験可タグ）は不正確な場合が多い。参考程度に留め、これだけで大きく増減点しない。
+- 情報が不足している項目は中立。
 必ず次のJSON形式のみで出力: {"scores":[{"i":0,"score":85,"reason":"..."},...]}`
 
 export async function scoreBatch(env, criteria, jobs) {
   if (!jobs.length) return { results: [], tokensUsed: 0 }
-  const lines = jobs.map((j, i) => `[${i}] ${jobToBrief(j)}`).join('\n')
+  const lines = jobs.map((j, i) => `[${i}] ${jobToFull(j)}`).join('\n')
   const user = `求職者の要望:\n${criteriaToText(criteria)}\n\n求人一覧(${jobs.length}件):\n${lines}\n\n各求人[i]の一致度を採点してJSONで返してください。`
 
   const res = await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
