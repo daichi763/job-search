@@ -333,7 +333,10 @@ async function processSource(browser, source, searchJobId, criteria) {
     })
   } catch (e) {
     console.error(`[${source}] error:`, e)
-    await reportState(searchJobId, source, { phase: 'error', message: `エラー: ${String(e.message).slice(0, 180)}` })
+    // エラーは切り詰めず全文を message に入れる（UI側で全文コピー可能にするため）。
+    // stack があれば併記して原因追跡をしやすくする。
+    const full = e && e.stack ? String(e.stack) : String(e && e.message ? e.message : e)
+    await reportState(searchJobId, source, { phase: 'error', message: `エラー: ${full}` })
   } finally {
     await context.close()
   }

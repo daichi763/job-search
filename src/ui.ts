@@ -17,6 +17,33 @@ export function renderPage(): string {
     .result-in { animation: slideIn .4s ease; }
     @keyframes slideIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
     .score-ring { background: conic-gradient(var(--c) calc(var(--p)*1%), #e5e7eb 0); }
+
+    /* ===== AIスタッフ ミニキャラクター ===== */
+    .staff-avatar { position: relative; width: 56px; height: 56px; flex-shrink: 0; }
+    /* 体の上下バウンド（作業中） */
+    .staff-body { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      font-size: 30px; line-height: 1; }
+    .staff-working .staff-body { animation: staffBob .6s ease-in-out infinite; }
+    @keyframes staffBob { 0%,100%{ transform: translateY(0) } 50%{ transform: translateY(-3px) } }
+    /* ノートPC */
+    .staff-laptop { position: absolute; bottom: -2px; left: 50%; transform: translateX(-50%);
+      font-size: 16px; }
+    /* タイピングの手ぶれ演出（作業中） */
+    .staff-working .staff-laptop { animation: laptopShake .18s linear infinite; }
+    @keyframes laptopShake { 0%{transform:translateX(-50%) rotate(-2deg)} 50%{transform:translateX(-48%) rotate(2deg)} 100%{transform:translateX(-50%) rotate(-2deg)} }
+    /* 頭上の作業エフェクト（点滅する集中線／汗） */
+    .staff-fx { position: absolute; top: -6px; right: -4px; font-size: 13px; opacity: 0; }
+    .staff-working .staff-fx { animation: fxBlink 1s ease-in-out infinite; }
+    @keyframes fxBlink { 0%,100%{opacity:0; transform: translateY(2px)} 50%{opacity:1; transform: translateY(-2px)} }
+    /* 完了時のはずむ演出 */
+    .staff-done .staff-body { animation: staffCheer .5s ease; }
+    @keyframes staffCheer { 0%{transform:translateY(0)} 30%{transform:translateY(-8px) rotate(-6deg)} 60%{transform:translateY(-8px) rotate(6deg)} 100%{transform:translateY(0)} }
+    /* エラー時のうなだれ */
+    .staff-error .staff-body { animation: staffSad .6s ease forwards; }
+    @keyframes staffSad { to { transform: translateY(2px) rotate(4deg); filter: grayscale(.4); } }
+
+    /* エラー全文表示ボックス */
+    .err-box { white-space: pre-wrap; word-break: break-word; }
   </style>
 </head>
 <body class="bg-slate-50 text-slate-800 min-h-screen">
@@ -123,10 +150,10 @@ export function renderPage(): string {
     <!-- 右: AI担当状態 + 結果 -->
     <section class="lg:col-span-3 space-y-4">
       <!-- AI担当ダッシュボード -->
-      <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-        <h2 class="font-bold text-slate-700 mb-3"><i class="fas fa-people-group mr-2 text-indigo-500"></i>AIスタッフ稼働状況</h2>
-        <div id="workers" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <p class="text-sm text-slate-400 col-span-2">検索を開始すると各DB担当が稼働します。</p>
+      <div class="bg-gradient-to-br from-indigo-50 to-white rounded-xl shadow-sm border border-indigo-100 p-6">
+        <h2 class="font-bold text-slate-700 mb-4 text-lg"><i class="fas fa-people-group mr-2 text-indigo-500"></i>AIスタッフ稼働状況</h2>
+        <div id="workers" class="grid grid-cols-1 gap-4">
+          <p class="text-sm text-slate-400">検索を開始すると各DB担当が稼働します。</p>
         </div>
       </div>
 

@@ -6,10 +6,18 @@ const JOB_CATS = ['ITエンジニア・PM','経営・管理・人事','金融専
 const HOLIDAYS = ['土日祝休み','土日休み','週休2日(土日以外)','シフト制','その他'];
 const SOURCES = [
   { id: 'kintone', label: '自社DB (kintone)', connected: true },
-  { id: 'circus', label: 'circusAGENT', connected: false },
+  { id: 'circus', label: 'circusAGENT', connected: true },
   { id: 'hitolink', label: 'ヒトリンク', connected: false },
   { id: 'jobins', label: 'ジョビンズ', connected: false },
 ];
+
+// DB担当ごとのミニキャラクター絵文字（AIスタッフの見た目）
+const STAFF_AVATAR = {
+  kintone: '🧑‍💼',
+  circus: '🕵️',
+  hitolink: '🧑‍💻',
+  jobins: '👩‍💼',
+};
 
 const PHASE_INFO = {
   idle:      { icon: 'fa-hourglass-start', color: 'text-slate-400', bg: 'bg-slate-50',   label: '待機中' },
@@ -71,6 +79,35 @@ async function loadStats() {
   }
 }
 
+// HTMLエスケープ（エラー全文などをそのまま埋め込む用）
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// クリップボードにコピー
+function copyText(text, btn) {
+  const done = () => {
+    if (!btn) return;
+    const orig = btn.innerHTML;
+    btn.innerHTML = '<i class="fas fa-check mr-1"></i>コピーしました';
+    setTimeout(() => { btn.innerHTML = orig; }, 1800);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else {
+    fallbackCopy(text, done);
+  }
+}
+function fallbackCopy(text, cb) {
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta); if (cb) cb();
+}
+
 // worker状態のレンダリング
 function renderWorkers(workers) {
   const box = document.getElementById('workers');
@@ -80,22 +117,62 @@ function renderWorkers(workers) {
     const info = PHASE_INFO[w.phase] || PHASE_INFO.idle;
     const active = ['fetching','filtering','scoring'].includes(w.phase);
     const dot = active ? '<span class="pulse-dot inline-block w-2 h-2 rounded-full bg-green-500 mr-1"></span>' : '';
+
+    // ミニキャラクターの状態クラス
+    let stateClass = '';
+    if (active) stateClass = 'staff-working';
+    else if (w.phase === 'done') stateClass = 'staff-done';
+    else if (w.phase === 'error') stateClass = 'staff-error';
+    const avatar = STAFF_AVATAR[w.source] || '🧑‍💼';
+    // 作業中の頭上エフェクト（採点中は電球、取得/絞込は汗）
+    const fx = w.phase === 'scoring' ? '💡' : (active ? '💦' : (w.phase === 'done' ? '✅' : (w.phase === 'error' ? '❗' : '')));
+
+    // エラー全文（あればコピー可能ブロックを表示）
+    const errText = w.phase === 'error' ? (w.error || w.message || 'エラーが発生しました') : '';
+    // 通常メッセージ欄：エラー時は簡潔に（全文は下のコピーボックスに表示）
+    const shortMsg = w.phase === 'error' ? 'エラーが発生しました（下記の内容をご確認ください）' : (w.message || '');
+    const errBlock = errText ? `
+      <div class="mt-2 bg-red-50 border border-red-200 rounded-lg p-2">
+        <div class="flex items-center justify-between mb-1">
+          <span class="text-[11px] font-semibold text-red-600"><i class="fas fa-triangle-exclamation mr-1"></i>エラー内容（全文）</span>
+          <button class="copy-err-btn text-[11px] bg-red-100 hover:bg-red-200 text-red-700 px-2 py-0.5 rounded" data-err="${escapeHtml(errText)}">
+            <i class="fas fa-copy mr-1"></i>全文コピー
+          </button>
+        </div>
+        <pre class="err-box text-[11px] text-red-700 max-h-40 overflow-auto bg-white/60 rounded p-2 border border-red-100">${escapeHtml(errText)}</pre>
+      </div>` : '';
+
     const card = document.createElement('div');
-    card.className = `worker-card ${info.bg} rounded-lg p-3 border border-slate-200`;
+    card.className = `worker-card ${info.bg} rounded-xl p-4 border border-slate-200 shadow-sm`;
     card.innerHTML = `
-      <div class="flex items-center justify-between mb-1">
-        <span class="font-semibold text-sm text-slate-700"><i class="fas fa-user-tie mr-1 text-slate-400"></i>${w.label}</span>
-        <span class="text-xs ${info.color} font-semibold">${dot}<i class="fas ${info.icon} mr-1"></i>${info.label}</span>
-      </div>
-      <p class="text-xs text-slate-500 mb-2 min-h-[2rem]">${w.message || ''}</p>
-      <div class="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-slate-500">
-        ${w.totalInDb ? `<span>総<b>${w.totalInDb}</b></span>` : ''}
-        ${w.candidates ? `<span>候補<b>${w.candidates}</b></span>` : ''}
-        <span>マッチ<b class="text-indigo-600">${w.matched}</b></span>
-        ${w.fromMemory ? `<span title="記憶から即提案"><i class="fas fa-lightbulb text-amber-400"></i>記憶${w.fromMemory}</span>` : ''}
-        ${w.tokensUsed ? `<span title="消費トークン"><i class="fas fa-coins text-yellow-500"></i>${w.tokensUsed}</span>` : ''}
+      <div class="flex items-start gap-3">
+        <div class="staff-avatar ${stateClass}">
+          <span class="staff-body">${avatar}</span>
+          <span class="staff-laptop">💻</span>
+          <span class="staff-fx">${fx}</span>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center justify-between mb-1">
+            <span class="font-semibold text-sm text-slate-700">${w.label}</span>
+            <span class="text-xs ${info.color} font-semibold">${dot}<i class="fas ${info.icon} mr-1"></i>${info.label}</span>
+          </div>
+          <p class="text-xs ${w.phase === 'error' ? 'text-red-600 font-semibold' : 'text-slate-500'} mb-2 min-h-[2rem]">${escapeHtml(shortMsg)}</p>
+          <div class="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-slate-500">
+            ${w.totalInDb ? `<span>総<b>${w.totalInDb}</b></span>` : ''}
+            ${w.candidates ? `<span>候補<b>${w.candidates}</b></span>` : ''}
+            <span>マッチ<b class="text-indigo-600">${w.matched}</b></span>
+            ${w.fromMemory ? `<span title="記憶から即提案"><i class="fas fa-lightbulb text-amber-400"></i>記憶${w.fromMemory}</span>` : ''}
+            ${w.tokensUsed ? `<span title="消費トークン"><i class="fas fa-coins text-yellow-500"></i>${w.tokensUsed}</span>` : ''}
+          </div>
+          ${errBlock}
+        </div>
       </div>`;
     box.appendChild(card);
+  });
+
+  // エラー全文コピーボタンのハンドラ
+  box.querySelectorAll('.copy-err-btn').forEach(btn => {
+    btn.addEventListener('click', () => copyText(btn.getAttribute('data-err') || '', btn));
   });
 }
 
@@ -196,6 +273,12 @@ async function startSearch() {
     pollStatus(jobId);
   } catch (e) {
     document.getElementById('search-status').textContent = '検索開始に失敗しました';
+    // 検索開始自体の失敗も、AIスタッフ欄にエラー全文＋コピーボタンで表示する
+    renderWorkers([{
+      source: 'circus', label: '検索リクエスト',
+      phase: 'error', matched: 0,
+      message: `検索開始に失敗しました: ${String(e && e.stack ? e.stack : (e && e.message ? e.message : e))}`,
+    }]);
     resetBtn();
   }
 }
