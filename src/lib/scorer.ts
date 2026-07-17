@@ -64,6 +64,22 @@ export interface BatchScoreOutput {
   tokensUsed: number
 }
 
+// OpenAI設定が揃っているか検証。未設定だと `${undefined}/chat/completions` という
+// 壊れたURLになり "Invalid URL: undefined/chat/completions" という分かりにくい
+// エラーになるため、原因を明示する。
+function assertScorerConfig(cfg: ScorerConfig) {
+  const missing: string[] = []
+  if (!cfg.baseUrl || cfg.baseUrl === 'undefined') missing.push('OPENAI_BASE_URL')
+  if (!cfg.apiKey || cfg.apiKey === 'undefined') missing.push('OPENAI_API_KEY')
+  if (!cfg.model || cfg.model === 'undefined') missing.push('OPENAI_MODEL')
+  if (missing.length) {
+    throw new Error(
+      `OpenAI設定が未設定です: ${missing.join(', ')}。` +
+      `webapp側の環境変数(.dev.vars)を確認してください。`
+    )
+  }
+}
+
 // バッチ採点（1リクエストで複数求人）
 export async function scoreBatch(
   cfg: ScorerConfig,
@@ -71,6 +87,7 @@ export async function scoreBatch(
   jobs: NormalizedJob[]
 ): Promise<BatchScoreOutput> {
   if (jobs.length === 0) return { results: [], tokensUsed: 0 }
+  assertScorerConfig(cfg)
 
   const jobLines = jobs.map((j, i) => `[${i}] ${jobToBrief(j)}`).join('\n')
   const userPrompt = `求職者の要望:\n${criteriaToText(criteria)}\n\n求人一覧(${jobs.length}件):\n${jobLines}\n\n各求人[i]の一致度を採点してJSONで返してください。`
