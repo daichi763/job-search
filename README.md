@@ -18,16 +18,25 @@
 | ① | circusAGENT | ログイン制Webサービス | フェーズ2（外部ワーカー） |
 | ② | ヒトリンク | ログイン制Webサービス | フェーズ2（外部ワーカー） |
 | ③ | ジョビンズ | ログイン制Webサービス | フェーズ2（外部ワーカー） |
-| ④ | 自社DB (kintone) | REST API | ✅ 接続済み（現在236件） |
+| ④ | 自社DB (kintone) | REST API | ✅ 接続済み（公開149件 / 全236件） |
 
 ## アーキテクチャ
 ```
 [フロント + API]  Cloudflare Pages/Workers + Hono   … 本アプリ
-     ├ ④kintone: 公式REST APIで直接取得（このアプリ内で完結）
-     └ ①②③: 外部ワーカー(手元PC/VPS)がスクレイピングし ingest API 経由で払い出し
+[外部ワーカー]    VPS上の Node ワーカー (worker/) が各DBを検索し ingest API 経由で払い出し
+     ├ ①circus : Playwright + 内部REST API（AI検索プランで反復検索）
+     ├ ④kintone: 公式REST API（X-Cybozu-API-Token）でAI検索プランのキーワード検索
+     │           - 全文相当4フィールド(仕事内容/求人タイトル/応募必須条件/PRポイント)をOR検索
+     │           - 公開判定「求人公開=可能」のみ対象（Playwright不要）
+     └ ②③: 未実装（アダプタstub）
 [記憶]           Cloudflare D1 (求人キャッシュ + AI採点結果の記憶)
-[AI採点]         OpenAI gpt-5-nano（reasoning_effort=low でトークン節約）
+[AI採点]         OpenAI gpt-5-nano（採点）/ gpt-5-mini（検索プラン設計・PDF解析）
 ```
+
+### 検索対象ソースの切替
+`worker/.env` の `SOURCES`（カンマ区切り）で有効化。例: `SOURCES=circus,kintone`。
+kintone は `KINTONE_SUBDOMAIN` / `KINTONE_APP_ID` / `KINTONE_API_TOKEN` を設定。
+kintone も circus と同じ「AI検索プラン反復＋機械フィルタ＋AI採点」フローで動作（絞りすぎ厳禁の方針で勤務地/職種/業種はクエリで絞らず機械フィルタ＋採点に委譲）。
 
 ### トークン節約の仕組み
 1. **機械フィルタ（消費ゼロ）**: 勤務地/年収/雇用形態などで候補を絞り込み（例: 236件→60件）

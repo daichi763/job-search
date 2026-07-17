@@ -1175,8 +1175,285 @@ export const jobinsAdapter = {
   },
 }
 
+// ------------------------------------------------------------
+// ④ kintone (自社DB) — REST API 直接方式（Playwright不要）
+//   kintone REST API を直接叩いて求人を検索・取得する。
+//   circus と同じ「API直接方式」インターフェース(getAuthToken/apiCount/
+//   apiSearch/mapApiJob)を満たすので、index.js の processSource が
+//   そのまま機能A(AI検索プラン反復)＋機能B(詳細=mapApiJob)を回せる。
+//
+//   認証:  X-Cybozu-API-Token ヘッダ（アプリ単位のAPIトークン）
+//   件数:  GET /k/v1/records.json?app=&totalCount=true&query=...&fields[]=$id
+//   検索:  GET /k/v1/records.json?app=&query=<cond> limit N offset M
+//
+//   ★ 絞り込み方針（ユーザ確定仕様）:
+//     - キーワード(plan.orKeyword)を全文相当4フィールド
+//       (仕事内容/求人タイトル/応募必須条件/PRポイント)に like OR で検索
+//     - 勤務地(criteria.locations)は MULTI_SELECT「勤務地」を in で AND 絞り込み
+//     - 公開判定: 「求人公開 in ("可能")」を常に AND 付与（=公開149件のみ対象）
+//     - 職種/業種は「絞りすぎ厳禁」方針に従い、クエリでは絞らず
+//       既存の機械フィルタ + AI採点に委ねる（DB規模236件なら十分）
+//     - plan.filters(circus専用の数値コード)は kintone では使わない
+// ------------------------------------------------------------
+
+// kintone クエリ用に文字列をエスケープ（" を \" に）
+function kintoneEscape(s) {
+  return String(s == null ? '' : s).replace(/"/g, '\\"')
+}
+
+// kintone の数値文字列 → 数値（空/不正は null）
+function kintoneNum(v) {
+  if (v == null || v === '') return null
+  const n = parseFloat(String(v).replace(/[^\d.\-]/g, ''))
+  return Number.isFinite(n) ? n : null
+}
+
+export const kintoneAdapter = {
+  source: 'kintone',
+  get subdomain() { return process.env.KINTONE_SUBDOMAIN || 'kvln1' },
+  get appId() { return process.env.KINTONE_APP_ID || '101' },
+  get apiToken() { return process.env.KINTONE_API_TOKEN || '' },
+  get base() { return `https://${this.subdomain}.cybozu.com` },
+
+  // 全文相当フィールド（キーワードOR検索対象）。ユーザ確定仕様。
+  KEYWORD_FIELDS: ['仕事内容', '求人タイトル', '応募必須条件', 'PRポイント'],
+
+  // Playwright不要。processSource は login→getAuthToken の順に呼ぶが
+  // kintone はページ操作不要なので何もしない（page引数は無視）。
+  async login(_page, _env) { /* no-op: REST APIトークン認証 */ },
+
+  // circus の getAuthToken 相当。kintone はAPIトークンをヘッダで送るだけなので
+  // トークン文字列をそのまま返す（processSource が token として保持）。
+  async getAuthToken(_page) {
+    const t = this.apiToken
+    if (!t) throw new Error('KINTONE_API_TOKEN が未設定です')
+    return t
+  },
+
+  // circus の buildQJson 相当。ここでは「キーワード条件」を表す構造を返すだけ。
+  //   terms.or : スペース区切りキーワード（plan.orKeyword）
+  // 戻り値はこのアダプタ内部の apiCount/apiSearch でだけ解釈する不透明オブジェクト。
+  buildQJson(terms = {}) {
+    const kw = String(terms.or || '').trim()
+    // スペース/全角スペースで分割した語（空語除去、最大8語）
+    const words = kw.split(/[\s\u3000]+/).map((w) => w.trim()).filter(Boolean).slice(0, 8)
+    return { words }
+  },
+
+  // qJson(=buildQJshの戻り) → kintone クエリ文字列（order/limit/offset除く）。
+  //   ・公開判定「求人公開=可能」を常に AND 付与（公開レコードのみ対象）
+  //   ・キーワード: circus と同じく OR ロジック。全語 × 全フィールド(4つ)の
+  //     like を1つの大きな OR 節にまとめる。
+  //       例: (仕事内容 like "営業" or 求人タイトル like "営業" or …
+  //            or 仕事内容 like "IT" or 求人タイトル like "IT" or …)
+  //     語同士を AND にすると「全語を含む求人」に絞られ 0 件になりやすい
+  //     （circus は or ロジック=いずれかの語を含む、で網羅的に拾う思想）。
+  //   ・勤務地/職種/業種の絞り込みは「絞りすぎ厳禁」方針に従いクエリでは行わず、
+  //     既存の機械フィルタ(evaluateOne: 勤務地hardFail等)とAI採点に委ねる。
+  //     （circus は数値コードで絞れるが kintone は日本語ラベルのため、DB規模149件なら
+  //      機械フィルタ側で十分・取りこぼしも防げる）
+  _buildQuery(qJson = {}) {
+    const clauses = []
+    clauses.push('求人公開 in ("可能")')
+    const words = Array.isArray(qJson.words) ? qJson.words : []
+    const ors = []
+    for (const w of words) {
+      const esc = kintoneEscape(w)
+      for (const f of this.KEYWORD_FIELDS) ors.push(`${f} like "${esc}"`)
+    }
+    if (ors.length) clauses.push(`(${ors.join(' or ')})`)
+    return clauses.join(' and ')
+  },
+
+  // 共通 REST 呼び出し（page引数は無視）。
+  async _apiCall(query, { totalCount = false, fields = null, limit, offset } = {}) {
+    // kintone クエリ記法: limit は offset より前に置く必要がある（順序厳格）。
+    let q = query || ''
+    if (typeof limit === 'number') q += ` limit ${limit}`
+    if (typeof offset === 'number') q += ` offset ${offset}`
+    const params = new URLSearchParams()
+    params.set('app', String(this.appId))
+    params.set('query', q.trim())
+    if (totalCount) params.set('totalCount', 'true')
+    if (Array.isArray(fields)) for (const f of fields) params.append('fields', f)
+    const url = `${this.base}/k/v1/records.json?${params.toString()}`
+    const res = await fetch(url, { headers: { 'X-Cybozu-API-Token': this.apiToken } })
+    const status = res.status
+    let json = null
+    try { json = await res.json() } catch {}
+    if (status !== 200) {
+      const msg = json && (json.message || JSON.stringify(json))
+      throw new Error(`kintone API ${status}: ${String(msg).slice(0, 200)}`)
+    }
+    return json || {}
+  },
+
+  // マッチ件数のみ（totalCount）。circus apiCount 相当。
+  async apiCount(_page, _token, params = {}) {
+    const query = this._buildQuery(params.qJson)
+    const json = await this._apiCall(query, { totalCount: true, fields: ['$id'], limit: 1 })
+    const n = json.totalCount
+    return n == null ? null : parseInt(n, 10)
+  },
+
+  // 求人検索（本体）。circus apiSearch 相当。
+  // 戻り値: { total, jobs:[生kintoneレコード], status }
+  async apiSearch(_page, _token, params = {}) {
+    const { limit = 100, offset = 0 } = params
+    const query = this._buildQuery(params.qJson)
+    // kintone は 1リクエスト最大500件。安全に100件刻みで取得。
+    const json = await this._apiCall(query, { limit: Math.min(limit, 500), offset })
+    const recs = Array.isArray(json.records) ? json.records : []
+    return { total: json.totalCount != null ? parseInt(json.totalCount, 10) : null, jobs: recs, status: 200 }
+  },
+
+  // circus と同じく criteria からキーワードを1語抽出（フォールバック用）。
+  extractKeyword(criteria) {
+    if (criteria.keyword && String(criteria.keyword).trim()) return String(criteria.keyword).trim()
+    if (Array.isArray(criteria.jobCategories) && criteria.jobCategories.length) return criteria.jobCategories[0]
+    return ''
+  },
+
+  // 生 kintone レコード → 内部 NormalizedJob 形式へ変換。
+  //   レコードは { フィールドコード: { type, value } } 構造。
+  mapApiJob(raw) {
+    if (!raw) return null
+    const val = (code) => {
+      const c = raw[code]
+      return c ? c.value : undefined
+    }
+    const str = (code) => {
+      const v = val(code)
+      if (v == null) return ''
+      if (Array.isArray(v)) return v.filter(Boolean).join('・')
+      return String(v)
+    }
+
+    const recordId = str('レコード番号') || str('$id') || (raw['$id'] && raw['$id'].value) || ''
+
+    // 職種: 大分類 + 小分類 + まとめ（ユーザ確定: この粒度）
+    const jobParts = [str('メイン職種_大分類_'), str('メイン職種_小分類_'), str('サブ職種まとめ')]
+      .map((s) => s.trim()).filter(Boolean)
+    const jobCategory = [...new Set(jobParts)].join('・')
+    const jobCategories = [...new Set(
+      [str('メイン職種_大分類_'), str('メイン職種_小分類_'), str('サブ職種_大分類_')].filter(Boolean)
+    )]
+
+    // 業種: メイン大分類 + サブ大分類
+    const indParts = [str('メイン業種_大分類_'), str('サブ業種_大分類_')].map((s) => s.trim()).filter(Boolean)
+    const industry = [...new Set(indParts)].join('・')
+    const industries = [...new Set(indParts)]
+
+    // 雇用形態
+    const employment = str('雇用形態')
+
+    // 勤務地（MULTI_SELECT → 県ラベル配列）
+    const rawLoc = val('勤務地')
+    const locations = Array.isArray(rawLoc) ? rawLoc.filter(Boolean) : (rawLoc ? [String(rawLoc)] : [])
+
+    // 年収: 万円 → 円
+    const salMin = kintoneNum(str('想定年収_下限_'))
+    const salMax = kintoneNum(str('想定年収_上限_'))
+    const salaryMin = salMin != null ? Math.round(salMin * 10000) : null
+    const salaryMax = salMax != null ? Math.round(salMax * 10000) : null
+
+    // 応募条件（年齢/性別/学歴）— circusの正規化と同じ意味づけ
+    const requiredAgeMin = kintoneNum(str('採用可能年齢_下限_'))
+    const requiredAgeMax = kintoneNum(str('採用可能年齢_上限_'))
+    // 性別: kintoneラベル → circus正規化ラベル(性別不問=null相当)
+    const genderRaw = str('性別')
+    let requiredGender = null
+    if (genderRaw === '男性限定') requiredGender = '男性'
+    else if (genderRaw === '女性限定') requiredGender = '女性'
+    // 「男性/女性であれば尚良し」「性別不問」は不問扱い(null)
+    // 学歴（学歴不問 は null 扱い＝制約なし）
+    const eduRaw = str('最終学歴')
+    const requiredEducation = (eduRaw && eduRaw !== '学歴不問') ? eduRaw : null
+
+    // 成果報酬（{ type, rate, amount, text }）
+    const reward = this._extractReward(raw, str)
+
+    // 未経験可否 / 外国籍（circusの experience[] と同じ語彙）
+    const experience = []
+    const jobExp = str('職種経験')
+    if (jobExp === '職種未経験OK') experience.push('職種未経験OK')
+    else if (jobExp === '職種未経験NG') experience.push('職種未経験NG')
+    const indExp = str('業種経験')
+    if (indExp === '業種未経験OK') experience.push('業種未経験OK')
+    else if (indExp === '業種未経験NG') experience.push('業種未経験NG')
+    const nationality = str('国籍')
+    if (nationality === '外国籍OK') experience.push('外国籍OK')
+
+    // 仕事内容 / 応募資格
+    const description = str('仕事内容')
+    const requirements = str('応募必須条件')
+
+    // 公開判定: 「求人公開」チェックに「可能」が含まれるか
+    const pub = val('求人公開')
+    const isOpen = Array.isArray(pub) ? pub.includes('可能') : Boolean(pub)
+
+    return {
+      source: 'kintone',
+      sourceJobId: String(recordId),
+      title: str('求人タイトル') || str('求人タイトル表紙') || '',
+      company: str('企業名') || '',
+      companyWebsite: str('ウェブサイトURL') || '',
+      jobCategory,
+      jobCategories,
+      industry,
+      industries,
+      employment,
+      locations,
+      salaryMin,
+      salaryMax,
+      overtime: str('月間平均残業時間') || '',
+      holiday: str('休日') || '',
+      requiredAgeMin,
+      requiredAgeMax,
+      requiredGender,
+      requiredEducation,
+      reward,
+      requirements,
+      description,
+      experience,
+      url: `${this.base}/k/${this.appId}/show#record=${recordId}`,
+      isOpen,
+      publishStartedAt: str('作成日時') || null,
+      lastUpdatedAt: str('更新日時') || null,
+      _raw: raw,
+    }
+  }, // mapApiJob
+
+  // 成果報酬抽出（kintone版）。circus の extractReward と同じ戻り形状。
+  //   成果報酬(ラジオ): 'パーセンテージ' | '一律料金'
+  //   一律(数値, 万円) / 成果報酬金額(表示テキスト)
+  _extractReward(raw, str) {
+    const type = str('成果報酬') // 'パーセンテージ' | '一律料金' | ''
+    const text = str('成果報酬金額') || ''
+    let rate = null
+    let amount = null
+    if (type === '一律料金') {
+      const fixed = kintoneNum(str('一律'))
+      if (fixed != null) amount = Math.round(fixed * 10000) // 万円→円
+      // テキストからの補完（"一律50万円"）
+      if (amount == null && text) {
+        const m = text.match(/([\d.]+)\s*万/)
+        if (m) amount = Math.round(parseFloat(m[1]) * 10000)
+      }
+      return { type: 'fixed', rate: null, amount, text }
+    }
+    if (type === 'パーセンテージ') {
+      const m = text.match(/([\d.]+)\s*[%％]/)
+      if (m) rate = parseFloat(m[1])
+      return { type: 'rate', rate, amount: null, text }
+    }
+    return { type: 'unknown', rate: null, amount: null, text }
+  },
+}
+
 export const ADAPTERS = {
   circus: circusAdapter,
   hitolink: hitolinkAdapter,
   jobins: jobinsAdapter,
+  kintone: kintoneAdapter,
 }
