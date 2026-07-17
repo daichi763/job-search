@@ -79,6 +79,7 @@ export function normalizeKintoneRecord(record: any, subdomain: string, appId: st
 
 // 総件数を取得（軽量: $id のみ）
 export async function fetchKintoneCount(cfg: KintoneConfig): Promise<number> {
+  assertKintoneConfig(cfg)
   const url = `https://${cfg.subdomain}.cybozu.com/k/v1/records.json`
   let total = 0
   let lastId = 0
@@ -99,11 +100,27 @@ export async function fetchKintoneCount(cfg: KintoneConfig): Promise<number> {
   return total
 }
 
+// 設定が揃っているか検証（未設定だと https://undefined.cybozu.com/... のような
+// 壊れたURLになり、cybozu以外のホストから汎用404 HTMLが返る＝原因が分かりにくい）。
+function assertKintoneConfig(cfg: KintoneConfig) {
+  const missing: string[] = []
+  if (!cfg.subdomain || cfg.subdomain === 'undefined') missing.push('KINTONE_SUBDOMAIN')
+  if (!cfg.appId || cfg.appId === 'undefined') missing.push('KINTONE_APP_ID')
+  if (!cfg.apiToken || cfg.apiToken === 'undefined') missing.push('KINTONE_API_TOKEN')
+  if (missing.length) {
+    throw new Error(
+      `kintone設定が未設定です: ${missing.join(', ')}。` +
+      `Cloudflare/wrangler側の環境変数(.dev.vars または wrangler secret)を確認してください。`
+    )
+  }
+}
+
 // 全求人を取得（ページング、$idカーソル方式で500件超も対応）
 export async function fetchKintoneJobs(
   cfg: KintoneConfig,
   opts: { onlyOpen?: boolean; max?: number } = {}
 ): Promise<NormalizedJob[]> {
+  assertKintoneConfig(cfg)
   const url = `https://${cfg.subdomain}.cybozu.com/k/v1/records.json`
   const jobs: NormalizedJob[] = []
   let lastId = 0
@@ -117,7 +134,11 @@ export async function fetchKintoneJobs(
     )
     if (!res.ok) {
       const t = await res.text()
-      throw new Error(`kintone API error ${res.status}: ${t.slice(0, 200)}`)
+      // 404かつHTMLが返る場合は「サブドメイン/APPID誤り or 未設定」の可能性が高い
+      const hint = res.status === 404
+        ? `（サブドメイン"${cfg.subdomain}"・アプリID"${cfg.appId}"・APIトークンが正しいか確認してください）`
+        : ''
+      throw new Error(`kintone API error ${res.status}${hint}: ${t.slice(0, 150)}`)
     }
     const data: any = await res.json()
     const recs = data.records || []
