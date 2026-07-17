@@ -18,15 +18,35 @@ function smartModel(env) { return env.OPENAI_MODEL_SMART || 'gpt-5' }
 // これを JSON.stringify して OpenAI に送ると「failed to parse JSON value」400が発生する。
 // 送信前に孤立サロゲートと制御文字を除去して根本回避する。
 // ------------------------------------------------------------
+// 旧実装は正規表現で孤立サロゲートを除去していたが、連続する孤立下位サロゲート
+// (例: \uDE00\uDE00) を取りこぼし、1個残ると OpenAI 400 が再発していた。
+// 1文字ずつ厳密に走査し、正規のサロゲートペアだけを残す実装に置き換える。
 function sanitizeText(str) {
   if (str == null) return ''
-  return String(str)
-    // 孤立した上位サロゲート（後続に下位サロゲートが無い）を除去
-    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
-    // 孤立した下位サロゲート（先行に上位サロゲートが無い）を除去
-    .replace(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '$1')
-    // 制御文字（改行/タブ以外）を空白へ
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
+  const s = String(str)
+  let out = ''
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    // 制御文字（タブ\t=0x09, 改行\n=0x0A, 復帰\r=0x0D 以外）を空白へ
+    if (c <= 0x08 || c === 0x0B || c === 0x0C || (c >= 0x0E && c <= 0x1F) || c === 0x7F) {
+      out += ' '
+      continue
+    }
+    // 上位サロゲート: 直後が下位サロゲートなら正規のペアとして両方採用、
+    // そうでなければ孤立上位サロゲートとして破棄。
+    if (c >= 0xD800 && c <= 0xDBFF) {
+      const n = s.charCodeAt(i + 1)
+      if (n >= 0xDC00 && n <= 0xDFFF) {
+        out += s[i] + s[i + 1]
+        i++
+      }
+      continue
+    }
+    // 孤立下位サロゲート → 破棄（連続していても各文字で確実に判定）
+    if (c >= 0xDC00 && c <= 0xDFFF) continue
+    out += s[i]
+  }
+  return out
 }
 
 function jobToBrief(job) {
