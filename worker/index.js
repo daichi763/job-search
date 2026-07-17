@@ -160,6 +160,17 @@ async function pushResult(searchJobId, job, score, reason) {
   }
 }
 
+// 検索ジョブが中止(またはdone)されたかを確認する。
+// エラー時は false を返す（通信失敗で処理を止めない）。
+async function isCancelled(searchJobId) {
+  try {
+    const r = await api(`/api/ingest/cancelled?id=${encodeURIComponent(searchJobId)}`)
+    return !!r.cancelled
+  } catch (e) {
+    return false
+  }
+}
+
 // ============================================================
 // 自律探索エージェント本体
 //
@@ -200,6 +211,24 @@ async function processSource(browser, source, searchJobId, criteria) {
   const relaxPool = []     // { job, relaxedReasons: [落ちた条件...] }
 
   const timeUp = () => Date.now() - startedAt > EXPLORE.TIME_LIMIT_MS
+
+  // 中止フラグ。ループ先頭で /api/ingest/cancelled をポーリングして立てる。
+  // 立ったら各ループを break し、それまでに集めた部分結果を確定する。
+  let cancelled = false
+  let lastCancelCheck = 0
+  // 過剰なポーリングを避けるため、最低 CANCEL_CHECK_MS 間隔でのみ問い合わせる。
+  const CANCEL_CHECK_MS = 4000
+  const checkCancel = async () => {
+    if (cancelled) return true
+    const now = Date.now()
+    if (now - lastCancelCheck < CANCEL_CHECK_MS) return false
+    lastCancelCheck = now
+    if (await isCancelled(searchJobId)) {
+      cancelled = true
+      console.log(`[${source}] 中止検知 → 部分結果を確定して終了します`)
+    }
+    return cancelled
+  }
 
   try {
     // ---- ログイン → 認証トークン取得（API直接方式）----
@@ -261,6 +290,7 @@ async function processSource(browser, source, searchJobId, criteria) {
 
     // ---- 機能A ループ: 各プランを count→取得→機械フィルタ→1次AI粗選別 ----
     for (let pi = 0; pi < plans.length; pi++) {
+      if (await checkCancel()) { console.log(`[${source}] プラン反復中断: 中止`); break }
       if (timeUp()) { console.log(`[${source}] プラン反復中断: 時間上限`); break }
       if (tokens >= EXPLORE.TOKEN_BUDGET) { console.log(`[${source}] プラン反復中断: トークン予算`); break }
       if (scanned >= EXPLORE.MAX_SCAN) { console.log(`[${source}] プラン反復中断: スキャン上限`); break }
@@ -295,6 +325,7 @@ async function processSource(browser, source, searchJobId, criteria) {
 
       // ページネーションで収集
       for (let offset = 0; offset < fetchCap; offset += EXPLORE.API_PAGE_SIZE) {
+        if (await checkCancel()) { console.log(`[${source}] 取得中断: 中止`); break }
         if (timeUp()) { console.log(`[${source}] 取得中断: 時間上限`); break }
         if (scanned >= EXPLORE.MAX_SCAN) { console.log(`[${source}] 取得中断: スキャン上限`); break }
         if (tokens >= EXPLORE.TOKEN_BUDGET) { console.log(`[${source}] 取得中断: トークン予算`); break }
@@ -394,6 +425,7 @@ async function processSource(browser, source, searchJobId, criteria) {
       for (const c of scoreTargets) finalMatches.push({ job: c.job, score: c.preScore, reason: '条件一致(機械評価)' })
     } else {
       for (let i = 0; i < scoreTargets.length; i += EXPLORE.DEEP_BATCH) {
+        if (await checkCancel()) { console.log(`[${source}] 精読中断: 中止`); break }
         if (tokens >= EXPLORE.TOKEN_BUDGET) { console.log(`[${source}] 精読中断: トークン予算`); break }
         const batch = scoreTargets.slice(i, i + EXPLORE.DEEP_BATCH).map((c) => c.job)
         const { results, tokensUsed } = await scoreBatch(env, criteria, batch)
@@ -424,7 +456,7 @@ async function processSource(browser, source, searchJobId, criteria) {
     // 年齢/性別/学歴は変更せず、緩和可能条件(年収/勤務地/雇用形態など)を
     // 緩めれば提案できる求人を、AIに理由付き(300字)で推薦させて補充する。
     const shortfall = topN - matched
-    if (shortfall > 0 && useAI && relaxPool.length && tokens < EXPLORE.TOKEN_BUDGET) {
+    if (!cancelled && shortfall > 0 && useAI && relaxPool.length && tokens < EXPLORE.TOKEN_BUDGET) {
       console.log(`[${source}] 通常${matched}件 < 希望${topN}件 → 条件緩和レコメンド開始 (候補${relaxPool.length}件)`)
       await reportState(searchJobId, source, {
         phase: 'scoring', scanned, candidates: pool.length, tokensUsed: tokens,
@@ -473,10 +505,12 @@ async function processSource(browser, source, searchJobId, criteria) {
     }
 
     await reportState(searchJobId, source, {
-      phase: 'done', matched, tokensUsed: tokens,
+      phase: cancelled ? 'cancelled' : 'done', matched, tokensUsed: tokens,
       totalInDb: mediaTotal ?? grandTotal ?? scanned, scanned,
       candidates: pool.length,
-      message: `完了: 媒体総求人${(mediaTotal ?? scanned).toLocaleString()}件 / 該当延べ${(grandTotal || scanned).toLocaleString()}件を走査→${pool.length}件精査→${matched}件を提案 (トークン約${tokens})`,
+      message: cancelled
+        ? `中止: それまでに走査${scanned.toLocaleString()}件→${matched}件を提案 (トークン約${tokens})`
+        : `完了: 媒体総求人${(mediaTotal ?? scanned).toLocaleString()}件 / 該当延べ${(grandTotal || scanned).toLocaleString()}件を走査→${pool.length}件精査→${matched}件を提案 (トークン約${tokens})`,
     })
   } catch (e) {
     console.error(`[${source}] error:`, e)
@@ -489,36 +523,47 @@ async function processSource(browser, source, searchJobId, criteria) {
   }
 }
 
-async function tick(browser) {
-  for (const source of SOURCES) {
-    try {
-      const { jobs } = await api(`/api/ingest/pending?source=${source}`)
-      for (const j of jobs) {
-        console.log(`[${source}] 処理開始 job=${j.searchJobId}`)
-        await processSource(browser, source, j.searchJobId, j.criteria)
-      }
-    } catch (e) {
-      console.error(`[${source}] pending取得失敗:`, e.message)
+// 1ソース分の pending を取得して順に処理する（1周分）。
+async function tickSource(browser, source) {
+  try {
+    const { jobs } = await api(`/api/ingest/pending?source=${source}`)
+    for (const j of jobs) {
+      console.log(`[${source}] 処理開始 job=${j.searchJobId}`)
+      await processSource(browser, source, j.searchJobId, j.criteria)
     }
+  } catch (e) {
+    console.error(`[${source}] pending取得失敗:`, e.message)
+  }
+}
+
+// --once 用: 全ソースを1周だけ並列処理する。
+async function tickAllOnce(browser) {
+  await Promise.allSettled(SOURCES.map((source) => tickSource(browser, source)))
+}
+
+// 常駐用: ソースごとに独立したポーリングループを回す。
+// ★これにより circus の重い検索処理が hitolink 等の他ソースをブロックしない。
+//   （以前は for ループの直列処理で、circus 完了まで hitolink が着手されなかった）
+async function pollLoopForSource(browser, source) {
+  while (true) {
+    await tickSource(browser, source)
+    await new Promise((r) => setTimeout(r, POLL))
   }
 }
 
 async function main() {
-  console.log(`外部ワーカー起動  APP_URL=${APP_URL}  headless=${HEADLESS}`)
+  console.log(`外部ワーカー起動  APP_URL=${APP_URL}  headless=${HEADLESS}  sources=[${SOURCES.join(',')}]`)
   if (!TOKEN) console.warn('⚠️ INGEST_TOKEN が未設定です。.env を確認してください。')
   const browser = await chromium.launch({ headless: HEADLESS })
 
   if (ONCE) {
-    await tick(browser)
+    await tickAllOnce(browser)
     await browser.close()
     return
   }
 
-  // 常駐ポーリング
-  while (true) {
-    await tick(browser)
-    await new Promise((r) => setTimeout(r, POLL))
-  }
+  // 各ソースを独立した並列ループで常駐ポーリング（相互ブロックなし）。
+  await Promise.all(SOURCES.map((source) => pollLoopForSource(browser, source)))
 }
 
 main().catch((e) => {

@@ -45,6 +45,16 @@
 - hitolink は `HITOLINK_LOGIN_URL`(=`/login`) / `HITOLINK_ID` / `HITOLINK_PW` を設定。
 - circus / hitolink / kintone いずれも同じ「AI検索プラン反復＋機械フィルタ＋AI採点」フローで動作（絞りすぎ厳禁の方針で勤務地/職種/業種はクエリで絞らず機械フィルタ＋採点に委譲）。
 
+### 並列処理（ソースごと独立ループ）
+外部ワーカー(`worker/index.js`)は **ソースごとに独立したポーリングループ** を並列実行する（`Promise.all(SOURCES.map(pollLoopForSource))`）。
+- これにより circus の重い処理（数分）が hitolink の着手をブロックしない。
+- 各ループが `/api/ingest/pending?source=X` を個別にポーリングし、担当ソースの検索だけ処理する。
+
+### 検索の中止（停止ボタン）
+フロントの「検索を中止」ボタン → `POST /api/search/:id/cancel` で `search_jobs.status=cancelled`。
+- **まだ着手していないソース(skipped)**: 即座に `cancelled` 表示になり、pending から外れて着手されない。
+- **稼働中のソース**: ワーカーが処理ループ内で `/api/ingest/cancelled?id=X` を約4秒間隔でポーリングし、中止を検知したら **それまでに見つけた部分結果を確定** して `phase=cancelled` を報告する（部分結果は破棄しない）。
+
 ### トークン節約の仕組み
 1. **機械フィルタ（消費ゼロ）**: 勤務地/年収/雇用形態などで候補を絞り込み（例: 236件→60件）
 2. **AI採点は上位候補のみ**: 機械スコア上位を最大40件、10件ずつバッチ採点
@@ -61,10 +71,12 @@
 | POST | `/api/search` | 検索開始（body=検索条件）。`{searchJobId}`を返す |
 | GET | `/api/search/:id/status` | 進捗＋各AI担当の状態を取得 |
 | GET | `/api/search/:id/results?since=N` | 検索結果を取得（`since`で新着のみ、逐次払い出し用） |
+| POST | `/api/search/:id/cancel` | 検索を中止（`status=cancelled`）。稼働中のワーカーは部分結果を確定して停止 |
 | GET | `/api/stats` | 各DBの総求人数、合計求人数 |
 | GET | `/api/ingest/pending?source=X` | (外部ワーカー用) 実行待ちの検索条件を取得 |
 | POST | `/api/ingest/state` | (外部ワーカー用) 進捗報告 |
 | POST | `/api/ingest/result` | (外部ワーカー用) 求人結果の払い出し |
+| GET | `/api/ingest/cancelled?id=X` | (外部ワーカー用) 検索が中止されたかを軽量確認（ループ内でポーリング） |
 
 ※ ingest系は `X-Ingest-Token` ヘッダによる認証あり
 
@@ -121,7 +133,7 @@ curl http://localhost:3000/api/stats                         # 動作確認
 - **プラットフォーム**: Cloudflare Pages
 - **状態**: ✅ ローカル稼働中（本番デプロイは未実施）
 - **技術スタック**: Hono + TypeScript + Cloudflare D1 + TailwindCSS + OpenAI
-- **最終更新**: 2026-07-15
+- **最終更新**: 2026-07-17（並列処理＋検索中止機能を追加）
 
 ## 今後の推奨ステップ
 1. ①②③各サイトのセレクタ実装（`worker/adapters.js`）→ 手元PCで検証

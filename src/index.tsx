@@ -103,6 +103,36 @@ app.get('/api/search/:id/status', async (c) => {
 })
 
 // ---------------------------------------------------------
+// 検索の中止（フロントの「検索を中止」ボタン）
+//   search_jobs.status を 'cancelled' にする。
+//   ・pending から外れるので、まだ処理を始めていないソースは着手されない。
+//   ・処理中のワーカーは cancel をポーリング(/api/ingest/cancelled)して中断し、
+//     それまでに見つけた部分結果を確定して done を報告する。
+// ---------------------------------------------------------
+app.post('/api/search/:id/cancel', async (c) => {
+  const id = c.req.param('id')
+  const job: any = await c.env.DB.prepare(`SELECT id, status FROM search_jobs WHERE id=?`).bind(id).first()
+  if (!job) return c.json({ error: 'not found' }, 404)
+  if (job.status !== 'running') {
+    return c.json({ ok: true, status: job.status, message: 'すでに終了しています' })
+  }
+
+  // ジョブを中止扱いに。まだ着手していない(skipped)ワーカーは即座に取り込み対象外へ。
+  await c.env.DB.prepare(
+    `UPDATE search_jobs SET status='cancelled', finished_at=datetime('now') WHERE id=? AND status='running'`
+  ).bind(id).run()
+
+  // まだ処理を始めていない(skipped)ソースは、この時点で cancelled 表示にしておく。
+  await c.env.DB.prepare(
+    `UPDATE worker_states
+     SET phase='cancelled', message='検索が中止されました', updated_at=datetime('now')
+     WHERE search_job_id=? AND phase='skipped'`
+  ).bind(id).run()
+
+  return c.json({ ok: true, status: 'cancelled' })
+})
+
+// ---------------------------------------------------------
 // 検索結果取得（逐次払い出し: since で新着のみ）
 // ---------------------------------------------------------
 app.get('/api/search/:id/results', async (c) => {
@@ -226,6 +256,19 @@ app.get('/api/ingest/pending', async (c) => {
   })
 })
 
+// 外部ワーカー用: 検索ジョブが中止されたかを軽量に確認する。
+//   ワーカーは処理ループ内でこれをポーリングし、cancelled なら中断して
+//   それまでの部分結果を確定(done報告)する。
+app.get('/api/ingest/cancelled', async (c) => {
+  const auth = c.req.header('X-Ingest-Token')
+  if (auth !== (c.env as any).INGEST_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+  const id = c.req.query('id')
+  if (!id) return c.json({ error: 'bad request' }, 400)
+  const job: any = await c.env.DB.prepare(`SELECT status FROM search_jobs WHERE id=?`).bind(id).first()
+  const cancelled = !job || job.status === 'cancelled' || job.status === 'done'
+  return c.json({ cancelled, status: job?.status ?? 'missing' })
+})
+
 // 外部ワーカーの状態報告
 app.post('/api/ingest/state', async (c) => {
   const auth = c.req.header('X-Ingest-Token')
@@ -265,9 +308,9 @@ app.post('/api/ingest/state', async (c) => {
     ).bind(body.source, Math.round(Number(body.totalInDb))).run()
   }
 
-  // 途中経過の合計を更新。完了報告なら全ソース完了かチェックしてジョブ完了。
+  // 途中経過の合計を更新。完了/エラー/中止報告なら全ソース確定かチェックしてジョブ確定。
   await refreshSearchTotals(c.env.DB, body.searchJobId)
-  if (body.phase === 'done' || body.phase === 'error') {
+  if (body.phase === 'done' || body.phase === 'error' || body.phase === 'cancelled') {
     await maybeCompleteSearch(c.env.DB, body.searchJobId)
   }
   return c.json({ ok: true })

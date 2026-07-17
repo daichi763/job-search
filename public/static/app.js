@@ -27,6 +27,7 @@ const PHASE_INFO = {
   done:      { icon: 'fa-circle-check',     color: 'text-green-600', bg: 'bg-green-50',  label: '完了' },
   error:     { icon: 'fa-triangle-exclamation', color: 'text-red-500', bg: 'bg-red-50', label: 'エラー' },
   skipped:   { icon: 'fa-plug-circle-xmark', color: 'text-slate-400', bg: 'bg-slate-50', label: '未接続' },
+  cancelled: { icon: 'fa-circle-stop',        color: 'text-orange-500', bg: 'bg-orange-50', label: '中止' },
 };
 
 // チップUI生成
@@ -360,6 +361,8 @@ function renderResults(items) {
 
 // 検索実行
 let pollTimer = null;
+let currentJobId = null;   // 実行中の検索ジョブID（停止ボタン用）
+let cancelRequested = false; // 中止リクエスト済みフラグ
 // 添付されたPDF(職務経歴書/履歴書)を base64 文字列で読み込む。
 //   ・PDFのみ対応（拡張子/MIMEでチェック）
 //   ・未選択なら null を返す（書類なしでも検索可能）
@@ -388,6 +391,16 @@ async function startSearch() {
   const btn = document.getElementById('searchBtn');
   btn.disabled = true;
   btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>AIスタッフが探しています…';
+
+  // 中止ボタンを表示・有効化
+  cancelRequested = false;
+  currentJobId = null;
+  const cancelBtn = document.getElementById('cancelBtn');
+  if (cancelBtn) {
+    cancelBtn.classList.remove('hidden');
+    cancelBtn.disabled = false;
+    cancelBtn.innerHTML = '<i class="fas fa-circle-stop mr-2"></i>検索を中止';
+  }
 
   // リセット
   shownResults.clear();
@@ -433,6 +446,7 @@ async function startSearch() {
     });
     const data = await res.json();
     const jobId = data.searchJobId;
+    currentJobId = jobId;
     pollStatus(jobId);
   } catch (e) {
     document.getElementById('search-status').textContent = '検索開始に失敗しました';
@@ -450,6 +464,32 @@ function resetBtn() {
   const btn = document.getElementById('searchBtn');
   btn.disabled = false;
   btn.innerHTML = '<i class="fas fa-robot mr-2"></i>AIスタッフに探してもらう';
+  // 中止ボタンを隠す
+  const cancelBtn = document.getElementById('cancelBtn');
+  if (cancelBtn) cancelBtn.classList.add('hidden');
+  currentJobId = null;
+}
+
+// 検索を中止する（フロントの「検索を中止」ボタン）。
+//   ・サーバに cancel を送り、search_jobs.status を cancelled にする。
+//   ・ポーリングは止めない。ワーカーが部分結果を確定し、
+//     全ソースが done/cancelled になったら pollStatus 側で終了処理する。
+async function cancelSearch() {
+  if (!currentJobId || cancelRequested) return;
+  cancelRequested = true;
+  const cancelBtn = document.getElementById('cancelBtn');
+  if (cancelBtn) {
+    cancelBtn.disabled = true;
+    cancelBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>中止しています…';
+  }
+  const statusEl = document.getElementById('search-status');
+  if (statusEl) statusEl.textContent = '中止をリクエストしました。稼働中の担当が安全に停止します…';
+  try {
+    await fetch(`/api/search/${currentJobId}/cancel`, { method: 'POST' });
+  } catch (e) {
+    console.error('cancel failed', e);
+    if (statusEl) statusEl.textContent = '中止リクエストの送信に失敗しました';
+  }
 }
 
 // 進捗＋結果ポーリング
@@ -471,14 +511,16 @@ function pollStatus(jobId) {
       }
 
       const statusEl = document.getElementById('search-status');
-      if (status.status === 'done') {
-        statusEl.textContent = `完了 (スキャン${status.totalScanned}件)`;
+      if (status.status === 'done' || status.status === 'cancelled') {
+        statusEl.textContent = status.status === 'cancelled'
+          ? `中止しました (スキャン${status.totalScanned}件 / 合致${status.totalMatched}件)`
+          : `完了 (スキャン${status.totalScanned}件)`;
         clearInterval(pollTimer);
         resetBtn();
         // 検索完了後、媒体ごとの最終検索時の総求人数が更新されているので右上を再取得
         loadStats();
       } else {
-        statusEl.textContent = '検索中…';
+        statusEl.textContent = cancelRequested ? '中止処理中…（担当が安全に停止中）' : '検索中…';
       }
     } catch (e) {
       console.error(e);
@@ -493,4 +535,6 @@ if (document.getElementById('searchBtn')) {
   initForm();
   loadStats();
   document.getElementById('searchBtn').addEventListener('click', startSearch);
+  const _cancelBtn = document.getElementById('cancelBtn');
+  if (_cancelBtn) _cancelBtn.addEventListener('click', cancelSearch);
 }

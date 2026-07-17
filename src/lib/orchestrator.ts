@@ -339,8 +339,11 @@ export async function maybeCompleteSearch(db: D1, searchJobId: string): Promise<
   const rows = states.results || []
   const done = criteria.sources.every((src) => {
     const st = rows.find((r: any) => r.source === src)
-    return st && (st.phase === 'done' || st.phase === 'error')
+    return st && (st.phase === 'done' || st.phase === 'error' || st.phase === 'cancelled')
   })
+  // 中止済みジョブは status='cancelled' を維持する。
+  // 全ソースが確定したタイミングで PDF 破棄だけ行い、status は上書きしない。
+  const isCancelled = job.status === 'cancelled'
   if (done) {
     await refreshSearchTotals(db, searchJobId)
     // 添付書類(PDF)の破棄: 検索完了後、criteria_json から生PDF(base64)を除去する。
@@ -350,10 +353,18 @@ export async function maybeCompleteSearch(db: D1, searchJobId: string): Promise<
       delete (criteria as any).resumePdfBase64
       cleanedCriteriaJson = JSON.stringify(criteria)
     }
-    await db
-      .prepare(`UPDATE search_jobs SET status='done', finished_at=datetime('now'), criteria_json=? WHERE id=?`)
-      .bind(cleanedCriteriaJson, searchJobId)
-      .run()
+    if (isCancelled) {
+      // 中止済み: status は cancelled のまま、PDF だけ破棄。
+      await db
+        .prepare(`UPDATE search_jobs SET criteria_json=? WHERE id=?`)
+        .bind(cleanedCriteriaJson, searchJobId)
+        .run()
+    } else {
+      await db
+        .prepare(`UPDATE search_jobs SET status='done', finished_at=datetime('now'), criteria_json=? WHERE id=?`)
+        .bind(cleanedCriteriaJson, searchJobId)
+        .run()
+    }
   }
   return done
 }

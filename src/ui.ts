@@ -154,6 +154,9 @@ export function renderPage(): string {
         <button id="searchBtn" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2.5 rounded-lg transition">
           <i class="fas fa-robot mr-2"></i>AIスタッフに探してもらう
         </button>
+        <button id="cancelBtn" class="w-full mt-2 bg-orange-500 hover:bg-orange-600 text-white font-bold py-2.5 rounded-lg transition hidden">
+          <i class="fas fa-circle-stop mr-2"></i>検索を中止
+        </button>
       </div>
     </section>
 
