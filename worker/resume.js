@@ -22,12 +22,27 @@ function smartModel(env) { return env.OPENAI_MODEL_SMART || 'gpt-5' }
 // ------------------------------------------------------------
 // 文字列サニタイズ（孤立サロゲート/制御文字除去。scorer.jsと同等）
 // ------------------------------------------------------------
+// scorer.js と同じ堅牢実装（1文字走査で連続孤立サロゲートも確実に除去）。
+// 旧正規表現版は連続する孤立下位サロゲートを取りこぼし OpenAI 400 の原因になる。
 function sanitizeText(str) {
   if (str == null) return ''
-  return String(str)
-    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
-    .replace(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '$1')
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
+  const s = String(str)
+  let out = ''
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c <= 0x08 || c === 0x0B || c === 0x0C || (c >= 0x0E && c <= 0x1F) || c === 0x7F) {
+      out += ' '
+      continue
+    }
+    if (c >= 0xD800 && c <= 0xDBFF) {
+      const n = s.charCodeAt(i + 1)
+      if (n >= 0xDC00 && n <= 0xDFFF) { out += s[i] + s[i + 1]; i++ }
+      continue
+    }
+    if (c >= 0xDC00 && c <= 0xDFFF) continue
+    out += s[i]
+  }
+  return out
 }
 
 // ------------------------------------------------------------
@@ -91,6 +106,16 @@ const RESUME_SYSTEM = `あなたは人材紹介のプロのキャリアアドバ
 - 事実に基づいて要約し、書類に無い情報を創作しない。
 - 求人検索・マッチングに役立つ観点（経験職種・スキル・業界・実績・志向）に集中する。
 
+【経験期間の算出（最重要）】
+- 各職歴の在籍期間から「働いた年数」を必ず計算する。
+  例:「2015年4月〜2018年3月」=約3年、「2018/4〜現在」は直近の年（不明なら2025年）まで計算。
+- 「現在」「在職中」「至 現在」等は現時点まで在籍とみなす。
+- 期間表記が全く無い場合のみ、その職歴の years を null にする。
+- 同じ職種を複数社で経験している場合は合算して jobTypeYears にまとめる。
+  例: A社で営業3年 + B社で営業2年 → {"営業": 5}
+- jobTypeYears のキーは、その人の代表的な職種カテゴリ（営業/事務/エンジニア/販売/経理 等）で正規化する。
+  細かすぎる肩書きではなく、求人票の職種と照合しやすい一般的な粒度にする。
+
 必ず次のJSON形式のみで返answer:
 {
   "summary": "この人の職務経歴の要約（200字程度、どんな経験を積んできたか）",
@@ -99,6 +124,11 @@ const RESUME_SYSTEM = `あなたは人材紹介のプロのキャリアアドバ
   "skills": ["スキル/強み（例: 新規開拓, マネジメント, 英語）"],
   "yearsExperience": 総経験年数の数値または null,
   "seniority": "メンバー | リーダー | マネージャー | 役員 などの到達役職 または null",
+  "companyCount": 在籍した会社の数（経験社数）の整数 または null,
+  "careers": [
+    { "jobType": "その職歴の職種（例: 法人営業）", "years": その職歴の在籍年数の数値, "current": 現在も在籍中ならtrue }
+  ],
+  "jobTypeYears": { "職種カテゴリ": 累計経験年数の数値 },
   "reachableJobs": "この経歴なら目指せる求人の方向性（100字程度。希望条件と合わせて考えるための材料）"
 }`
 
@@ -175,7 +205,16 @@ export function resumeAnalysisToText(analysis) {
   if (Array.isArray(analysis.jobTypes) && analysis.jobTypes.length) parts.push(`【経験職種】${analysis.jobTypes.join('、')}`)
   if (Array.isArray(analysis.industries) && analysis.industries.length) parts.push(`【経験業界】${analysis.industries.join('、')}`)
   if (Array.isArray(analysis.skills) && analysis.skills.length) parts.push(`【スキル/強み】${analysis.skills.join('、')}`)
-  if (analysis.yearsExperience != null) parts.push(`【経験年数】約${analysis.yearsExperience}年`)
+  if (analysis.yearsExperience != null) parts.push(`【総経験年数】約${analysis.yearsExperience}年`)
+  // 職種別の経験年数（実務経験N年以上要件との照合に使う最重要情報）
+  const jty = analysis.jobTypeYears
+  if (jty && typeof jty === 'object' && Object.keys(jty).length) {
+    const list = Object.entries(jty)
+      .filter(([, y]) => y != null)
+      .map(([k, y]) => `${k}:約${y}年`)
+    if (list.length) parts.push(`【職種別の経験年数】${list.join('、')}`)
+  }
+  if (analysis.companyCount != null) parts.push(`【経験社数】${analysis.companyCount}社`)
   if (analysis.seniority) parts.push(`【到達役職】${analysis.seniority}`)
   if (analysis.reachableJobs) parts.push(`【目指せる求人の方向性】${analysis.reachableJobs}`)
   return parts.join('\n')
