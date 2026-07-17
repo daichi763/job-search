@@ -17,9 +17,9 @@
 ## 対象データベース
 | # | DB | 種別 | 接続状況 |
 |---|----|----|--------|
-| ① | circusAGENT | ログイン制Webサービス | フェーズ2（外部ワーカー） |
-| ② | ヒトリンク | ログイン制Webサービス | フェーズ2（外部ワーカー） |
-| ③ | ジョビンズ | ログイン制Webサービス | フェーズ2（外部ワーカー） |
+| ① | circusAGENT | ログイン制Webサービス | ✅ 接続済み（Playwright + 内部REST API） |
+| ② | ヒトリンク (HITO-Link) | ログイン制Webサービス | ✅ 接続済み（Playwright + Server Action / 全101,580件） |
+| ③ | ジョビンズ | ログイン制Webサービス | フェーズ2（アダプタstub） |
 | ④ | 自社DB (kintone) | REST API | ✅ 接続済み（公開149件 / 全236件） |
 
 ## アーキテクチャ
@@ -27,18 +27,23 @@
 [フロント + API]  Cloudflare Pages/Workers + Hono   … 本アプリ
 [外部ワーカー]    VPS上の Node ワーカー (worker/) が各DBを検索し ingest API 経由で払い出し
      ├ ①circus : Playwright + 内部REST API（AI検索プランで反復検索）
+     ├ ②hitolink: Playwright(Azure AD B2C)でログイン → SESSION Cookieで
+     │           内部API(Next.js Server Action / POST /manage/matter)を反復検索
+     │           - キーワードは「求人情報(matter)」全文検索、RSC flightをパースして正規化
      ├ ④kintone: 公式REST API（X-Cybozu-API-Token）でAI検索プランのキーワード検索
      │           - 全文相当4フィールド(仕事内容/求人タイトル/応募必須条件/PRポイント)をOR検索
      │           - 公開判定「求人公開=可能」のみ対象（Playwright不要）
-     └ ②③: 未実装（アダプタstub）
+     └ ③jobins: 未実装（アダプタstub）
 [記憶]           Cloudflare D1 (求人キャッシュ + AI採点結果の記憶)
 [AI採点]         OpenAI gpt-5-nano（採点）/ gpt-5-mini（検索プラン設計・PDF解析）
 ```
 
 ### 検索対象ソースの切替
-`worker/.env` の `SOURCES`（カンマ区切り）で有効化。例: `SOURCES=circus,kintone`。
-kintone は `KINTONE_SUBDOMAIN` / `KINTONE_APP_ID` / `KINTONE_API_TOKEN` を設定。
-kintone も circus と同じ「AI検索プラン反復＋機械フィルタ＋AI採点」フローで動作（絞りすぎ厳禁の方針で勤務地/職種/業種はクエリで絞らず機械フィルタ＋採点に委譲）。
+`worker/.env` の `SOURCES`（カンマ区切り）で有効化。例: `SOURCES=circus,hitolink`。
+- **worker側で処理**: circus / hitolink（`worker/.env` に認証情報）
+- **webapp側で処理**: kintone は Hono 内で直接検索するため `worker/.env` の SOURCES には**含めない**（設定は `.dev.vars`）。
+- hitolink は `HITOLINK_LOGIN_URL`(=`/login`) / `HITOLINK_ID` / `HITOLINK_PW` を設定。
+- circus / hitolink / kintone いずれも同じ「AI検索プラン反復＋機械フィルタ＋AI採点」フローで動作（絞りすぎ厳禁の方針で勤務地/職種/業種はクエリで絞らず機械フィルタ＋採点に委譲）。
 
 ### トークン節約の仕組み
 1. **機械フィルタ（消費ゼロ）**: 勤務地/年収/雇用形態などで候補を絞り込み（例: 236件→60件）

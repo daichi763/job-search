@@ -1146,17 +1146,402 @@ export const circusAdapter = {
 }
 
 // ------------------------------------------------------------
-// ②ヒトリンク (未調査 — 次に構造確認)
+// ②ヒトリンク (HITO-Link エージェント) — API直接方式（実装済み）
+//   circus と同じ「Playwrightでログイン → 認証情報キャプチャ → 内部APIを叩く」
+//   方式。ただし circus との差異が2点ある（調査レポート 2026-07-17 実証済）:
+//     1. ログインは Azure AD B2C(OAuth2/OIDC)経由（メール+PWのみ、2FA/CAPTCHA無し）
+//     2. 認証キャリアは httpOnly の `SESSION` Cookie（抜き出せるBearerトークンは無い）
+//     3. APIは独立RESTではなく Next.js Server Action 経由:
+//        すべて POST /manage/matter に対して、バックエンドAPIパスを
+//        POSTボディ第1引数で指定する RSC(flight) プロトコル。
+//
+//   ★ index.js の processSource は circus と同じインターフェース
+//     (getAuthToken/buildQJson/apiCount/apiSearch/mapApiJob/extractKeyword)
+//     を要求するため、hitolink もそれに合わせる。circus では token=UUID文字列
+//     だが、hitolink では token = { sessionCookie, nextAction } オブジェクトを
+//     そのまま流用する（processSource は token を不透明値として渡すだけなので問題ない）。
+//
+//   検索: POST /manage/matter
+//         body=["/matter/query/search-matter?pageNo=N&pageSize=M&sortType=0",
+//               {"method":"POST","body":"<検索条件JSON文字列>"}]
+//         → RSC flight の "ok":true 行の data.matters(配列) + data.totalCount
+//   件数: 専用APIは無い。search-matter を pageSize=1 で叩き data.totalCount を読む。
 // ------------------------------------------------------------
+
+// 検索条件ボディの既定値（省略不可フィールドが多い。欠けると 500 JSON parse error）
+const HITOLINK_SEARCH_DEFAULTS = {
+  keywords: [],
+  matterTypes: [], prefectures: [],
+  annualIncomeIncluded: 0, annualIncomeMin: 0, annualIncomeMax: 0, age: 0,
+  occupations: [], amount: 0, rate: 0, jobType: '', academicBackgrounds: [],
+  businessTypes: [],
+  noExperienceNecessary: false, noIndustryExperienceNecessary: false,
+  dayOffWeekendsHolidays: false, isFlexibleWorkType: false, salaryType: '',
+  isBookmarked: false, workHistoryFrom: 0, workHistoryTo: 0,
+  isNoFullTimeExperience: false, isPublicCompany: false,
+  hasMoreThan120DaysOff: false, isSideJobOk: false, changeJobCountType: '',
+  isForeignNationalOk: false, isRemoteOk: false, isNoRelocation: false,
+  isOvertimeUnder20h: false, hasMaternityPaternityLeave: false,
+  isReducedHoursOk: false, isServiceB2c: false, isServiceB2b: false,
+  hasHousingAllowance: false, isDressCodeCasual: false, isCarCommutingOk: false,
+  hasRetirementSystem: false, suggestionMatterGroupId: '', candidateId: '',
+  isRecruitmentDocSelectionPassRateOver50: false,
+  isRecruitmentSelectionLeadTimeFinalWithin2weeks: false,
+  isRecruitmentHiringQuotaOver10: false,
+}
+
+// 調査時にキャプチャした next-router-state-tree（Server Action呼び出しに必須）。
+// next-action ID はビルドで変わり得るためログイン時に動的キャプチャするが、
+// これは固定文字列で動作することを実証済み。
+const HITOLINK_ROUTER_TREE =
+  '%5B%22%22%2C%7B%22children%22%3A%5B%22manage%22%2C%7B%22children%22%3A%5B%22matter%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C16%5D'
+// フォールバック用の next-action ID（動的キャプチャ失敗時に使用）
+const HITOLINK_FALLBACK_ACTION = '600e94cf457c70cf338da8f3667cac8f1b06b29bc5'
+
 export const hitolinkAdapter = {
   source: 'hitolink',
   base: 'https://agent.hito-link.jp',
+
+  // ---- ログイン（Azure AD B2C 経由）----
+  //   /login の「ログイン」リンク→B2Cフォームへ遷移→メール/PW入力→送信。
+  //   ★ハイドレーション完了前にsubmitすると失敗するため #email 出現後に待機必須。
   async login(page, env) {
-    await page.goto(env.HITOLINK_LOGIN_URL, { waitUntil: 'networkidle', timeout: 45000 })
-    throw new Error('hitolinkAdapter.login は未実装です（画面構造の確認が必要）。')
+    const loginUrl = env.HITOLINK_LOGIN_URL || 'https://agent.hito-link.jp/login'
+    const email = env.HITOLINK_ID || env.HITOLINK_EMAIL
+    const pw = env.HITOLINK_PW || env.HITOLINK_PASSWORD
+    if (!email || !pw) throw new Error('hitolink 認証情報(HITOLINK_ID / HITOLINK_PW)が未設定です')
+
+    await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
+    await page.waitForTimeout(1500)
+
+    // 既にログイン済み（/manage 配下に居る）ならスキップ
+    if (/agent\.hito-link\.jp\/manage/.test(page.url())) return
+
+    // /login 上の OAuth 開始リンクをクリックして B2C へ
+    const startLink = await page.$('a[href*="oauth2/authorization"]')
+    if (startLink) {
+      await startLink.click()
+    } else if (!/b2clogin|agent-login\.hito-link/.test(page.url())) {
+      // リンクが無く B2C 画面でもない場合は直接 authorization エンドポイントへ
+      await page.goto(`${this.base}/oauth2/authorization/agt`, { waitUntil: 'domcontentloaded', timeout: 45000 })
+    }
+
+    // B2C ログインフォーム（#email / #password / #next）
+    await page.waitForSelector('#email', { timeout: 20000 })
+    await page.waitForTimeout(1500) // ← ハイドレーション待ち（必須）
+    await page.fill('#email', email)
+    await page.fill('#password', pw)
+    await page.click('#next')
+
+    // ログイン完了 = /manage 配下へ遷移
+    await page.waitForURL(/agent\.hito-link\.jp\/manage/, { timeout: 40000 }).catch(() => {})
+    if (!/agent\.hito-link\.jp\/manage/.test(page.url())) {
+      const body = await page.innerText('body').catch(() => '')
+      if (page.url().includes('error') || body.includes('ログインに失敗')) {
+        throw new Error('hitolink ログイン失敗（認証情報またはB2Cハイドレーション待ちを確認）')
+      }
+    }
   },
-  async fetchJobs(page, criteria, onJob) {
-    return
+
+  // ---- 認証情報の取得 ----
+  //   circus の getAuthToken(トークン文字列)に相当。hitolink では
+  //   SESSION Cookie + next-action ID をまとめて返す（processSource は
+  //   この戻り値を不透明な token として apiCount/apiSearch に渡すだけ）。
+  //   /manage/matter を開いて next-action ID を動的キャプチャする（堅牢性）。
+  async getAuthToken(page) {
+    let nextAction = null
+    const handler = (r) => {
+      const h = r.headers()
+      if (h['next-action'] && !nextAction) nextAction = h['next-action']
+    }
+    page.on('request', handler)
+    try {
+      await page.goto(`${this.base}/manage/matter`, { waitUntil: 'networkidle', timeout: 60000 })
+      for (let t = 0; t < 12 && !nextAction; t++) await page.waitForTimeout(600)
+    } finally {
+      page.off('request', handler)
+    }
+
+    // SESSION Cookie を取得
+    const cookies = await page.context().cookies()
+    const sess = cookies.find((c) => c.name === 'SESSION' && (c.domain || '').includes('agent.hito-link.jp'))
+    if (!sess) throw new Error('hitolink SESSION Cookie の取得に失敗しました')
+
+    return {
+      sessionCookie: `SESSION=${sess.value}`,
+      nextAction: nextAction || HITOLINK_FALLBACK_ACTION,
+    }
+  },
+
+  // ---- 検索条件オブジェクトの組み立て ----
+  //   circus の buildQJson(4要素配列)に相当。hitolink では
+  //   HITOLINK_SEARCH_DEFAULTS に keywords/絞り込みをマージした
+  //   検索条件オブジェクトを返す（apiCall で JSON文字列化する）。
+  //   terms.or（スペース区切りキーワード）を「求人情報(matter)」全文検索へ。
+  //   複数語は keywords 配列に複数入れると AND 条件になるため、
+  //   OR網羅重視で "最初の1語のみ" を使う（circusのor思想に合わせる）。
+  buildQJson(terms = {}, filters = {}) {
+    const body = { ...HITOLINK_SEARCH_DEFAULTS }
+    const raw = (terms.or || terms.and || '').trim()
+    if (raw) {
+      // スペース区切りの先頭語を全文検索キーワードに（AND化を避け網羅重視）
+      const first = raw.split(/[\s　]+/).filter(Boolean)[0]
+      if (first) {
+        body.keywords = [{ searchType: 'matter', searchMode: 'match', keyword: first }]
+      }
+    }
+    // 追加絞り込み（将来拡張。circus数値コードは使わず hitolink 固有キーのみ）
+    if (filters && typeof filters === 'object') {
+      if (Array.isArray(filters.prefectures) && filters.prefectures.length) body.prefectures = filters.prefectures
+      if (filters.annualIncomeMin) { body.annualIncomeMin = filters.annualIncomeMin; body.annualIncomeIncluded = 1 }
+      if (filters.annualIncomeMax) { body.annualIncomeMax = filters.annualIncomeMax; body.annualIncomeIncluded = 1 }
+      if (filters.jobType) body.jobType = filters.jobType
+    }
+    return body
+  },
+
+  // ---- Server Action 経由の内部API呼び出し（共通処理）----
+  //   token = { sessionCookie, nextAction }
+  //   ブラウザコンテキスト内 fetch で POST /manage/matter を叩き、
+  //   RSC flight（text/x-component）を返す。パースは _parseFlight で行う。
+  async _actionCall(page, token, actionArgs) {
+    const { sessionCookie, nextAction } = token || {}
+    const res = await page.evaluate(async ({ base, nextAction, routerTree, actionArgs }) => {
+      const r = await fetch(`${base}/manage/matter`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'content-type': 'text/plain;charset=UTF-8',
+          'accept': 'text/x-component',
+          'next-action': nextAction,
+          'next-router-state-tree': routerTree,
+        },
+        body: JSON.stringify(actionArgs),
+      })
+      const text = await r.text()
+      return { status: r.status, text }
+    }, { base: this.base, nextAction, routerTree: HITOLINK_ROUTER_TREE, actionArgs })
+    return res
+  },
+
+  // RSC flight（改行区切りの id:payload）をパースする。
+  //   Next.js の Server Action レスポンスは「flight」形式:
+  //     0:{...}                  ← メタ行
+  //     2:T<hexlen>,<本文…>      ← 長い文字列は別チャンクに切り出され、
+  //     <本文の続き…>            ← 改行を含む場合は次のトップレベルid行まで続く
+  //     1:{"ok":true,"data":{... "summary":"$2" ...}}  ← 本体（$N は id=N への参照）
+  //   よって: (1)各トップレベルチャンク(id→raw値)を集める → (2)"ok"を含む本体JSONを
+  //   見つけて JSON.parse → (3)"$N" 参照文字列をチャンク本文で解決する。
+  _parseFlight(text) {
+    if (!text) return null
+    const lines = text.split('\n')
+
+    // (1) トップレベルチャンクを分解。`^<id>:<rest>` で始まる行が新チャンクの開始。
+    //     続く行（idプレフィックス無し）は直前チャンクの本文の一部（改行込み）。
+    const chunks = {}            // id(string) → 生rest文字列（複数行は \n で連結）
+    let curId = null
+    const idRe = /^([0-9a-f]+):([\s\S]*)$/
+    for (const line of lines) {
+      const m = line.match(idRe)
+      if (m) {
+        curId = m[1]
+        chunks[curId] = m[2]
+      } else if (curId != null) {
+        chunks[curId] += '\n' + line
+      }
+    }
+
+    // チャンク値を「解決済み文字列」に整える。
+    //   T<hexlen>,<本文> 形式なら "," 以降が本文。それ以外はそのまま。
+    const resolveChunkText = (rest) => {
+      if (rest == null) return ''
+      const tm = rest.match(/^T[0-9a-f]+,([\s\S]*)$/)
+      if (tm) return tm[1]
+      return rest
+    }
+
+    // (2) 本体JSON（"ok" を含む { ... } チャンク）を探す
+    let body = null
+    for (const [, rest] of Object.entries(chunks)) {
+      const s = (rest || '').trimStart()
+      if (s.startsWith('{') && s.includes('"ok"') && s.includes('"data"')) {
+        try { body = JSON.parse(s) } catch { /* 次へ */ }
+        if (body) break
+      }
+    }
+    if (!body || !body.data) return null
+
+    // (3) "$N" 参照を解決（オブジェクトを再帰的に走査し、"$数字" 文字列を差し替え）
+    const refRe = /^\$([0-9a-f]+)$/
+    const seen = new WeakSet()
+    const resolve = (v) => {
+      if (typeof v === 'string') {
+        const rm = v.match(refRe)
+        if (rm && chunks[rm[1]] != null) return resolveChunkText(chunks[rm[1]])
+        return v
+      }
+      if (Array.isArray(v)) return v.map(resolve)
+      if (v && typeof v === 'object') {
+        if (seen.has(v)) return v
+        seen.add(v)
+        for (const k of Object.keys(v)) v[k] = resolve(v[k])
+        return v
+      }
+      return v
+    }
+    body.data = resolve(body.data)
+    return body
+  },
+
+  // 求人検索（本体）。params = { qJson(=検索条件obj), filters, limit, offset, pageNo }
+  // 戻り値: { total, jobs:[生matter], status }
+  async apiSearch(page, token, params = {}) {
+    const { qJson, filters, limit = 100, offset = 0, pageNo } = params
+    const pno = pageNo || Math.floor(offset / (limit || 100)) + 1
+    const body = qJson || this.buildQJson({}, filters)
+    const actionArgs = [
+      `/matter/query/search-matter?pageNo=${pno}&pageSize=${limit}&sortType=0`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ]
+    const { status, text } = await this._actionCall(page, token, actionArgs)
+    if (status !== 200) throw new Error(`hitolink apiSearch 失敗 status=${status}`)
+    const obj = this._parseFlight(text)
+    if (!obj || obj.ok !== true) throw new Error('hitolink apiSearch: flightパース失敗またはok=false')
+    const data = obj.data || {}
+    return { total: typeof data.totalCount === 'number' ? data.totalCount : null,
+             jobs: Array.isArray(data.matters) ? data.matters : [], status }
+  },
+
+  // 件数のみ取得（専用APIが無いので pageSize=1 で search-matter を叩く軽量版）。
+  async apiCount(page, token, params = {}) {
+    try {
+      const r = await this.apiSearch(page, token, { ...params, limit: 1, offset: 0, pageNo: 1 })
+      return typeof r.total === 'number' ? r.total : null
+    } catch (e) {
+      return null
+    }
+  },
+
+  // ---- 生 matter → 内部 NormalizedJob 形状へ変換（機能B）----
+  //   一覧49項目から正規化。業種(businessType)は一覧に明示フィールドが無いため
+  //   基本 null（詳細APIでのみ取得可能。負荷回避のため一覧段階では取らない）。
+  mapApiJob(raw) {
+    if (!raw) return null
+
+    const jobCategory = raw.occupationClassification || ''
+    const jobCategories = [raw.occupationClassification, raw.occupation].filter(Boolean)
+
+    // 勤務地: prefecture + town を1件に結合
+    const loc = [raw.prefecture, raw.town].filter(Boolean).join('')
+    const locations = loc ? [loc] : []
+
+    // 年収: 万円 → 円
+    const salaryMin = typeof raw.annualIncomeMin === 'number' && raw.annualIncomeMin > 0
+      ? Math.round(raw.annualIncomeMin * 10000) : null
+    const salaryMax = typeof raw.annualIncomeMax === 'number' && raw.annualIncomeMax > 0
+      ? Math.round(raw.annualIncomeMax * 10000) : null
+
+    // 残業: isOvertimeUnder20h → テキスト
+    const overtime = raw.isOvertimeUnder20h === true ? '20時間未満' : null
+
+    // 休日: フラグからテキスト合成
+    const holParts = []
+    if (raw.dayOffWeekendsHolidays) holParts.push('土日祝休み')
+    if (raw.hasMoreThan120DaysOff) holParts.push('年間休日120日超')
+    const holiday = holParts.join('・') || null
+
+    // 応募条件（年齢/学歴）。性別フィールドは一覧に無し→null。
+    const requiredAgeMin = typeof raw.ageFrom === 'number' && raw.ageFrom > 0 ? raw.ageFrom : null
+    const requiredAgeMax = typeof raw.ageTo === 'number' && raw.ageTo > 0 ? raw.ageTo : null
+    const requiredGender = null
+    // 学歴: "設定なし"/"不問" 等は要件なし → null
+    let requiredEducation = null
+    if (raw.academicBackground) {
+      const ab = String(raw.academicBackground).trim()
+      if (ab && !/^設定なし$|^不問$|^学歴不問$/.test(ab)) {
+        requiredEducation = ab.split(',').map((s) => s.trim()).filter(Boolean).join('・')
+      }
+    }
+
+    // 成果報酬: commissionType('rate'|'fixed') + commission(率% or 額)
+    const reward = this._extractReward(raw)
+
+    // 経験要件フラグ
+    const experience = []
+    if (raw.noExperienceNecessary) experience.push('職種未経験OK')
+    if (raw.noIndustryExperienceNecessary) experience.push('業種未経験OK')
+    if (raw.isNoFullTimeExperience) experience.push('正社員経験不問')
+    if (raw.isForeignNationalOk) experience.push('外国籍OK')
+
+    // 詳細URL: 一覧の recTenantId + recMatterId(6桁ゼロ埋め) から詳細画面URLを組み立て
+    let url = `${this.base}/manage/matter`
+    if (raw.recTenantId && raw.recMatterId != null) {
+      const detailId = `${raw.recTenantId}-${String(raw.recMatterId).padStart(6, '0')}`
+      url = `${this.base}/manage/matter?id=${detailId}`
+    }
+
+    return {
+      source: 'hitolink',
+      sourceJobId: String(raw.matterId || ''),
+      title: raw.matterName || '',
+      company: raw.companyName || '',
+      companyWebsite: raw.companyUrl || '',
+      jobCategory,
+      jobCategories,
+      industry: '',            // 一覧に業種名フィールド無し（詳細APIでのみ取得可）
+      industries: [],
+      employment: raw.jobType || '',
+      locations,
+      salaryMin,
+      salaryMax,
+      overtime,
+      holiday,
+      requiredAgeMin,
+      requiredAgeMax,
+      requiredGender,
+      requiredEducation,
+      reward,
+      requirements: raw.essentialRequirement || '',
+      description: raw.summary || '',
+      url,
+      isOpen: true,            // search-matter が返すのは掲載中(public)のみ
+      publishStartedAt: raw.insertDateTime || null,
+      lastUpdatedAt: raw.updateDateTime || null,
+      _raw: raw,
+    }
+  },
+
+  // 成果報酬抽出（commissionType/commission から）。
+  //   type='rate' → rate(%)、type='fixed' → amount(円)。
+  //   実データでは commission が rate時=25(=%), fixed時=額（万円か円かは要確認、
+  //   万円想定で×10000。異常に小さい値のみ万円換算）。
+  _extractReward(raw) {
+    const type = raw.commissionType || 'unknown'
+    const val = typeof raw.commission === 'number' ? raw.commission : null
+    if (type === 'rate') {
+      return { type: 'rate', rate: val, amount: null, text: val != null ? `理論年収の${val}%` : '' }
+    }
+    if (type === 'fixed') {
+      // 固定額。100未満なら万円表記とみなし×10000、それ以上は円とみなす
+      const amount = val == null ? null : (val < 1000 ? val * 10000 : val)
+      return { type: 'fixed', rate: null, amount, text: val != null ? `固定 ${val}` : '' }
+    }
+    return { type: 'unknown', rate: null, amount: null, text: '' }
+  },
+
+  // freeText からキーワード候補を抽出（circus と同じロジック）。
+  extractKeyword(criteria) {
+    if (criteria.keyword && criteria.keyword.trim()) return criteria.keyword.trim()
+    const ft = (criteria.freeText || '').trim()
+    if (!ft) return ''
+    if (Array.isArray(criteria.jobCategories) && criteria.jobCategories.length) {
+      return criteria.jobCategories[0]
+    }
+    const KNOWN = ['営業', 'エンジニア', '事務', '経理', '人事', 'マーケティング', '企画',
+      '販売', '看護', '介護', 'デザイナー', 'コンサル', '製造', '施工', '建築', '医療',
+      'IT', 'プログラマ', 'ドライバー', '接客', '管理', '開発', 'データ', '財務', '総務']
+    for (const k of KNOWN) if (ft.includes(k)) return k
+    return ''
   },
 }
 
