@@ -1395,6 +1395,9 @@ export const hitolinkAdapter = {
 
   // 求人検索（本体）。params = { qJson(=検索条件obj), filters, limit, offset, pageNo }
   // 戻り値: { total, jobs:[生matter], status }
+  //
+  // ★リトライ付き: hitolink サーバは連続アクセス時に一時的な失敗(空/エラー/ok!=true)を
+  //   返すことがある（特に circus と並列で走らせると顕著）。指数バックオフで最大3回試す。
   async apiSearch(page, token, params = {}) {
     const { qJson, filters, limit = 100, offset = 0, pageNo } = params
     const pno = pageNo || Math.floor(offset / (limit || 100)) + 1
@@ -1403,13 +1406,47 @@ export const hitolinkAdapter = {
       `/matter/query/search-matter?pageNo=${pno}&pageSize=${limit}&sortType=0`,
       { method: 'POST', body: JSON.stringify(body) },
     ]
-    const { status, text } = await this._actionCall(page, token, actionArgs)
-    if (status !== 200) throw new Error(`hitolink apiSearch 失敗 status=${status}`)
-    const obj = this._parseFlight(text)
-    if (!obj || obj.ok !== true) throw new Error('hitolink apiSearch: flightパース失敗またはok=false')
-    const data = obj.data || {}
-    return { total: typeof data.totalCount === 'number' ? data.totalCount : null,
-             jobs: Array.isArray(data.matters) ? data.matters : [], status }
+
+    const MAX_TRY = 3
+    let lastErr = null
+    for (let attempt = 1; attempt <= MAX_TRY; attempt++) {
+      let status = 0
+      let text = ''
+      try {
+        const r = await this._actionCall(page, token, actionArgs)
+        status = r.status
+        text = r.text
+      } catch (e) {
+        lastErr = new Error(`hitolink apiSearch 通信失敗: ${e.message}`)
+      }
+
+      if (status === 200 && !lastErr) {
+        const obj = this._parseFlight(text)
+        if (obj && obj.ok === true) {
+          const data = obj.data || {}
+          return {
+            total: typeof data.totalCount === 'number' ? data.totalCount : null,
+            jobs: Array.isArray(data.matters) ? data.matters : [],
+            status,
+          }
+        }
+        // パース失敗 / ok!=true。デバッグのため先頭を残す（PIIを避け先頭300字のみ）。
+        const head = (text || '').replace(/\s+/g, ' ').slice(0, 300)
+        lastErr = new Error(`hitolink apiSearch: flightパース失敗またはok=false (len=${(text || '').length}, head="${head}")`)
+      } else if (!lastErr) {
+        const head = (text || '').replace(/\s+/g, ' ').slice(0, 200)
+        lastErr = new Error(`hitolink apiSearch 失敗 status=${status} head="${head}"`)
+      }
+
+      // 最終試行でなければバックオフして再試行
+      if (attempt < MAX_TRY) {
+        const wait = 800 * attempt // 800ms, 1600ms
+        console.log(`[hitolink] apiSearch 一時失敗(try ${attempt}/${MAX_TRY} p${pno}) → ${wait}ms後リトライ: ${lastErr.message}`)
+        await page.waitForTimeout(wait)
+        lastErr = null
+      }
+    }
+    throw lastErr || new Error('hitolink apiSearch: 不明なエラー')
   },
 
   // 件数のみ取得（専用APIが無いので pageSize=1 で search-matter を叩く軽量版）。
