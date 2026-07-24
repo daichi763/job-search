@@ -1334,31 +1334,62 @@ export const hitolinkAdapter = {
   //   見つけて JSON.parse → (3)"$N" 参照文字列をチャンク本文で解決する。
   _parseFlight(text) {
     if (!text) return null
-    const lines = text.split('\n')
 
-    // (1) トップレベルチャンクを分解。`^<id>:<rest>` で始まる行が新チャンクの開始。
-    //     続く行（idプレフィックス無し）は直前チャンクの本文の一部（改行込み）。
-    const chunks = {}            // id(string) → 生rest文字列（複数行は \n で連結）
-    let curId = null
-    const idRe = /^([0-9a-f]+):([\s\S]*)$/
-    for (const line of lines) {
-      const m = line.match(idRe)
-      if (m) {
-        curId = m[1]
-        chunks[curId] = m[2]
-      } else if (curId != null) {
-        chunks[curId] += '\n' + line
+    // ── 長さベースのチャンク分解 ──────────────────────────────
+    // Next.js の flight は `<id>:<payload>\n` の連なりだが、payload が
+    //   `T<hexlen>,<本文>` 形式の場合、本文は「hexlen バイト分の生テキスト」であり
+    //   その中に改行(\n)を含みうる。行(split '\n')ベースで分けると、長い本文の
+    //   途中の改行で切れてしまい、後続の `1:{"ok":true...}` 行を前チャンクが
+    //   飲み込んで本体を見失う（＝flightパース失敗の実際の原因）。
+    // そこで、`T<hexlen>,` を見つけたら hexlen バイト（UTF-16換算でなくバイト長）
+    //   を厳密に読み進めるカーソル方式に変更する。
+    const chunks = {}     // id(string) → 解決済み文字列（Tプレフィックス除去済み）
+    const enc = new TextEncoder()
+    const dec = new TextDecoder()
+    // バイト長で厳密に切り出すため、一度 UTF-8 バイト列に変換して扱う。
+    const bytes = enc.encode(text)
+    let pos = 0
+    const nl = 0x0a   // '\n'
+    const colon = 0x3a // ':'
+    const readLineStr = () => {
+      // 現在位置から次の \n までを1行として返す（\n は消費）。
+      let end = pos
+      while (end < bytes.length && bytes[end] !== nl) end++
+      const s = dec.decode(bytes.subarray(pos, end))
+      pos = end < bytes.length ? end + 1 : end
+      return s
+    }
+    while (pos < bytes.length) {
+      // 行頭の `<id>:` を読む
+      let cur = pos
+      let colonAt = -1
+      while (cur < bytes.length && bytes[cur] !== nl) {
+        if (bytes[cur] === colon) { colonAt = cur; break }
+        cur++
+      }
+      if (colonAt < 0) { readLineStr(); continue } // ':' の無い行はスキップ
+      const id = dec.decode(bytes.subarray(pos, colonAt))
+      pos = colonAt + 1
+      // payload の先頭が 'T' なら長さ付きテキスト。それ以外は行末まで。
+      if (bytes[pos] === 0x54 /* 'T' */) {
+        // `T<hexlen>,` を読む
+        let p = pos + 1
+        let hexEnd = p
+        while (hexEnd < bytes.length && bytes[hexEnd] !== 0x2c /* ',' */) hexEnd++
+        const hexLen = dec.decode(bytes.subarray(p, hexEnd))
+        const byteLen = parseInt(hexLen, 16)
+        const bodyStart = hexEnd + 1
+        const bodyEnd = Math.min(bodyStart + (isNaN(byteLen) ? 0 : byteLen), bytes.length)
+        chunks[id] = dec.decode(bytes.subarray(bodyStart, bodyEnd))
+        pos = bodyEnd
+        if (pos < bytes.length && bytes[pos] === nl) pos++ // 末尾の改行を消費
+      } else {
+        // 通常 payload（JSON等）。行末まで。
+        chunks[id] = readLineStr()
       }
     }
 
-    // チャンク値を「解決済み文字列」に整える。
-    //   T<hexlen>,<本文> 形式なら "," 以降が本文。それ以外はそのまま。
-    const resolveChunkText = (rest) => {
-      if (rest == null) return ''
-      const tm = rest.match(/^T[0-9a-f]+,([\s\S]*)$/)
-      if (tm) return tm[1]
-      return rest
-    }
+    const resolveChunkText = (rest) => (rest == null ? '' : rest)
 
     // (2) 本体JSON（"ok" を含む { ... } チャンク）を探す
     let body = null
