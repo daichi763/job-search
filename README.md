@@ -14,6 +14,7 @@
   - 求人は見つかり次第、一致度順に**逐次払い出し**
   - **記憶機能**: 採点結果を記憶し、公開中の求人は次回AIを使わず即提案
   - **検索履歴**: 過去の検索条件と結果をDBに保存し、ヘッダの「検索履歴」からいつでも見返せる
+  - **同時実行ガード**: 検索中は新規検索を投げられない（サーバー負荷軽減）。実行中は検索ボタンが無効化され、ページを開くだけで「検索中」状態に自動追従する
 
 ## 対象データベース
 | # | DB | 種別 | 接続状況 |
@@ -73,7 +74,8 @@
 | Method | Path | 説明 |
 |--------|------|------|
 | GET | `/` | フロントUI |
-| POST | `/api/search` | 検索開始（body=検索条件）。`{searchJobId}`を返す |
+| POST | `/api/search` | 検索開始（body=検索条件）。`{searchJobId}`を返す。**実行中の検索がある場合は409**（`{error:"search_in_progress", activeSearchJobId}`）で拒否＝サーバー負荷軽減の同時実行ガード |
+| GET | `/api/search/active` | 実行中の検索の有無を返す（`{active, searchJobId, freeText, ...}`）。ページ表示時の復帰・ボタン制御に使用 |
 | GET | `/api/search/:id/status` | 進捗＋各AI担当の状態を取得 |
 | GET | `/api/search/:id/results?since=N` | 検索結果を取得（`since`で新着のみ、逐次払い出し用） |
 | POST | `/api/search/:id/cancel` | 検索を中止（`status=cancelled`）。稼働中のワーカーは部分結果を確定して停止 |
@@ -141,7 +143,7 @@ curl http://localhost:3000/api/stats                         # 動作確認
 - **プラットフォーム**: Cloudflare Pages
 - **状態**: ✅ ローカル稼働中（本番デプロイは未実施）
 - **技術スタック**: Hono + TypeScript + Cloudflare D1 + TailwindCSS + OpenAI
-- **最終更新**: 2026-07-29（検索履歴の閲覧機能＋ファビコンを追加）
+- **最終更新**: 2026-07-29（検索の同時実行ガード＝負荷軽減を追加）
 
 ## 今後の推奨ステップ
 1. ①②③各サイトのセレクタ実装（`worker/adapters.js`）→ 手元PCで検証

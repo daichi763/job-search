@@ -45,7 +45,29 @@ function summarizeCriteria(criteria: any): string {
 // ---------------------------------------------------------
 // 検索開始
 // ---------------------------------------------------------
+// 「進行中」とみなす閾値（分）。これより古い running はハングとみなし新規検索を許可する。
+const RUNNING_STALE_MINUTES = 30
+
 app.post('/api/search', async (c) => {
+  // --- 同時実行ガード：サーバー負荷軽減のため、実行中の検索が1つでもあれば新規検索を拒否 ---
+  const active: any = await c.env.DB.prepare(
+    `SELECT id, free_text, created_at FROM search_jobs
+     WHERE status='running'
+       AND created_at > datetime('now', ?)
+     ORDER BY created_at DESC LIMIT 1`
+  )
+    .bind(`-${RUNNING_STALE_MINUTES} minutes`)
+    .first()
+  if (active) {
+    return c.json({
+      error: 'search_in_progress',
+      message: '現在ほかの検索を実行中です。完了までお待ちください。',
+      activeSearchJobId: active.id,
+      activeFreeText: active.free_text || '',
+      activeCreatedAt: active.created_at,
+    }, 409)
+  }
+
   const body = await c.req.json<Partial<SearchCriteria>>()
 
   const criteria: SearchCriteria = {
@@ -91,6 +113,30 @@ app.post('/api/search', async (c) => {
   }
 
   return c.json({ searchJobId })
+})
+
+// ---------------------------------------------------------
+// 実行中の検索があるか（ページ表示時の復帰・ボタン制御に使用）
+// 静的パスなので :id ルートより前に定義すること
+// ---------------------------------------------------------
+app.get('/api/search/active', async (c) => {
+  const active: any = await c.env.DB.prepare(
+    `SELECT id, free_text, created_at, total_scanned, total_matched FROM search_jobs
+     WHERE status='running'
+       AND created_at > datetime('now', ?)
+     ORDER BY created_at DESC LIMIT 1`
+  )
+    .bind(`-${RUNNING_STALE_MINUTES} minutes`)
+    .first()
+  if (!active) return c.json({ active: false })
+  return c.json({
+    active: true,
+    searchJobId: active.id,
+    freeText: active.free_text || '',
+    createdAt: active.created_at,
+    totalScanned: active.total_scanned,
+    totalMatched: active.total_matched,
+  })
 })
 
 // ---------------------------------------------------------

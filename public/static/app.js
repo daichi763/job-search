@@ -388,19 +388,12 @@ function readResumePdf() {
 }
 
 async function startSearch() {
-  const btn = document.getElementById('searchBtn');
-  btn.disabled = true;
-  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>AIスタッフが探しています…';
+  lockSearchBtn();
 
   // 中止ボタンを表示・有効化
   cancelRequested = false;
   currentJobId = null;
-  const cancelBtn = document.getElementById('cancelBtn');
-  if (cancelBtn) {
-    cancelBtn.classList.remove('hidden');
-    cancelBtn.disabled = false;
-    cancelBtn.innerHTML = '<i class="fas fa-circle-stop mr-2"></i>検索を中止';
-  }
+  showCancelBtn();
 
   // リセット
   shownResults.clear();
@@ -445,6 +438,25 @@ async function startSearch() {
       body: JSON.stringify(criteria),
     });
     const data = await res.json();
+
+    // 同時実行ガード：サーバー側で実行中の検索がある場合は 409
+    if (res.status === 409 || data.error === 'search_in_progress') {
+      const statusEl = document.getElementById('search-status');
+      if (statusEl) {
+        statusEl.innerHTML = '<span class="text-amber-600"><i class="fas fa-triangle-exclamation mr-1"></i>'
+          + escapeHtml(data.message || '現在ほかの検索を実行中です。完了までお待ちください。') + '</span>';
+      }
+      // 実行中の検索に「追従」して進捗・結果を表示する
+      if (data.activeSearchJobId) {
+        currentJobId = data.activeSearchJobId;
+        showCancelBtn();
+        pollStatus(data.activeSearchJobId);
+      } else {
+        resetBtn();
+      }
+      return;
+    }
+
     const jobId = data.searchJobId;
     currentJobId = jobId;
     pollStatus(jobId);
@@ -457,6 +469,25 @@ async function startSearch() {
       message: `検索開始に失敗しました: ${String(e && e.stack ? e.stack : (e && e.message ? e.message : e))}`,
     }]);
     resetBtn();
+  }
+}
+
+// 中止ボタンを表示・有効化（検索開始時・実行中検索への追従時に使用）
+function showCancelBtn() {
+  const cancelBtn = document.getElementById('cancelBtn');
+  if (cancelBtn) {
+    cancelBtn.classList.remove('hidden');
+    cancelBtn.disabled = false;
+    cancelBtn.innerHTML = '<i class="fas fa-circle-stop mr-2"></i>検索を中止';
+  }
+}
+
+// 検索ボタンを「検索中」ロック状態にする
+function lockSearchBtn() {
+  const btn = document.getElementById('searchBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>AIスタッフが探しています…';
   }
 }
 
@@ -649,10 +680,35 @@ async function showHistoryDetail(id) {
   }
 }
 
+// ページを開いた時、サーバー側で検索が実行中なら自動で追従表示する
+// （別タブ/リロード/別端末からアクセスしても「今検索中」が分かるように）
+async function resumeActiveSearch() {
+  try {
+    const res = await fetch('/api/search/active');
+    const data = await res.json();
+    if (!data.active || !data.searchJobId) return;
+    currentJobId = data.searchJobId;
+    lockSearchBtn();
+    showCancelBtn();
+    const statusEl = document.getElementById('search-status');
+    if (statusEl) {
+      const q = escapeHtml((data.freeText || '').slice(0, 40)) || '（自由記述なし）';
+      statusEl.innerHTML = '<span class="text-indigo-600"><i class="fas fa-spinner fa-spin mr-1"></i>検索を実行中です：'
+        + q + '</span>';
+    }
+    const box = document.getElementById('results');
+    if (box) box.innerHTML = '<p class="text-sm text-slate-400">実行中の検索に接続しました。見つかった求人がここに表示されます。</p>';
+    pollStatus(data.searchJobId);
+  } catch (e) {
+    console.error('resumeActiveSearch failed', e);
+  }
+}
+
 // 起動（本番ページのみ。テスト等で要素が無い場合は安全にスキップ）
 if (document.getElementById('searchBtn')) {
   initForm();
   loadStats();
+  resumeActiveSearch();
   document.getElementById('searchBtn').addEventListener('click', startSearch);
   const _cancelBtn = document.getElementById('cancelBtn');
   if (_cancelBtn) _cancelBtn.addEventListener('click', cancelSearch);
