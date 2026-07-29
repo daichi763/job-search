@@ -7,7 +7,8 @@ export function renderPage(): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>求人横断検索AI</title>
-  <link rel="icon" href="/favicon.ico">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="alternate icon" href="/favicon.ico">
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
   <style>
@@ -50,8 +51,13 @@ export function renderPage(): string {
   <header class="bg-gradient-to-r from-indigo-600 to-blue-600 text-white shadow">
     <div class="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
       <h1 class="text-xl font-bold"><i class="fas fa-magnifying-glass-chart mr-2"></i>求人横断検索AI</h1>
-      <div id="grand-total" class="text-sm bg-white/20 rounded-full px-4 py-1.5">
-        <i class="fas fa-database mr-1"></i>総求人数: <span id="grand-total-num" class="font-bold">…</span> 件
+      <div class="flex items-center gap-3">
+        <button id="historyBtn" class="text-sm bg-white/20 hover:bg-white/30 rounded-full px-4 py-1.5 transition">
+          <i class="fas fa-clock-rotate-left mr-1"></i>検索履歴
+        </button>
+        <div id="grand-total" class="text-sm bg-white/20 rounded-full px-4 py-1.5">
+          <i class="fas fa-database mr-1"></i>総求人数: <span id="grand-total-num" class="font-bold">…</span> 件
+        </div>
       </div>
     </div>
   </header>
@@ -182,6 +188,31 @@ export function renderPage(): string {
       </div>
     </section>
   </main>
+
+  <!-- ===== 検索履歴モーダル ===== -->
+  <div id="historyModal" class="fixed inset-0 z-50 hidden">
+    <div id="historyBackdrop" class="absolute inset-0 bg-black/40"></div>
+    <div class="absolute inset-0 flex items-start justify-center p-4 overflow-y-auto">
+      <div class="bg-white rounded-xl shadow-xl w-full max-w-4xl my-8 max-h-[90vh] flex flex-col">
+        <div class="flex items-center justify-between px-5 py-3 border-b border-slate-200">
+          <h2 class="font-bold text-slate-700">
+            <i class="fas fa-clock-rotate-left mr-2 text-indigo-500"></i><span id="historyTitle">検索履歴</span>
+          </h2>
+          <div class="flex items-center gap-2">
+            <button id="historyBackBtn" class="hidden text-sm text-indigo-600 hover:text-indigo-800 px-2 py-1">
+              <i class="fas fa-arrow-left mr-1"></i>一覧へ戻る
+            </button>
+            <button id="historyCloseBtn" class="text-slate-400 hover:text-slate-600 text-xl px-2" aria-label="閉じる">
+              <i class="fas fa-xmark"></i>
+            </button>
+          </div>
+        </div>
+        <div id="historyBody" class="p-5 overflow-y-auto">
+          <p class="text-sm text-slate-400">読み込み中…</p>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

@@ -13,6 +13,7 @@
   - AIスタッフ（各DB担当）の稼働状況をリアルタイム可視化
   - 求人は見つかり次第、一致度順に**逐次払い出し**
   - **記憶機能**: 採点結果を記憶し、公開中の求人は次回AIを使わず即提案
+  - **検索履歴**: 過去の検索条件と結果をDBに保存し、ヘッダの「検索履歴」からいつでも見返せる
 
 ## 対象データベース
 | # | DB | 種別 | 接続状況 |
@@ -77,6 +78,9 @@
 | GET | `/api/search/:id/results?since=N` | 検索結果を取得（`since`で新着のみ、逐次払い出し用） |
 | POST | `/api/search/:id/cancel` | 検索を中止（`status=cancelled`）。稼働中のワーカーは部分結果を確定して停止 |
 | GET | `/api/stats` | 各DBの総求人数、合計求人数 |
+| GET | `/api/history?limit=N&offset=N` | 検索履歴の一覧（新しい順。検索条件サマリ・スキャン数・合致数・対象DB） |
+| GET | `/api/history/:id` | 検索1件の詳細（検索条件＋保存済みの合致求人をスコア順に返す） |
+| GET | `/favicon.ico` / `/favicon.svg` | ファビコン（インラインSVG・虫めがねアイコン） |
 | GET | `/api/ingest/pending?source=X` | (外部ワーカー用) 実行待ちの検索条件を取得 |
 | POST | `/api/ingest/state` | (外部ワーカー用) 進捗報告 |
 | POST | `/api/ingest/result` | (外部ワーカー用) 求人結果の払い出し |
@@ -137,7 +141,7 @@ curl http://localhost:3000/api/stats                         # 動作確認
 - **プラットフォーム**: Cloudflare Pages
 - **状態**: ✅ ローカル稼働中（本番デプロイは未実施）
 - **技術スタック**: Hono + TypeScript + Cloudflare D1 + TailwindCSS + OpenAI
-- **最終更新**: 2026-07-29（ジョビンズ実装＝4媒体すべて接続済み）
+- **最終更新**: 2026-07-29（検索履歴の閲覧機能＋ファビコンを追加）
 
 ## 今後の推奨ステップ
 1. ①②③各サイトのセレクタ実装（`worker/adapters.js`）→ 手元PCで検証

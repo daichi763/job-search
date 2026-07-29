@@ -18,6 +18,30 @@ function uuid(): string {
   return crypto.randomUUID()
 }
 
+// 検索条件を短い日本語サマリに整形（履歴一覧の表示用）
+function summarizeCriteria(criteria: any): string {
+  if (!criteria || typeof criteria !== 'object') return ''
+  const parts: string[] = []
+  if (Array.isArray(criteria.jobCategories) && criteria.jobCategories.length) {
+    parts.push(`職種:${criteria.jobCategories.slice(0, 3).join('・')}`)
+  }
+  if (Array.isArray(criteria.locations) && criteria.locations.length) {
+    parts.push(`勤務地:${criteria.locations.slice(0, 3).join('・')}`)
+  }
+  if (criteria.salaryMin != null || criteria.salaryMax != null) {
+    const lo = criteria.salaryMin != null ? `${criteria.salaryMin}万` : ''
+    const hi = criteria.salaryMax != null ? `${criteria.salaryMax}万` : ''
+    parts.push(`年収:${lo}〜${hi}`)
+  }
+  if (Array.isArray(criteria.employment) && criteria.employment.length) {
+    parts.push(`雇用:${criteria.employment.slice(0, 2).join('・')}`)
+  }
+  if (criteria.age) parts.push(`年齢:${criteria.age}`)
+  if (criteria.gender) parts.push(`性別:${criteria.gender}`)
+  if (criteria.education) parts.push(`学歴:${criteria.education}`)
+  return parts.join(' / ')
+}
+
 // ---------------------------------------------------------
 // 検索開始
 // ---------------------------------------------------------
@@ -163,6 +187,95 @@ app.get('/api/search/:id/results', async (c) => {
 
   const maxId = items.reduce((m, it) => Math.max(m, it.resultId), since)
   return c.json({ items, maxId })
+})
+
+// ---------------------------------------------------------
+// 検索履歴：一覧
+//   過去の検索(search_jobs)を新しい順に返す。条件の要約と件数付き。
+//   ?limit=50&offset=0 でページング可能。
+// ---------------------------------------------------------
+app.get('/api/history', async (c) => {
+  const limit = Math.max(1, Math.min(200, parseInt(c.req.query('limit') || '50', 10)))
+  const offset = Math.max(0, parseInt(c.req.query('offset') || '0', 10))
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, criteria_json, free_text, top_n, status, created_at, finished_at,
+            total_scanned, total_matched
+       FROM search_jobs
+      ORDER BY created_at DESC, id DESC
+      LIMIT ? OFFSET ?`
+  ).bind(limit, offset).all()
+
+  const totalRow: any = await c.env.DB.prepare(`SELECT COUNT(*) AS cnt FROM search_jobs`).first()
+
+  const items = (results || []).map((r: any) => {
+    let criteria: any = {}
+    try { criteria = JSON.parse(r.criteria_json) } catch {}
+    // 一時保存のPDF(base64)は要約に含めない
+    if (criteria && criteria.resumePdfBase64) delete criteria.resumePdfBase64
+    return {
+      id: r.id,
+      status: r.status,
+      createdAt: r.created_at,
+      finishedAt: r.finished_at,
+      totalScanned: r.total_scanned,
+      totalMatched: r.total_matched,
+      freeText: r.free_text || '',
+      summary: summarizeCriteria(criteria),
+      sources: (criteria.sources || []).map((s: string) => SOURCE_LABELS[s as SourceId] || s),
+    }
+  })
+
+  return c.json({ items, total: totalRow?.cnt ?? items.length, limit, offset })
+})
+
+// ---------------------------------------------------------
+// 検索履歴：詳細（条件 + 保存済み結果すべて）
+// ---------------------------------------------------------
+app.get('/api/history/:id', async (c) => {
+  const id = c.req.param('id')
+  const job: any = await c.env.DB.prepare(
+    `SELECT id, criteria_json, free_text, top_n, status, created_at, finished_at,
+            total_scanned, total_matched
+       FROM search_jobs WHERE id=?`
+  ).bind(id).first()
+  if (!job) return c.json({ error: 'not found' }, 404)
+
+  let criteria: any = {}
+  try { criteria = JSON.parse(job.criteria_json) } catch {}
+  if (criteria && criteria.resumePdfBase64) delete criteria.resumePdfBase64
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT * FROM search_results WHERE search_job_id=? ORDER BY score DESC, id ASC`
+  ).bind(id).all()
+
+  const items = (results || []).map((r: any) => {
+    let jobObj: any = {}
+    try { jobObj = JSON.parse(r.job_json) } catch {}
+    return {
+      resultId: r.id,
+      source: r.source,
+      sourceLabel: SOURCE_LABELS[r.source as SourceId] || r.source,
+      score: r.score,
+      reason: r.reason,
+      fromMemory: r.from_memory === 1,
+      job: jobObj,
+    }
+  })
+
+  return c.json({
+    id: job.id,
+    status: job.status,
+    createdAt: job.created_at,
+    finishedAt: job.finished_at,
+    totalScanned: job.total_scanned,
+    totalMatched: job.total_matched,
+    freeText: job.free_text || '',
+    criteria,
+    summary: summarizeCriteria(criteria),
+    sources: (criteria.sources || []).map((s: string) => SOURCE_LABELS[s as SourceId] || s),
+    items,
+  })
 })
 
 // ---------------------------------------------------------
@@ -339,9 +452,24 @@ app.post('/api/ingest/result', async (c) => {
 // ---------------------------------------------------------
 // フロントUI
 // ---------------------------------------------------------
-app.get('/favicon.ico', (c) => {
-  return c.body(null, 204)
-})
+// ファビコン（インラインSVG。ヘッダーのテーマ色＝インディゴの虫眼鏡アイコン）
+const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#2563eb"/>
+  </linearGradient></defs>
+  <rect width="64" height="64" rx="14" fill="url(#g)"/>
+  <circle cx="28" cy="28" r="12" fill="none" stroke="#fff" stroke-width="4.5"/>
+  <line x1="37" y1="37" x2="48" y2="48" stroke="#fff" stroke-width="5.5" stroke-linecap="round"/>
+</svg>`
+
+const faviconResponse = (c: any) =>
+  c.body(FAVICON_SVG, 200, {
+    'Content-Type': 'image/svg+xml',
+    'Cache-Control': 'public, max-age=86400',
+  })
+
+app.get('/favicon.ico', faviconResponse)
+app.get('/favicon.svg', faviconResponse)
 
 app.get('/', (c) => {
   return c.html(renderPage())

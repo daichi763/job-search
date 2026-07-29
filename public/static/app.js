@@ -530,6 +530,125 @@ function pollStatus(jobId) {
   pollTimer = setInterval(poll, 1500);
 }
 
+// ============================================================
+// 検索履歴モーダル
+// ============================================================
+const STATUS_BADGE = {
+  done: { label: '完了', cls: 'bg-green-100 text-green-700' },
+  running: { label: '実行中', cls: 'bg-blue-100 text-blue-700' },
+  cancelled: { label: '中止', cls: 'bg-orange-100 text-orange-700' },
+  error: { label: 'エラー', cls: 'bg-red-100 text-red-700' },
+};
+
+function fmtDateTime(s) {
+  if (!s) return '-';
+  // SQLite datetime('now') はUTC。ローカル表示に変換。
+  const d = new Date(String(s).replace(' ', 'T') + (String(s).includes('Z') ? '' : 'Z'));
+  if (isNaN(d.getTime())) return s;
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}/${p(d.getMonth()+1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function openHistory() {
+  const modal = document.getElementById('historyModal');
+  if (!modal) return;
+  modal.classList.remove('hidden');
+  showHistoryList();
+}
+
+function closeHistory() {
+  const modal = document.getElementById('historyModal');
+  if (modal) modal.classList.add('hidden');
+}
+
+async function showHistoryList() {
+  const body = document.getElementById('historyBody');
+  const title = document.getElementById('historyTitle');
+  const backBtn = document.getElementById('historyBackBtn');
+  title.textContent = '検索履歴';
+  backBtn.classList.add('hidden');
+  body.innerHTML = '<p class="text-sm text-slate-400">読み込み中…</p>';
+  try {
+    const res = await fetch('/api/history?limit=100');
+    const data = await res.json();
+    const items = data.items || [];
+    if (!items.length) {
+      body.innerHTML = '<p class="text-sm text-slate-400">まだ検索履歴はありません。</p>';
+      return;
+    }
+    body.innerHTML = `
+      <p class="text-xs text-slate-400 mb-3">全 ${data.total} 件</p>
+      <div class="space-y-2">
+        ${items.map(it => {
+          const b = STATUS_BADGE[it.status] || { label: it.status, cls: 'bg-slate-100 text-slate-600' };
+          const query = escapeHtml((it.freeText || '').slice(0, 80)) || '<span class="text-slate-400">（自由記述なし）</span>';
+          const summary = escapeHtml(it.summary || '');
+          return `
+          <button class="history-item w-full text-left border border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/40 rounded-lg p-3 transition" data-id="${escapeHtml(it.id)}">
+            <div class="flex items-center justify-between gap-2 mb-1">
+              <span class="text-xs text-slate-500"><i class="fas fa-clock mr-1"></i>${fmtDateTime(it.createdAt)}</span>
+              <span class="text-[10px] px-2 py-0.5 rounded ${b.cls}">${b.label}</span>
+            </div>
+            <p class="text-sm text-slate-800 font-medium leading-snug">${query}</p>
+            ${summary ? `<p class="text-xs text-slate-500 mt-1">${summary}</p>` : ''}
+            <div class="flex items-center gap-3 text-[11px] text-slate-400 mt-1.5">
+              <span><i class="fas fa-magnifying-glass mr-1"></i>スキャン ${it.totalScanned ?? 0}件</span>
+              <span><i class="fas fa-check mr-1"></i>合致 ${it.totalMatched ?? 0}件</span>
+              ${it.sources && it.sources.length ? `<span><i class="fas fa-database mr-1"></i>${escapeHtml(it.sources.join('・'))}</span>` : ''}
+            </div>
+          </button>`;
+        }).join('')}
+      </div>`;
+    body.querySelectorAll('.history-item').forEach(btn => {
+      btn.addEventListener('click', () => showHistoryDetail(btn.getAttribute('data-id')));
+    });
+  } catch (e) {
+    body.innerHTML = `<p class="text-sm text-red-500">履歴の読み込みに失敗しました: ${escapeHtml(String(e && e.message || e))}</p>`;
+  }
+}
+
+async function showHistoryDetail(id) {
+  const body = document.getElementById('historyBody');
+  const title = document.getElementById('historyTitle');
+  const backBtn = document.getElementById('historyBackBtn');
+  backBtn.classList.remove('hidden');
+  title.textContent = '検索の詳細';
+  body.innerHTML = '<p class="text-sm text-slate-400">読み込み中…</p>';
+  try {
+    const res = await fetch(`/api/history/${encodeURIComponent(id)}`);
+    if (!res.ok) throw new Error('見つかりませんでした');
+    const d = await res.json();
+    const b = STATUS_BADGE[d.status] || { label: d.status, cls: 'bg-slate-100 text-slate-600' };
+    const items = (d.items || []).sort((a, b) => b.score - a.score);
+
+    const condHtml = `
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-4 mb-4">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="text-sm font-bold text-slate-700"><i class="fas fa-sliders mr-1 text-indigo-500"></i>検索条件</h3>
+          <span class="text-[10px] px-2 py-0.5 rounded ${b.cls}">${b.label}</span>
+        </div>
+        ${d.freeText ? `<p class="text-sm text-slate-700 mb-2 whitespace-pre-wrap">${escapeHtml(d.freeText)}</p>` : ''}
+        ${d.summary ? `<p class="text-xs text-slate-500">${escapeHtml(d.summary)}</p>` : ''}
+        <div class="flex flex-wrap items-center gap-3 text-[11px] text-slate-400 mt-2">
+          <span><i class="fas fa-clock mr-1"></i>${fmtDateTime(d.createdAt)}</span>
+          <span><i class="fas fa-magnifying-glass mr-1"></i>スキャン ${d.totalScanned ?? 0}件</span>
+          <span><i class="fas fa-check mr-1"></i>合致 ${d.totalMatched ?? 0}件</span>
+          ${d.sources && d.sources.length ? `<span><i class="fas fa-database mr-1"></i>${escapeHtml(d.sources.join('・'))}</span>` : ''}
+        </div>
+      </div>`;
+
+    const resultsHtml = items.length
+      ? `<div class="space-y-3">${items.map(it => `<div class="border border-slate-100 rounded-lg p-3 bg-white">${jobCardInner(it, {})}</div>`).join('')}</div>`
+      : '<p class="text-sm text-slate-400">この検索では合致した求人が保存されていません。</p>';
+
+    body.innerHTML = condHtml
+      + `<h3 class="text-sm font-bold text-slate-700 mb-2"><i class="fas fa-list-check mr-1 text-indigo-500"></i>マッチした求人 (${items.length})</h3>`
+      + resultsHtml;
+  } catch (e) {
+    body.innerHTML = `<p class="text-sm text-red-500">詳細の読み込みに失敗しました: ${escapeHtml(String(e && e.message || e))}</p>`;
+  }
+}
+
 // 起動（本番ページのみ。テスト等で要素が無い場合は安全にスキップ）
 if (document.getElementById('searchBtn')) {
   initForm();
@@ -537,4 +656,15 @@ if (document.getElementById('searchBtn')) {
   document.getElementById('searchBtn').addEventListener('click', startSearch);
   const _cancelBtn = document.getElementById('cancelBtn');
   if (_cancelBtn) _cancelBtn.addEventListener('click', cancelSearch);
+
+  // 検索履歴モーダル
+  const _histBtn = document.getElementById('historyBtn');
+  if (_histBtn) _histBtn.addEventListener('click', openHistory);
+  const _histClose = document.getElementById('historyCloseBtn');
+  if (_histClose) _histClose.addEventListener('click', closeHistory);
+  const _histBack = document.getElementById('historyBackBtn');
+  if (_histBack) _histBack.addEventListener('click', showHistoryList);
+  const _histBackdrop = document.getElementById('historyBackdrop');
+  if (_histBackdrop) _histBackdrop.addEventListener('click', closeHistory);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeHistory(); });
 }
