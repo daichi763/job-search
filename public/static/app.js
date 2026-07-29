@@ -8,7 +8,7 @@ const SOURCES = [
   { id: 'kintone', label: '自社DB (kintone)', connected: true },
   { id: 'circus', label: 'circusAGENT', connected: true },
   { id: 'hitolink', label: 'ヒトリンク', connected: true },
-  { id: 'jobins', label: 'ジョビンズ', connected: false },
+  { id: 'jobins', label: 'ジョビンズ', connected: true },
 ];
 
 // DB担当ごとのミニキャラクター絵文字（AIスタッフの見た目）

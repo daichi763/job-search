@@ -36,10 +36,15 @@ kintone のような **webapp側で処理する機能** と、circus のよう�
 ### ポイント
 - **kintone は外部ワーカー経由ではなく webapp（Hono）側で直接 REST API を叩く**。
   → よって kintone の設定先は `worker/.env` ではなく **webapp の `.dev.vars`**。
-- `worker/.env` の `SOURCES` は **`circus,hitolink`**（worker側で処理するもののみ）。
+- `worker/.env` の `SOURCES` は **`circus,hitolink,jobins`**（worker側で処理するもののみ）。
   kintone はwebapp側が担当するため **SOURCES に入れない**（入れると二重処理になりうる）。
 - hitolink は Azure AD B2C(OAuth2)でログイン → `SESSION` Cookie で内部API(Next.js Server Action)を叩く。
   認証情報は `HITOLINK_LOGIN_URL`(=`/login`) / `HITOLINK_ID` / `HITOLINK_PW`（`worker/.env`）。
+- jobins は Laravel フォームでログイン → セッションCookie(`jobins_prod_api_session_1`)+CSRF(`XSRF-TOKEN`→`x-xsrf-token`)で
+  純粋REST API(`POST api.jobins.jp/api/agent/job/search`)を叩く。認証情報は
+  `JOBINS_LOGIN_URL`(=`/agent/login`) / `JOBINS_ID` / `JOBINS_PW`（`worker/.env`）。
+  **WAF/bot対策**でheadless Linux UAだと403になるため、worker/index.js は source=jobins のとき
+  Windows Chrome UA + locale ja-JP + `navigator.webdriver` 隠蔽の context で起動する。
 
 ## 反映手順（VPS）
 ```bash

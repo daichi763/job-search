@@ -1614,17 +1614,306 @@ export const hitolinkAdapter = {
 }
 
 // ------------------------------------------------------------
-// ③ジョビンズ (未調査 — 403対策でPlaywright必須)
+// ③ジョビンズ (JoBins) — circus方式（ログイン→Cookie/CSRF捕捉→REST直接）
+//
+//   3サイト中もっとも容易。求人データは純粋なREST JSON API
+//     POST https://api.jobins.jp/api/agent/job/search
+//   から取得できる。flightパース不要・詳細API不要（検索レスポンス各要素が
+//   59フィールドの完全な求人詳細を含む）。
+//
+//   ★ WAF/bot対策: 既定のheadless Linux UAだと403。Windows Chrome UAへ偽装し
+//     navigator.webdriver を隠蔽、locale=ja-JP + viewport を設定する。
+//     ハニーポット項目 address には触れないこと。2FA/CAPTCHAは無し。
+//
+//   認証: セッションCookie(jobins_prod_api_session_1, httpOnly) +
+//         CSRF(XSRF-TOKEN Cookieを URLデコード → x-xsrf-token ヘッダ)。
+//         Bearer/JWT/localStorageトークンは無し。
+//         追加Cookie: XSRF-API-TOKEN-MAIN, _lt も併せて送る。
+//   件数: 検索レスポンスの meta.pagination.total（専用件数API不要）。
+//   検索: POST /api/agent/job/search（body に page/per_page/search 等）。
+//
+//   getAuthToken は circus の「トークン文字列」に相当する不透明トークンとして
+//   { cookieHeader, xsrf } を返す（processSource は apiCount/apiSearch に渡すだけ）。
 // ------------------------------------------------------------
+
+// JoBins WAF回避用の共通UA/ヘッダ
+const JOBINS_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+// 検索ボディのデフォルト（REPORT.md 実測。search:[] で全件=129042）
+function jobinsSearchDefaults() {
+  return {
+    search: [], strategy: 'or',
+    prefecture: [], industry: [], sub_job_type: [],
+    referral_fee_percent: '', referral_fee_amount: '',
+    job_type_experience: [], industry_type_experience: [],
+    age: '', employment_status: [], gender: [], nationality: [],
+    bonus: [], incentive: [], stock: [],
+    minimum_education_level: '', document_passing_rate: '',
+    document_screening_speed: '', no_of_vacancy: '', experience: '',
+    salary: [null, null], minimumSalary: '',
+    page: 1, per_page: 20, sort: 'job_score:desc',
+    jd_type: [], job_ids: [],
+    location: { prefecture: [], city: [] },
+    characteristics: [], media_publication: [], send_scout: [],
+    relocation: [], jobins_recommendation: false, pre_payment: false,
+    source: '', searchEntity: '', entityName: '', no_experience: false,
+    job_employment_category: [],
+  }
+}
+
 export const jobinsAdapter = {
   source: 'jobins',
   base: 'https://jobins.jp',
+  apiBase: 'https://api.jobins.jp',
+
+  // ---- ログイン（Laravel フォーム）----
+  //   /agent/login で #email / #password を埋め #login-button-submit を押下。
+  //   ハニーポット項目 address には触れない。成功後 /agent/job/search_1#/ へ。
   async login(page, env) {
-    await page.goto(env.JOBINS_LOGIN_URL, { waitUntil: 'networkidle', timeout: 45000 })
-    throw new Error('jobinsAdapter.login は未実装です（画面構造の確認が必要）。')
+    const loginUrl = env.JOBINS_LOGIN_URL || `${this.base}/agent/login`
+    const email = env.JOBINS_ID || env.JOBINS_EMAIL || env.JB_EMAIL
+    const pw = env.JOBINS_PW || env.JOBINS_PASSWORD || env.JB_PW
+    if (!email || !pw) throw new Error('jobins 認証情報(JOBINS_ID / JOBINS_PW)が未設定です')
+
+    // WAF回避: navigator.webdriver 隠蔽（context生成時に済んでいれば冪等）
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
+    }).catch(() => {})
+
+    await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
+    await page.waitForTimeout(1500)
+
+    // 既にログイン済み（/agent/login 以外に居る）ならスキップ
+    if (!/\/agent\/login/.test(page.url())) return
+
+    await page.waitForSelector('#email', { timeout: 20000 })
+    await page.waitForTimeout(800)
+    await page.fill('#email', email)
+    await page.fill('#password', pw)
+    // ハニーポット #address には絶対に触れない
+    await page.waitForTimeout(400)
+    await page.click('#login-button-submit')
+
+    // ログイン完了 = /agent/login から離脱
+    await page.waitForURL((u) => !/\/agent\/login/.test(String(u)), { timeout: 40000 }).catch(() => {})
+    await page.waitForTimeout(2000)
+    if (/\/agent\/login/.test(page.url())) {
+      const body = await page.innerText('body').catch(() => '')
+      if (body.includes('ログイン') && (body.includes('正しく') || body.includes('失敗') || body.includes('一致'))) {
+        throw new Error('jobins ログイン失敗（認証情報を確認）')
+      }
+      // フォームが残っているなら失敗
+      const still = await page.$('#password')
+      if (still) throw new Error('jobins ログイン失敗（/agent/login から遷移しませんでした）')
+    }
   },
-  async fetchJobs(page, criteria, onJob) {
-    return
+
+  // ---- 認証情報の取得 ----
+  //   circus の getAuthToken(トークン文字列)に相当。jobins では
+  //   jobins.jp ドメインのCookie群を Cookieヘッダ文字列にまとめ、
+  //   XSRF-TOKEN を URLデコードしたCSRFトークンと共に返す（不透明token）。
+  async getAuthToken(page) {
+    // 検索SPAを一度開いてCookie/CSRFを確実に発火させる
+    await page.goto(`${this.base}/agent/job/search_1#/`, { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {})
+    await page.waitForTimeout(2000)
+
+    const cookies = await page.context().cookies()
+    const jb = cookies.filter((c) => (c.domain || '').includes('jobins.jp'))
+    if (!jb.length) throw new Error('jobins Cookie の取得に失敗しました')
+
+    const cookieHeader = jb.map((c) => `${c.name}=${c.value}`).join('; ')
+    const xsrfCookie = jb.find((c) => c.name === 'XSRF-TOKEN')
+    const xsrf = xsrfCookie ? decodeURIComponent(xsrfCookie.value) : ''
+
+    const hasSession = jb.some((c) => c.name.startsWith('jobins_prod_api_session'))
+    if (!hasSession) throw new Error('jobins セッションCookie(jobins_prod_api_session_1)の取得に失敗しました')
+
+    return { cookieHeader, xsrf }
+  },
+
+  // ---- 検索条件オブジェクトの組み立て ----
+  //   circus の buildQJson(4要素配列)に相当。jobins では検索ボディを返す。
+  //   terms.or（スペース区切りキーワード）を search 配列へ（strategy=or）。
+  //   OR網羅重視で「最初の1語のみ」を使う（circusのor思想に合わせる）。
+  buildQJson(terms = {}, filters = {}) {
+    const body = jobinsSearchDefaults()
+    const raw = (terms.or || terms.and || '').trim()
+    if (raw) {
+      const first = raw.split(/[\s　]+/).filter(Boolean)[0]
+      if (first) body.search = [first]
+    }
+    // 追加絞り込み（将来拡張。circus数値コードは使わず jobins 固有キーのみ）
+    if (filters && typeof filters === 'object') {
+      if (Array.isArray(filters.prefecture) && filters.prefecture.length) body.prefecture = filters.prefecture
+      if (Array.isArray(filters.industry) && filters.industry.length) body.industry = filters.industry
+      if (Array.isArray(filters.sub_job_type) && filters.sub_job_type.length) body.sub_job_type = filters.sub_job_type
+      if (Array.isArray(filters.jd_type) && filters.jd_type.length) body.jd_type = filters.jd_type
+    }
+    return body
+  },
+
+  // ---- REST API 呼び出し（共通処理）----
+  //   token = { cookieHeader, xsrf }
+  //   ブラウザコンテキスト内 fetch で api.jobins.jp を叩く（WAF回避のため
+  //   Cookie/UA/origin/referer をブラウザと一致させる）。
+  async _apiCall(page, token, body) {
+    const { cookieHeader, xsrf } = token || {}
+    return await page.evaluate(async ({ apiBase, cookieHeader, xsrf, ua, body }) => {
+      try {
+        const res = await fetch(`${apiBase}/api/agent/job/search`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'content-type': 'application/json',
+            'accept': 'application/json',
+            'x-requested-with': 'XMLHttpRequest',
+            'x-xsrf-token': xsrf,
+            'origin': 'https://jobins.jp',
+            'referer': 'https://jobins.jp/',
+          },
+          body: JSON.stringify(body),
+        })
+        const status = res.status
+        let json = null
+        try { json = await res.json() } catch {}
+        return { status, json }
+      } catch (e) {
+        return { status: 0, json: null, error: String(e && e.message || e) }
+      }
+    }, { apiBase: this.apiBase, cookieHeader, xsrf, ua: JOBINS_UA, body })
+  },
+
+  // 求人検索（本体）。params = { qJson(検索ボディ), filters, limit, offset, pageNo }
+  // 戻り値: { total, jobs:[生API job], status }
+  async apiSearch(page, token, params = {}) {
+    const { qJson, filters, limit = 20, offset = 0, pageNo } = params
+    const body = qJson ? { ...qJson } : this.buildQJson({}, filters)
+    body.per_page = limit
+    body.page = pageNo || Math.floor(offset / (limit || 20)) + 1
+
+    const MAX_TRY = 3
+    let lastErr = null
+    for (let attempt = 1; attempt <= MAX_TRY; attempt++) {
+      const { status, json, error } = await this._apiCall(page, token, body)
+      if (status === 200 && json && json.success) {
+        const total = json.meta && json.meta.pagination ? json.meta.pagination.total : null
+        const jobs = Array.isArray(json.data) ? json.data : []
+        return { total, jobs, status }
+      }
+      lastErr = new Error(`jobins apiSearch 失敗 status=${status}${error ? ` (${error})` : ''}`)
+      if (attempt < MAX_TRY) { await page.waitForTimeout(800 * attempt) }
+    }
+    throw lastErr || new Error('jobins apiSearch: 不明なエラー')
+  },
+
+  // マッチ件数のみ取得（機能Aの件数→条件調整ループ用）。
+  //   専用件数APIは無いので per_page:1 で検索し meta.pagination.total を読む。
+  async apiCount(page, token, params = {}) {
+    const { qJson, filters } = params
+    const body = qJson ? { ...qJson } : this.buildQJson({}, filters)
+    body.per_page = 1
+    body.page = 1
+    const { status, json } = await this._apiCall(page, token, body)
+    if (status !== 200 || !json || !json.success) return null
+    const total = json.meta && json.meta.pagination ? json.meta.pagination.total : null
+    return typeof total === 'number' ? total : null
+  },
+
+  // ==========================================================
+  // 【機能B（詳細取得）＝API直接方式】
+  //   検索レスポンス各要素(59フィールド)を内部 NormalizedJob 形式へ変換。
+  //   別途の詳細ページ取得は不要。
+  // ==========================================================
+  mapApiJob(raw) {
+    if (!raw) return null
+    const iso = (u) => (u ? new Date(u * 1000).toISOString() : null)
+
+    const jobCat = raw.job_type && raw.job_type.name ? raw.job_type.name : ''
+    const jobSub = raw.job_sub_type && raw.job_sub_type.name ? raw.job_sub_type.name : ''
+    const jobCategories = [jobCat, jobSub].filter(Boolean)
+
+    const locations = (Array.isArray(raw.prefectures) ? raw.prefectures : [])
+      .map((p) => p && p.name).filter(Boolean)
+
+    const chars = (Array.isArray(raw.characteristics) ? raw.characteristics : [])
+      .map((c) => c && c.name).filter(Boolean)
+
+    const salaryMin = raw.min_year_salary != null ? Math.round(Number(raw.min_year_salary) * 10000) : null
+    const salaryMax = raw.max_year_salary != null ? Math.round(Number(raw.max_year_salary) * 10000) : null
+
+    const reward = this._extractReward(raw)
+
+    return {
+      source: 'jobins',
+      sourceJobId: String(raw.uuid || raw.id || raw.vacancy_no || ''),
+      title: raw.job_title || '',
+      company: raw.provider_company || '',
+      companyWebsite: '',
+      jobCategory: jobCategories.join('・'),
+      jobCategories,
+      industry: '',          // 求人レコードに業界名フィールドなし（推定は行わず空）
+      industries: [],
+      employment: raw.employment_status || '',
+      locations,
+      salaryMin,
+      salaryMax,
+      overtime: chars.find((c) => c.includes('残業')) || '',
+      // 休日は「土日/週休/休日/年休」等を優先（産休/育休の誤検出を避ける）
+      holiday:
+        chars.find((c) => /(土日|週休|休日|年間休日|年休|完全)/.test(c)) ||
+        chars.find((c) => c.includes('休') && !/(産休|育休)/.test(c)) ||
+        '',
+      requiredAgeMin: typeof raw.age_min === 'number' ? raw.age_min : null,
+      requiredAgeMax: typeof raw.age_max === 'number' ? raw.age_max : null,
+      requiredGender: raw.gender && raw.gender !== 'NA' ? raw.gender : null,
+      requiredEducation: raw.minimum_education_level || null,
+      reward,
+      requirements: raw.application_condition || '',
+      description: raw.job_description || '',
+      url: `${this.base}/agent/job/search_1#/`,
+      isOpen: true, // 検索結果に出る=公開中
+      publishStartedAt: iso(raw.created_at && raw.created_at.raw),
+      lastUpdatedAt: iso(raw.updated_at && raw.updated_at.raw),
+      _raw: raw,
+    }
+  },
+
+  // 成果報酬（紹介手数料）抽出。agent_fee_type に依存。
+  //   percent → agent_percent(%)（理論年収に対する紹介率）
+  //   number  → final_referrer_income(万円) を ×10000 で円換算した固定額
+  _extractReward(raw) {
+    if (!raw || typeof raw !== 'object') return { type: 'unknown', rate: null, amount: null, text: '' }
+    const num = (v) => {
+      if (v == null) return null
+      const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/[, ]/g, ''))
+      return Number.isFinite(n) ? n : null
+    }
+    if (raw.agent_fee_type === 'percent') {
+      const rate = num(raw.agent_percent != null ? raw.agent_percent : raw.final_referrer_income)
+      return { type: 'rate', rate, amount: null, text: rate != null ? `理論年収の${rate}%` : '' }
+    }
+    if (raw.agent_fee_type === 'number') {
+      const man = num(raw.final_referrer_income)
+      const amount = man != null ? man * 10000 : null
+      return { type: 'fixed', rate: null, amount, text: man != null ? `一律${man}万円` : '' }
+    }
+    return { type: 'unknown', rate: null, amount: null, text: '' }
+  },
+
+  // freeText からキーワード候補を抽出（circus と同じロジック）。
+  extractKeyword(criteria) {
+    if (criteria.keyword && criteria.keyword.trim()) return criteria.keyword.trim()
+    const ft = (criteria.freeText || '').trim()
+    if (!ft) return ''
+    if (Array.isArray(criteria.jobCategories) && criteria.jobCategories.length) {
+      return criteria.jobCategories[0]
+    }
+    const KNOWN = ['営業', 'エンジニア', '事務', '経理', '人事', 'マーケティング', '企画',
+      '販売', '看護', '介護', 'デザイナー', 'コンサル', '製造', '施工', '建築', '医療',
+      'IT', 'プログラマ', 'ドライバー', '接客', '管理', '開発', 'データ', '財務', '総務']
+    for (const k of KNOWN) if (ft.includes(k)) return k
+    return ''
   },
 }
 

@@ -215,7 +215,7 @@ app.get('/api/stats', async (c) => {
       lastSearchedAt: totalMap[s]?.updatedAt ?? null,
       cached: cacheMap[s]?.cached ?? 0,
       openCached: cacheMap[s]?.open ?? 0,
-      connected: s === 'kintone' || s === 'circus' || s === 'hitolink', // kintone/circus/hitolink 接続済み
+      connected: s === 'kintone' || s === 'circus' || s === 'hitolink' || s === 'jobins', // 全4媒体 接続済み
     }
   }
 

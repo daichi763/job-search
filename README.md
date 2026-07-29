@@ -19,7 +19,7 @@
 |---|----|----|--------|
 | ① | circusAGENT | ログイン制Webサービス | ✅ 接続済み（Playwright + 内部REST API） |
 | ② | ヒトリンク (HITO-Link) | ログイン制Webサービス | ✅ 接続済み（Playwright + Server Action / 全101,580件） |
-| ③ | ジョビンズ | ログイン制Webサービス | フェーズ2（アダプタstub） |
+| ③ | ジョビンズ (JoBins) | ログイン制Webサービス | ✅ 接続済み（Playwright + REST API / 全131,633件） |
 | ④ | 自社DB (kintone) | REST API | ✅ 接続済み（公開149件 / 全236件） |
 
 ## アーキテクチャ
@@ -30,20 +30,24 @@
      ├ ②hitolink: Playwright(Azure AD B2C)でログイン → SESSION Cookieで
      │           内部API(Next.js Server Action / POST /manage/matter)を反復検索
      │           - キーワードは「求人情報(matter)」全文検索、RSC flightをパースして正規化
-     ├ ④kintone: 公式REST API（X-Cybozu-API-Token）でAI検索プランのキーワード検索
-     │           - 全文相当4フィールド(仕事内容/求人タイトル/応募必須条件/PRポイント)をOR検索
-     │           - 公開判定「求人公開=可能」のみ対象（Playwright不要）
-     └ ③jobins: 未実装（アダプタstub）
+     ├ ③jobins  : Playwright(Laravelフォーム)でログイン → セッションCookie+CSRFで
+     │           純粋REST API(POST api.jobins.jp/api/agent/job/search)を反復検索
+     │           - WAF回避のためWindows Chrome UA偽装+navigator.webdriver隠蔽
+     │           - 検索レスポンス各要素(59フィールド)がそのまま求人詳細（詳細API不要）
+     └ ④kintone : 公式REST API（X-Cybozu-API-Token）でAI検索プランのキーワード検索
+                 - 全文相当4フィールド(仕事内容/求人タイトル/応募必須条件/PRポイント)をOR検索
+                 - 公開判定「求人公開=可能」のみ対象（Playwright不要）
 [記憶]           Cloudflare D1 (求人キャッシュ + AI採点結果の記憶)
 [AI採点]         OpenAI gpt-5-nano（採点）/ gpt-5-mini（検索プラン設計・PDF解析）
 ```
 
 ### 検索対象ソースの切替
-`worker/.env` の `SOURCES`（カンマ区切り）で有効化。例: `SOURCES=circus,hitolink`。
-- **worker側で処理**: circus / hitolink（`worker/.env` に認証情報）
+`worker/.env` の `SOURCES`（カンマ区切り）で有効化。例: `SOURCES=circus,hitolink,jobins`。
+- **worker側で処理**: circus / hitolink / jobins（`worker/.env` に認証情報）
 - **webapp側で処理**: kintone は Hono 内で直接検索するため `worker/.env` の SOURCES には**含めない**（設定は `.dev.vars`）。
 - hitolink は `HITOLINK_LOGIN_URL`(=`/login`) / `HITOLINK_ID` / `HITOLINK_PW` を設定。
-- circus / hitolink / kintone いずれも同じ「AI検索プラン反復＋機械フィルタ＋AI採点」フローで動作（絞りすぎ厳禁の方針で勤務地/職種/業種はクエリで絞らず機械フィルタ＋採点に委譲）。
+- jobins は `JOBINS_LOGIN_URL`(=`/agent/login`) / `JOBINS_ID` / `JOBINS_PW` を設定。WAF対策でWindows Chrome UA偽装が必須（worker/index.jsがsource=jobins時に自動設定）。
+- circus / hitolink / jobins / kintone いずれも同じ「AI検索プラン反復＋機械フィルタ＋AI採点」フローで動作（絞りすぎ厳禁の方針で勤務地/職種/業種はクエリで絞らず機械フィルタ＋採点に委譲）。
 
 ### 並列処理（ソースごと独立ループ）
 外部ワーカー(`worker/index.js`)は **ソースごとに独立したポーリングループ** を並列実行する（`Promise.all(SOURCES.map(pollLoopForSource))`）。
@@ -133,7 +137,7 @@ curl http://localhost:3000/api/stats                         # 動作確認
 - **プラットフォーム**: Cloudflare Pages
 - **状態**: ✅ ローカル稼働中（本番デプロイは未実施）
 - **技術スタック**: Hono + TypeScript + Cloudflare D1 + TailwindCSS + OpenAI
-- **最終更新**: 2026-07-17（並列処理＋検索中止機能を追加）
+- **最終更新**: 2026-07-29（ジョビンズ実装＝4媒体すべて接続済み）
 
 ## 今後の推奨ステップ
 1. ①②③各サイトのセレクタ実装（`worker/adapters.js`）→ 手元PCで検証

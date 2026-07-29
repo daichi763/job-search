@@ -194,7 +194,22 @@ async function processSource(browser, source, searchJobId, criteria) {
     return
   }
 
-  const context = await browser.newContext({ viewport: { width: 1400, height: 1000 } })
+  // jobins は WAF/bot対策で headless Linux UA だと403になるため、
+  // Windows Chrome UA + locale ja-JP + navigator.webdriver 隠蔽で起動する。
+  const contextOpts = { viewport: { width: 1400, height: 1000 } }
+  if (source === 'jobins') {
+    contextOpts.userAgent =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    contextOpts.locale = 'ja-JP'
+    contextOpts.viewport = { width: 1366, height: 768 }
+    contextOpts.extraHTTPHeaders = { 'Accept-Language': 'ja-JP,ja;q=0.9,en;q=0.8' }
+  }
+  const context = await browser.newContext(contextOpts)
+  if (source === 'jobins') {
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
+    })
+  }
   const page = await context.newPage()
   const startedAt = Date.now()
   const useAI = (criteria.freeText || '').trim().length > 0
