@@ -150,9 +150,15 @@ curl http://localhost:3000/api/stats                         # 動作確認
 外部ワーカー(circus/hitolink/jobins)がクラッシュ・再起動して完了報告を送れないと、
 `search_jobs.status='running'` が残り、同時実行ガードで新規検索が全て弾かれることがある。
 以下の3層で自動/手動に復旧する：
-1. **pending再取得**: 途中状態のまま10分以上更新のない担当を、workerが再び拾って再実行（自動復旧）
-2. **自動完了**: `/api/search/active`（ページ表示時に必ず叩かれる）で、10分以上応答のない担当をerror扱いにして検索を完了させる
+1. **pending再取得**: 途中状態のまま10分以上「進捗報告(updated_at)」が途絶えた担当を、workerが再び拾って再実行（自動復旧）
+2. **自動完了**: `/api/search/active`（ページ表示時に必ず叩かれる）で、**最終進捗報告から25分**応答のない担当をerror扱いにして検索を完了させる
 3. **手動リセット**: `POST /api/admin/reset-stale?force=1` で全runningを即完了（下記コマンド）
+
+> **⚠️ 長時間検索の誤爆防止**: ハング判定は「検索開始からの経過時間」ではなく
+> 「**最終進捗報告(updated_at)からの無応答時間**」で行う。workerはページ取得・採点バッチ
+> ごとに進捗を報告するため、**進捗が続いている限り何十分かかっても誤ってerrorにされない**。
+> 未着手ソースの自動救済も「実在する担当が全て確定済み(=もう動く担当がいない)」場合に限定し、
+> 他ソースが実行中の正常な長時間検索は保護される。
 ```bash
 curl -X POST "https://job-search.dissectera.com/api/admin/reset-stale?force=1" \
   -H "X-Ingest-Token: <INGEST_TOKEN>"

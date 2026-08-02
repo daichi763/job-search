@@ -324,9 +324,13 @@ export async function refreshSearchTotals(db: D1, searchJobId: string): Promise<
     .run()
 }
 
-// 担当が途中状態のままこの分数以上更新されなければハングとみなし error 扱いで完了させる。
-// （worker のクラッシュ/再起動で done/error 報告が欠落し running が永久に残るのを防ぐ）
-const STALE_COMPLETE_MINUTES = 10
+// 担当が途中状態のまま「最終進捗報告(updated_at)」からこの分数以上ハートビートが
+// 途絶えたら、ハングとみなし error 扱いで完了させる。
+//  ※ worker は各ページ取得・各採点バッチごとに reportState(=updated_at更新) するため、
+//    正常に進捗している検索は何時間かかっても updated_at が更新され続け誤爆しない。
+//    この閾値は「1バッチ処理の最大想定時間」より十分大きく取る（LLM遅延等の余裕込み）。
+//    同時実行ガードの RUNNING_STALE_MINUTES(30分) より内側にする。
+const STALE_COMPLETE_MINUTES = 25
 
 // 全ソースがdone/errorに達していれば search_jobs を完了させる
 export async function maybeCompleteSearch(db: D1, searchJobId: string): Promise<boolean> {
@@ -351,21 +355,33 @@ export async function maybeCompleteSearch(db: D1, searchJobId: string): Promise<
     .bind(searchJobId, `-${STALE_COMPLETE_MINUTES} minutes`)
     .run()
 
-  // ハング救済(2): criteria のソースなのに worker_states 行が全く無い担当。
-  //   （worker が一度も着手できずに落ちた等）。ジョブ作成から十分経過していれば
-  //   error 行を作って完了できるようにする。
-  const jobAgeRow: any = await db
-    .prepare(`SELECT created_at < datetime('now', ?) AS old FROM search_jobs WHERE id=?`)
-    .bind(`-${STALE_COMPLETE_MINUTES} minutes`, searchJobId)
-    .first()
-  if (jobAgeRow?.old) {
+  // ハング救済(2): criteria のソースなのに worker_states 行が全く無い担当（一度も着手されず）。
+  //   ★誤爆防止: 「検索開始からの経過時間」では判定しない（長時間かかる正常検索を殺すため）。
+  //   代わりに「他の担当が全て確定済み(done/error/cancelled)で、この未着手ソースだけが
+  //   取り残されており、かつ既存担当の最終更新から STALE_COMPLETE_MINUTES 経過」した場合のみ
+  //   error 行を作って完了させる。他ソースが実行中＝正常進行中なら、ここは発火しない。
+  {
     const existing: any = await db
-      .prepare(`SELECT source FROM worker_states WHERE search_job_id=?`)
+      .prepare(`SELECT source, phase FROM worker_states WHERE search_job_id=?`)
       .bind(searchJobId)
       .all()
-    const haveSrc = new Set((existing.results || []).map((r: any) => r.source))
-    for (const src of criteria.sources) {
-      if (!haveSrc.has(src)) {
+    const rows0 = existing.results || []
+    const haveSrc = new Set(rows0.map((r: any) => r.source))
+    const missing = criteria.sources.filter((src) => !haveSrc.has(src))
+    // 実在する担当が「1件以上あり、かつ全て確定済み(done/error/cancelled)」か。
+    //   ＝もう進捗する担当がいない状態。未着手ソースが動き出す見込みもない。
+    //   （救済(1)直後は updated_at が"今"に更新されるため、updated_at では判定できない。
+    //     "実在担当が全確定" という強い条件 + ジョブが十分古いこと で誤爆を防ぐ）
+    const presentAllSettled =
+      rows0.length > 0 &&
+      rows0.every((r: any) => ['done', 'error', 'cancelled'].includes(r.phase))
+    // ジョブ作成から十分経過しているか（起動直後の取りこぼしを救わないための保険）
+    const jobOldRow: any = await db
+      .prepare(`SELECT created_at < datetime('now', ?) AS old FROM search_jobs WHERE id=?`)
+      .bind(`-${STALE_COMPLETE_MINUTES} minutes`, searchJobId)
+      .first()
+    if (missing.length > 0 && presentAllSettled && jobOldRow?.old) {
+      for (const src of missing) {
         await db
           .prepare(
             `INSERT INTO worker_states (search_job_id, source, phase, message, updated_at)
