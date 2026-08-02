@@ -87,6 +87,7 @@
 | POST | `/api/ingest/state` | (外部ワーカー用) 進捗報告 |
 | POST | `/api/ingest/result` | (外部ワーカー用) 求人結果の払い出し |
 | GET | `/api/ingest/cancelled?id=X` | (外部ワーカー用) 検索が中止されたかを軽量確認（ループ内でポーリング） |
+| POST | `/api/admin/reset-stale` | 詰まった`running`を強制回収。`?force=1`で経過時間を問わず即完了。認証は`X-Ingest-Token`または`?token=` |
 
 ※ ingest系は `X-Ingest-Token` ヘッダによる認証あり
 
@@ -143,7 +144,19 @@ curl http://localhost:3000/api/stats                         # 動作確認
 - **プラットフォーム**: Cloudflare Pages
 - **状態**: ✅ ローカル稼働中（本番デプロイは未実施）
 - **技術スタック**: Hono + TypeScript + Cloudflare D1 + TailwindCSS + OpenAI
-- **最終更新**: 2026-07-29（検索の同時実行ガード＝負荷軽減を追加）
+- **最終更新**: 2026-08-02（`running`詰まりの自動回収＋手動リセットを追加）
+
+### running詰まりの復旧について
+外部ワーカー(circus/hitolink/jobins)がクラッシュ・再起動して完了報告を送れないと、
+`search_jobs.status='running'` が残り、同時実行ガードで新規検索が全て弾かれることがある。
+以下の3層で自動/手動に復旧する：
+1. **pending再取得**: 途中状態のまま10分以上更新のない担当を、workerが再び拾って再実行（自動復旧）
+2. **自動完了**: `/api/search/active`（ページ表示時に必ず叩かれる）で、10分以上応答のない担当をerror扱いにして検索を完了させる
+3. **手動リセット**: `POST /api/admin/reset-stale?force=1` で全runningを即完了（下記コマンド）
+```bash
+curl -X POST "https://job-search.dissectera.com/api/admin/reset-stale?force=1" \
+  -H "X-Ingest-Token: <INGEST_TOKEN>"
+```
 
 ## 今後の推奨ステップ
 1. ①②③各サイトのセレクタ実装（`worker/adapters.js`）→ 手元PCで検証

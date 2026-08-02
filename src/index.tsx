@@ -47,6 +47,10 @@ function summarizeCriteria(criteria: any): string {
 // ---------------------------------------------------------
 // 「進行中」とみなす閾値（分）。これより古い running はハングとみなし新規検索を許可する。
 const RUNNING_STALE_MINUTES = 30
+// 担当(worker_states)が途中状態のままこの分数以上更新されなければ「ハング」とみなす。
+//   ・pending で再取得してworkerに再割り当て（対策1）
+//   ・maybeCompleteSearch でerror扱いにして検索を強制完了（対策2）
+const STALE_PICKUP_MINUTES = 10
 
 app.post('/api/search', async (c) => {
   // --- 同時実行ガード：サーバー負荷軽減のため、実行中の検索が1つでもあれば新規検索を拒否 ---
@@ -120,6 +124,15 @@ app.post('/api/search', async (c) => {
 // 静的パスなので :id ルートより前に定義すること
 // ---------------------------------------------------------
 app.get('/api/search/active', async (c) => {
+  // 実行中とされている全ジョブについて、ハング担当の救済＆完了判定を試みる。
+  // （全ソースが無応答で /api/ingest/state が来なくなっても、ここで running を回収できる）
+  const { results: runningJobs } = await c.env.DB.prepare(
+    `SELECT id FROM search_jobs WHERE status='running'`
+  ).all()
+  for (const r of (runningJobs || []) as any[]) {
+    try { await maybeCompleteSearch(c.env.DB, r.id) } catch (_) {}
+  }
+
   const active: any = await c.env.DB.prepare(
     `SELECT id, free_text, created_at, total_scanned, total_matched FROM search_jobs
      WHERE status='running'
@@ -389,21 +402,90 @@ app.get('/api/stats', async (c) => {
 // ---------------------------------------------------------
 
 // 現在running中の検索ジョブと条件を取得（外部ワーカーが検索条件を知るため）
+// 管理: 詰まった running を強制回収する。
+//   ・途中状態のままの担当を error にし、全ジョブの完了判定を実行。
+//   ・?force=1 で「running のまま残る全ジョブ」を経過時間に関わらず即 error 完了。
+// 認証は INGEST_TOKEN を流用（X-Ingest-Token ヘッダ or ?token=）。
+app.post('/api/admin/reset-stale', async (c) => {
+  const token = c.req.header('X-Ingest-Token') || c.req.query('token')
+  if (token !== (c.env as any).INGEST_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+  const force = c.req.query('force') === '1'
+
+  const { results: runningJobs } = await c.env.DB.prepare(
+    `SELECT id FROM search_jobs WHERE status='running'`
+  ).all()
+  const ids = (runningJobs || []).map((r: any) => r.id)
+
+  let recovered = 0
+  for (const id of ids) {
+    if (force) {
+      // criteria の各ソースについて worker_states が無ければ error 行を作る
+      // （初期化直後にクラッシュして行が生成されていないソースを救済）
+      const jrow: any = await c.env.DB.prepare(
+        `SELECT criteria_json FROM search_jobs WHERE id=?`
+      ).bind(id).first()
+      let srcs: string[] = []
+      try { srcs = (JSON.parse(jrow?.criteria_json || '{}').sources) || [] } catch (_) {}
+      for (const src of srcs) {
+        await c.env.DB.prepare(
+          `INSERT INTO worker_states (search_job_id, source, phase, message, updated_at)
+           VALUES (?,?,'error','[管理: 強制打ち切り]',datetime('now'))
+           ON CONFLICT(search_job_id, source) DO NOTHING`
+        ).bind(id, src).run()
+      }
+      // 途中状態の担当を経過時間を問わず error 化
+      await c.env.DB.prepare(
+        `UPDATE worker_states
+         SET phase='error',
+             message=COALESCE(NULLIF(message,''),'') || ' [管理: 強制打ち切り]',
+             updated_at=datetime('now')
+         WHERE search_job_id=? AND phase NOT IN ('done','error','cancelled')`
+      ).bind(id).run()
+    }
+    const done = await maybeCompleteSearch(c.env.DB, id)
+    if (done) recovered++
+  }
+
+  const still: any = await c.env.DB.prepare(
+    `SELECT COUNT(*) as n FROM search_jobs WHERE status='running'`
+  ).first()
+
+  return c.json({
+    checked: ids.length,
+    recovered,
+    stillRunning: still?.n ?? 0,
+    force,
+  })
+})
+
 app.get('/api/ingest/pending', async (c) => {
   const auth = c.req.header('X-Ingest-Token')
   if (auth !== (c.env as any).INGEST_TOKEN) return c.json({ error: 'unauthorized' }, 401)
 
+  // 対象: status=running で、そのソースの担当が
+  //   (a) phase='skipped'（未着手）… 通常の新規割り当て
+  //   (b) 途中状態(fetching/scoring等)のまま STALE_PICKUP_MINUTES 以上更新なし
+  //       … worker のクラッシュ/再起動で完了報告が欠落したハング担当。再取得して復旧させる。
+  //  ※ done/error/cancelled は確定済みなので対象外。
+  const source = c.req.query('source') || 'circus'
   const { results } = await c.env.DB.prepare(
     `SELECT sj.id, sj.criteria_json, sj.top_n
      FROM search_jobs sj
      WHERE sj.status='running'
        AND EXISTS (
          SELECT 1 FROM worker_states ws
-         WHERE ws.search_job_id=sj.id AND ws.source=? AND ws.phase='skipped'
+         WHERE ws.search_job_id=sj.id AND ws.source=?
+           AND (
+             ws.phase='skipped'
+             OR (
+               ws.phase NOT IN ('done','error','cancelled')
+               AND ws.updated_at < datetime('now', ?)
+             )
+           )
        )
      ORDER BY sj.created_at DESC LIMIT 5`
   )
-    .bind(c.req.query('source') || 'circus')
+    .bind(source, `-${STALE_PICKUP_MINUTES} minutes`)
     .all()
 
   return c.json({

@@ -324,6 +324,10 @@ export async function refreshSearchTotals(db: D1, searchJobId: string): Promise<
     .run()
 }
 
+// 担当が途中状態のままこの分数以上更新されなければハングとみなし error 扱いで完了させる。
+// （worker のクラッシュ/再起動で done/error 報告が欠落し running が永久に残るのを防ぐ）
+const STALE_COMPLETE_MINUTES = 10
+
 // 全ソースがdone/errorに達していれば search_jobs を完了させる
 export async function maybeCompleteSearch(db: D1, searchJobId: string): Promise<boolean> {
   const job: any = await db
@@ -332,6 +336,48 @@ export async function maybeCompleteSearch(db: D1, searchJobId: string): Promise<
     .first()
   if (!job || job.status === 'done') return job?.status === 'done'
   const criteria = JSON.parse(job.criteria_json) as SearchCriteria
+
+  // ハング救済(1): 途中状態のまま長時間更新されていない担当を error に落とす。
+  await db
+    .prepare(
+      `UPDATE worker_states
+       SET phase='error',
+           message=COALESCE(NULLIF(message,''),'') || ' [自動: 応答が途絶えたため打ち切り]',
+           updated_at=datetime('now')
+       WHERE search_job_id=?
+         AND phase NOT IN ('done','error','cancelled')
+         AND updated_at < datetime('now', ?)`
+    )
+    .bind(searchJobId, `-${STALE_COMPLETE_MINUTES} minutes`)
+    .run()
+
+  // ハング救済(2): criteria のソースなのに worker_states 行が全く無い担当。
+  //   （worker が一度も着手できずに落ちた等）。ジョブ作成から十分経過していれば
+  //   error 行を作って完了できるようにする。
+  const jobAgeRow: any = await db
+    .prepare(`SELECT created_at < datetime('now', ?) AS old FROM search_jobs WHERE id=?`)
+    .bind(`-${STALE_COMPLETE_MINUTES} minutes`, searchJobId)
+    .first()
+  if (jobAgeRow?.old) {
+    const existing: any = await db
+      .prepare(`SELECT source FROM worker_states WHERE search_job_id=?`)
+      .bind(searchJobId)
+      .all()
+    const haveSrc = new Set((existing.results || []).map((r: any) => r.source))
+    for (const src of criteria.sources) {
+      if (!haveSrc.has(src)) {
+        await db
+          .prepare(
+            `INSERT INTO worker_states (search_job_id, source, phase, message, updated_at)
+             VALUES (?,?,'error','[自動: 担当が着手できないまま時間切れ]',datetime('now'))
+             ON CONFLICT(search_job_id, source) DO NOTHING`
+          )
+          .bind(searchJobId, src)
+          .run()
+      }
+    }
+  }
+
   const states: any = await db
     .prepare(`SELECT source, phase FROM worker_states WHERE search_job_id=?`)
     .bind(searchJobId)
