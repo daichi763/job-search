@@ -150,15 +150,40 @@ export const circusAdapter = {
   source: 'circus',
   base: 'https://circus-job.com',
 
+  // 既存セッション(他者/前回)が残っていると /search でトークンが取れないため、
+  // 確実に一度ログアウトさせてから自分の認証情報で入り直す。
+  async logout(page) {
+    try {
+      // circus のログアウトは GET /logout で処理される（SPA外の実エンドポイント）
+      await page.goto(`${this.base}/logout`, { waitUntil: 'networkidle', timeout: 30000 }).catch(() => {})
+      await page.waitForTimeout(1000)
+      // 念のためクライアント側の認証情報も破棄
+      await page.evaluate(() => {
+        try { localStorage.clear() } catch (e) {}
+        try { sessionStorage.clear() } catch (e) {}
+      }).catch(() => {})
+      await page.context().clearCookies().catch(() => {})
+    } catch (e) {
+      // ログアウト失敗は致命ではない（この後の再ログインで吸収）
+    }
+  },
+
   async login(page, env) {
     const loginUrl = env.CIRCUS_LOGIN_URL || 'https://circus-job.com/login'
     await page.goto(loginUrl, { waitUntil: 'networkidle', timeout: 45000 })
     await page.waitForTimeout(1500)
 
-    // 既にログイン済みでダッシュボード等へリダイレクトされた場合はスキップ
-    const emailField = await page.$('input[name="email"]')
+    // 既にログイン済み（＝他セッション/前回セッションが残っている）場合は、
+    // スキップせず一度ログアウトさせてから自分の認証情報で確実に入り直す。
+    // ※スキップすると他人のセッションのまま /search へ進み、トークン取得に失敗しうる。
+    let emailField = await page.$('input[name="email"]')
+    if (!emailField && !page.url().includes('/login')) {
+      await this.logout(page)
+      await page.goto(loginUrl, { waitUntil: 'networkidle', timeout: 45000 })
+      await page.waitForTimeout(1500)
+      emailField = await page.$('input[name="email"]')
+    }
     if (!emailField) {
-      if (!page.url().includes('/login')) return // 既にログイン済み
       // フォーム描画待ち（SPA遅延）
       await page.waitForSelector('input[name="email"]', { timeout: 20000 })
     }
@@ -208,15 +233,64 @@ export const circusAdapter = {
       const h = r.headers()
       if (h['x-circus-authentication-token'] && !token) token = h['x-circus-authentication-token']
     }
+    // レスポンスヘッダにトークンが載るケースも拾う
+    const respHandler = (resp) => {
+      try {
+        const h = resp.headers()
+        if (h['x-circus-authentication-token'] && !token) token = h['x-circus-authentication-token']
+      } catch (e) {}
+    }
     page.on('request', handler)
+    page.on('response', respHandler)
+
+    // localStorage / sessionStorage / Cookie からトークンを探すフォールバック。
+    const scrapeStorage = async () => {
+      try {
+        const t = await page.evaluate(() => {
+          const keyRe = /circus.*token|auth.*token|token/i
+          const scan = (store) => {
+            try {
+              for (let i = 0; i < store.length; i++) {
+                const k = store.key(i)
+                const v = store.getItem(k)
+                if (!v) continue
+                // UUID風(36文字)の値、またはキー名がtokenっぽいもの
+                if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) return v
+                if (keyRe.test(k) && v.length >= 16) return v
+              }
+            } catch (e) {}
+            return null
+          }
+          return scan(localStorage) || scan(sessionStorage)
+        })
+        if (t) return t
+      } catch (e) {}
+      try {
+        const cookies = await page.context().cookies()
+        const c = cookies.find(c => /token/i.test(c.name) && c.value && c.value.length >= 16)
+        if (c) return c.value
+      } catch (e) {}
+      return null
+    }
+
     try {
-      await page.goto(`${this.base}/search`, { waitUntil: 'networkidle', timeout: 60000 })
-      // トークンを載せたリクエストが飛ぶまで少し待つ
-      for (let t = 0; t < 10 && !token; t++) {
-        await page.waitForTimeout(700)
+      // 最大3回まで /search をロードし直してトークン捕捉を試みる
+      for (let attempt = 0; attempt < 3 && !token; attempt++) {
+        try {
+          await page.goto(`${this.base}/search`, { waitUntil: 'networkidle', timeout: 60000 })
+        } catch (e) {
+          // networkidleに達しない場合もあるので握りつぶして待機継続
+        }
+        // トークンを載せたリクエスト/レスポンスが飛ぶまで待つ（1回あたり最大約10秒）
+        for (let t = 0; t < 14 && !token; t++) {
+          await page.waitForTimeout(700)
+        }
+        // ヘッダで取れなければストレージ/Cookieから探す
+        if (!token) token = await scrapeStorage()
       }
     } finally {
       page.off('request', handler)
+      page.off('response', respHandler)
     }
     if (!token) throw new Error('circus 認証トークン(x-circus-authentication-token)の取得に失敗しました')
     return token

@@ -250,7 +250,22 @@ async function processSource(browser, source, searchJobId, criteria) {
     await reportState(searchJobId, source, { phase: 'fetching', message: 'ログイン中…' })
     await adapter.login(page, env)
     await reportState(searchJobId, source, { phase: 'fetching', message: '認証トークン取得中…' })
-    const token = await adapter.getAuthToken(page)
+    let token
+    try {
+      token = await adapter.getAuthToken(page)
+    } catch (e) {
+      // トークン取得失敗（circusのシングルセッション競合等）。
+      // ログアウト→再ログイン→再取得を1回だけ試みる。
+      if (typeof adapter.logout === 'function') {
+        console.log(`[${source}] トークン取得失敗、ログアウトして再ログインを試みます: ${e.message}`)
+        await reportState(searchJobId, source, { phase: 'fetching', message: '別セッションを解除して再ログイン中…' })
+        await adapter.logout(page)
+        await adapter.login(page, env)
+        token = await adapter.getAuthToken(page)
+      } else {
+        throw e
+      }
+    }
     console.log(`[${source}] 認証トークン取得OK`)
 
     // ---- 媒体の総求人数（未フィルタ）を取得 ----
