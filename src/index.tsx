@@ -6,6 +6,7 @@ import { fetchKintoneCount } from './lib/kintone'
 import type { SearchCriteria, SourceId } from './lib/types'
 import { SOURCE_LABELS } from './lib/types'
 import { renderPage } from './ui'
+import { renderManualPage } from './ui_manual'
 
 type Bindings = Env
 
@@ -577,6 +578,380 @@ app.post('/api/ingest/result', async (c) => {
   return c.json({ ok: true })
 })
 
+// =========================================================
+// 手動検索モード（自社DB内を直接検索）
+//   AI検索とは独立。jobs テーブル(4DBのトレース済み求人)をSQLで絞り込む。
+// =========================================================
+
+// 絞り込み候補(ファセット)を返す。プルダウンの選択肢に使う。
+app.get('/api/manual/facets', async (c) => {
+  const db = c.env.DB
+  const distinct = async (col: string): Promise<string[]> => {
+    // job_category / industry / employment のユニーク値(上位)を返す
+    const { results } = await db
+      .prepare(
+        `SELECT ${col} AS v, COUNT(*) AS n FROM jobs
+         WHERE ${col} IS NOT NULL AND ${col} <> ''
+         GROUP BY ${col} ORDER BY n DESC LIMIT 200`
+      )
+      .all()
+    return (results || []).map((r: any) => String(r.v))
+  }
+  const [categories, industries, employments] = await Promise.all([
+    distinct('job_category'),
+    distinct('industry'),
+    distinct('employment'),
+  ])
+  // 媒体ごとの件数（掲載中）
+  const { results: srcRows } = await db
+    .prepare(
+      `SELECT source, COUNT(*) AS total,
+              SUM(CASE WHEN is_open=1 THEN 1 ELSE 0 END) AS open
+       FROM jobs GROUP BY source`
+    )
+    .all()
+  const sources: Record<string, { total: number; open: number; label: string }> = {}
+  for (const r of srcRows || []) {
+    const s = (r as any).source
+    sources[s] = {
+      total: (r as any).total || 0,
+      open: (r as any).open || 0,
+      label: (SOURCE_LABELS as any)[s] || s,
+    }
+  }
+  return c.json({ categories, industries, employments, sources })
+})
+
+// 自社DBの手動検索本体
+app.get('/api/manual/jobs', async (c) => {
+  const db = c.env.DB
+  const q = (k: string) => (c.req.query(k) || '').trim()
+
+  const keyword = q('keyword')
+  const source = q('source')
+  const category = q('category')
+  const industry = q('industry')
+  const employment = q('employment')
+  const location = q('location')
+  const salaryMin = q('salaryMin')
+  const salaryMax = q('salaryMax')
+  const openOnly = q('openOnly') !== '0' // 既定は掲載中のみ
+  const sort = q('sort') || 'updated' // updated|salary_desc|salary_asc|new
+  const page = Math.max(1, parseInt(q('page') || '1', 10) || 1)
+  const pageSize = Math.min(100, Math.max(1, parseInt(q('pageSize') || '20', 10) || 20))
+  const offset = (page - 1) * pageSize
+
+  const where: string[] = []
+  const binds: any[] = []
+
+  if (openOnly) where.push('is_open=1')
+  if (source) { where.push('source=?'); binds.push(source) }
+  if (category) { where.push('job_category LIKE ?'); binds.push(`%${category}%`) }
+  if (industry) { where.push('industry LIKE ?'); binds.push(`%${industry}%`) }
+  if (employment) { where.push('employment LIKE ?'); binds.push(`%${employment}%`) }
+  if (location) { where.push('locations LIKE ?'); binds.push(`%${location}%`) }
+  if (salaryMin) { where.push('(salary_max IS NULL OR salary_max >= ?)'); binds.push(parseInt(salaryMin, 10)) }
+  if (salaryMax) { where.push('(salary_min IS NULL OR salary_min <= ?)'); binds.push(parseInt(salaryMax, 10)) }
+  if (keyword) {
+    // タイトル/企業/仕事内容/必須条件/職種/業種を横断
+    where.push(`(
+      title LIKE ?1 OR company LIKE ?1 OR description LIKE ?1
+      OR requirements LIKE ?1 OR job_category LIKE ?1 OR industry LIKE ?1
+    )`)
+    // ?1 名前付き参照のため、別途 keyword を最後にpush（下でbind順を組み直す）
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
+
+  let orderSql = 'ORDER BY updated_at DESC'
+  if (sort === 'salary_desc') orderSql = 'ORDER BY salary_max DESC NULLS LAST, salary_min DESC'
+  else if (sort === 'salary_asc') orderSql = 'ORDER BY salary_min ASC NULLS LAST'
+  else if (sort === 'new') orderSql = 'ORDER BY first_seen_at DESC'
+
+  // keyword は ?1 名前付きなので、SQLを ?N 方式ではなく通常の順序bindに書き換える。
+  // → keyword を使う場合は WHERE 内の ?1 を ? に置換し、binds の該当位置へ差し込む。
+  let finalWhere = whereSql
+  const finalBinds = [...binds]
+  if (keyword) {
+    finalWhere = finalWhere.replace(/\?1/g, '?')
+    // keyword LIKE を6回使うので、その6個ぶんを WHERE の末尾グループに合わせて追加。
+    // 上でkeyword句を最後にpushしているため、ここで6個追加すれば順序が一致する。
+    const kw = `%${keyword}%`
+    for (let i = 0; i < 6; i++) finalBinds.push(kw)
+  }
+
+  const countRow: any = await db
+    .prepare(`SELECT COUNT(*) AS n FROM jobs ${finalWhere}`)
+    .bind(...finalBinds)
+    .first()
+  const total = countRow?.n || 0
+
+  const { results } = await db
+    .prepare(`SELECT * FROM jobs ${finalWhere} ${orderSql} LIMIT ? OFFSET ?`)
+    .bind(...finalBinds, pageSize, offset)
+    .all()
+
+  const jobs = (results || []).map((r: any) => {
+    let locations: string[] = []
+    try { locations = r.locations ? JSON.parse(r.locations) : [] }
+    catch { locations = r.locations ? String(r.locations).split(',') : [] }
+    return {
+      id: r.id,
+      source: r.source,
+      sourceLabel: (SOURCE_LABELS as any)[r.source] || r.source,
+      sourceJobId: r.source_job_id,
+      title: r.title || '',
+      company: r.company || '',
+      jobCategory: r.job_category || '',
+      industry: r.industry || '',
+      employment: r.employment || '',
+      locations,
+      salaryMin: r.salary_min,
+      salaryMax: r.salary_max,
+      overtime: r.overtime || '',
+      holiday: r.holiday || '',
+      benefits: r.benefits || '',
+      requirements: r.requirements || '',
+      description: r.description || '',
+      url: r.url || '',
+      isOpen: r.is_open === 1,
+      firstSeenAt: r.first_seen_at,
+      lastSeenAt: r.last_seen_at,
+      updatedAt: r.updated_at,
+    }
+  })
+
+  return c.json({ total, page, pageSize, totalPages: Math.ceil(total / pageSize), jobs })
+})
+
+// =========================================================
+// トレース(全求人ミラーリング)制御
+// =========================================================
+
+// 同期を開始（手動ボタン or cron から呼ばれる）
+app.post('/api/trace/start', async (c) => {
+  const db = c.env.DB
+  let body: any = {}
+  try { body = await c.req.json() } catch {}
+  const trigger = body.trigger === 'cron' ? 'cron' : 'manual'
+  // 対象媒体。未指定なら全4媒体。
+  const allSources = ['circus', 'hitolink', 'jobins', 'kintone']
+  const sources: string[] = Array.isArray(body.sources) && body.sources.length
+    ? body.sources.filter((s: string) => allSources.includes(s))
+    : allSources
+
+  // 既に実行中の同期があれば二重起動を防ぐ（30分以上前のものはハングとみなし許可）
+  const running: any = await db
+    .prepare(
+      `SELECT id, started_at FROM trace_jobs
+       WHERE status='running' AND started_at > datetime('now','-30 minutes')
+       ORDER BY started_at DESC LIMIT 1`
+    )
+    .first()
+  if (running) {
+    return c.json({ ok: false, error: 'already_running', traceJobId: running.id }, 409)
+  }
+
+  const id = uuid()
+  await db
+    .prepare(
+      `INSERT INTO trace_jobs (id, sources_json, status, trigger, started_at)
+       VALUES (?,?, 'running', ?, datetime('now'))`
+    )
+    .bind(id, JSON.stringify(sources), trigger)
+    .run()
+
+  // 各媒体の担当状態を pending で作成 → ワーカーがポーリングで拾う
+  for (const s of sources) {
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO trace_states (trace_job_id, source, phase, message, updated_at)
+         VALUES (?,?, 'pending', '同期待機中…', datetime('now'))`
+      )
+      .bind(id, s)
+      .run()
+  }
+
+  return c.json({ ok: true, traceJobId: id, sources })
+})
+
+// 同期の進捗を取得（フロントのポーリング用）
+app.get('/api/trace/status', async (c) => {
+  const db = c.env.DB
+  const id = c.req.query('id')
+  let job: any
+  if (id) {
+    job = await db.prepare(`SELECT * FROM trace_jobs WHERE id=?`).bind(id).first()
+  } else {
+    job = await db.prepare(`SELECT * FROM trace_jobs ORDER BY started_at DESC LIMIT 1`).first()
+  }
+  if (!job) return c.json({ job: null, states: [] })
+  const { results } = await db
+    .prepare(`SELECT * FROM trace_states WHERE trace_job_id=? ORDER BY source`)
+    .bind(job.id)
+    .all()
+  return c.json({
+    job: {
+      id: job.id,
+      status: job.status,
+      trigger: job.trigger,
+      sources: JSON.parse(job.sources_json || '[]'),
+      startedAt: job.started_at,
+      finishedAt: job.finished_at,
+      totalUpserted: job.total_upserted,
+      totalAdded: job.total_added,
+      totalClosed: job.total_closed,
+    },
+    states: (results || []).map((r: any) => ({
+      source: r.source,
+      sourceLabel: (SOURCE_LABELS as any)[r.source] || r.source,
+      phase: r.phase,
+      message: r.message,
+      total: r.total,
+      fetched: r.fetched,
+      upserted: r.upserted,
+      added: r.added,
+      closed: r.closed,
+      updatedAt: r.updated_at,
+    })),
+  })
+})
+
+// --- ワーカー用: トレース待ちの媒体を払い出す ---
+app.get('/api/ingest/trace-pending', async (c) => {
+  const auth = c.req.header('X-Ingest-Token')
+  if (auth !== (c.env as any).INGEST_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+  const source = c.req.query('source') || 'circus'
+  const { results } = await c.env.DB.prepare(
+    `SELECT ts.trace_job_id, tj.started_at
+     FROM trace_states ts
+     JOIN trace_jobs tj ON tj.id = ts.trace_job_id
+     WHERE tj.status='running' AND ts.source=?
+       AND (
+         ts.phase='pending'
+         OR (ts.phase NOT IN ('done','error') AND ts.updated_at < datetime('now','-15 minutes'))
+       )
+     ORDER BY tj.started_at ASC LIMIT 1`
+  ).bind(source).all()
+  const jobs = (results || []).map((r: any) => ({
+    traceJobId: r.trace_job_id,
+    source,
+    startedAt: r.started_at,
+  }))
+  return c.json({ jobs })
+})
+
+// --- ワーカー用: トレース進捗の報告 ---
+app.post('/api/ingest/trace-state', async (c) => {
+  const auth = c.req.header('X-Ingest-Token')
+  if (auth !== (c.env as any).INGEST_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+  const b = await c.req.json<any>()
+  const numOrNull = (v: any) => (v === undefined || v === null ? null : v)
+  await c.env.DB.prepare(
+    `INSERT INTO trace_states
+     (trace_job_id, source, phase, message, total, fetched, upserted, added, closed, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))
+     ON CONFLICT(trace_job_id, source) DO UPDATE SET
+      phase=excluded.phase, message=excluded.message,
+      total=COALESCE(excluded.total, trace_states.total),
+      fetched=COALESCE(excluded.fetched, trace_states.fetched),
+      upserted=COALESCE(excluded.upserted, trace_states.upserted),
+      added=COALESCE(excluded.added, trace_states.added),
+      closed=COALESCE(excluded.closed, trace_states.closed),
+      updated_at=datetime('now')`
+  )
+    .bind(
+      b.traceJobId, b.source, b.phase || 'fetching', b.message || '',
+      numOrNull(b.total), numOrNull(b.fetched), numOrNull(b.upserted),
+      numOrNull(b.added), numOrNull(b.closed)
+    )
+    .run()
+
+  // 全媒体が done/error なら trace_jobs を確定
+  await maybeCompleteTrace(c.env.DB, b.traceJobId)
+  return c.json({ ok: true })
+})
+
+// --- ワーカー用: 取得した求人をトレース保存（自社DBへupsert）---
+app.post('/api/ingest/trace-result', async (c) => {
+  const auth = c.req.header('X-Ingest-Token')
+  if (auth !== (c.env as any).INGEST_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+  const b = await c.req.json<any>()
+  const jobs: any[] = Array.isArray(b.jobs) ? b.jobs : (b.job ? [b.job] : [])
+  if (!jobs.length) return c.json({ ok: true, added: 0, upserted: 0 })
+
+  let added = 0
+  for (const job of jobs) {
+    // 新規判定: 既存レコードの有無を事前に確認（正確な追加件数集計のため）
+    const exist: any = await c.env.DB
+      .prepare(`SELECT id FROM jobs WHERE source=? AND source_job_id=?`)
+      .bind(job.source, String(job.sourceJobId))
+      .first()
+    if (!exist) added++
+    const { upsertTraceJob } = await import('./lib/db')
+    await upsertTraceJob(c.env.DB, {
+      source: job.source,
+      sourceJobId: String(job.sourceJobId),
+      title: job.title || '',
+      company: job.company || '',
+      jobCategory: job.jobCategory || '',
+      industry: job.industry || '',
+      employment: job.employment || '',
+      locations: Array.isArray(job.locations) ? job.locations : [],
+      salaryMin: job.salaryMin ?? null,
+      salaryMax: job.salaryMax ?? null,
+      overtime: job.overtime || '',
+      holiday: job.holiday || '',
+      benefits: job.benefits || '',
+      requirements: job.requirements || '',
+      description: job.description || '',
+      url: job.url || '',
+      isOpen: true,
+      raw: job.raw ?? null,
+    } as any)
+  }
+  return c.json({ ok: true, added, upserted: jobs.length })
+})
+
+// --- ワーカー用: 同期完了時に掲載終了(is_open=0)を確定させる ---
+app.post('/api/ingest/trace-close', async (c) => {
+  const auth = c.req.header('X-Ingest-Token')
+  if (auth !== (c.env as any).INGEST_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+  const b = await c.req.json<any>()
+  const { source, startedAt } = b
+  if (!source || !startedAt) return c.json({ error: 'bad request' }, 400)
+  const { closeStaleTraceJobs } = await import('./lib/db')
+  const closed = await closeStaleTraceJobs(c.env.DB, source, startedAt)
+  return c.json({ ok: true, closed })
+})
+
+// 全媒体の担当が done/error になったら trace_jobs を確定し、合計を集計する。
+async function maybeCompleteTrace(db: D1, traceJobId: string): Promise<void> {
+  const job: any = await db.prepare(`SELECT * FROM trace_jobs WHERE id=?`).bind(traceJobId).first()
+  if (!job || job.status !== 'running') return
+  const sources: string[] = JSON.parse(job.sources_json || '[]')
+  const { results } = await db
+    .prepare(`SELECT * FROM trace_states WHERE trace_job_id=?`)
+    .bind(traceJobId)
+    .all()
+  const states = results || []
+  const finished = states.filter((s: any) => s.phase === 'done' || s.phase === 'error')
+  if (finished.length < sources.length) return // まだ実行中の媒体がある
+
+  const anyError = states.some((s: any) => s.phase === 'error')
+  const totalUpserted = states.reduce((a: number, s: any) => a + (s.upserted || 0), 0)
+  const totalAdded = states.reduce((a: number, s: any) => a + (s.added || 0), 0)
+  const totalClosed = states.reduce((a: number, s: any) => a + (s.closed || 0), 0)
+  await db
+    .prepare(
+      `UPDATE trace_jobs SET status=?, finished_at=datetime('now'),
+        total_upserted=?, total_added=?, total_closed=?
+       WHERE id=?`
+    )
+    .bind(anyError ? 'error' : 'done', totalUpserted, totalAdded, totalClosed, traceJobId)
+    .run()
+}
+
 // ---------------------------------------------------------
 // フロントUI
 // ---------------------------------------------------------
@@ -601,6 +976,11 @@ app.get('/favicon.svg', faviconResponse)
 
 app.get('/', (c) => {
   return c.html(renderPage())
+})
+
+// 手動検索モードページ
+app.get('/manual', (c) => {
+  return c.html(renderManualPage())
 })
 
 export default app

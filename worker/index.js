@@ -24,6 +24,7 @@ import { ADAPTERS } from './adapters.js'
 import { mechanicalFilter, evaluateOne, evaluateDetail } from './filter.js'
 import { scoreBatch, scoreBriefBatch, buildSearchPlans, scoreRelaxBatch } from './scorer.js'
 import { analyzeResumePdf, resumeAnalysisToText } from './resume.js'
+import { traceSource } from './trace.js'
 
 // 職務経歴書(PDF)解析結果のキャッシュ。
 //   同一検索ジョブは複数媒体(circus/hitolink...)で processSource が呼ばれるため、
@@ -81,6 +82,10 @@ const env = process.env
 const APP_URL = env.APP_URL || 'http://localhost:3000'
 const TOKEN = env.INGEST_TOKEN || ''
 const POLL = parseInt(env.POLL_INTERVAL || '5000', 10)
+// トレース(全求人同期)のポーリング間隔。AI検索より低頻度でよい。
+const TRACE_POLL = parseInt(env.TRACE_POLL_INTERVAL || '15000', 10)
+// トレース機能の有効/無効。既定ON。cron専用にしたい場合は TRACE_ENABLED=false。
+const TRACE_ENABLED = (env.TRACE_ENABLED || 'true') === 'true'
 const HEADLESS = (env.HEADLESS || 'true') === 'true'
 const ONCE = process.argv.includes('--once')
 
@@ -136,6 +141,25 @@ async function api(path, opts = {}) {
   })
   if (!res.ok) throw new Error(`${path} -> ${res.status}`)
   return res.json()
+}
+
+// 媒体ごとのブラウザcontextを生成する（jobinsのWAF回避設定を共通化）。
+async function newContextForSource(browser, source) {
+  const contextOpts = { viewport: { width: 1400, height: 1000 } }
+  if (source === 'jobins') {
+    contextOpts.userAgent =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    contextOpts.locale = 'ja-JP'
+    contextOpts.viewport = { width: 1366, height: 768 }
+    contextOpts.extraHTTPHeaders = { 'Accept-Language': 'ja-JP,ja;q=0.9,en;q=0.8' }
+  }
+  const context = await browser.newContext(contextOpts)
+  if (source === 'jobins') {
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
+    })
+  }
+  return context
 }
 
 async function reportState(searchJobId, source, patch) {
@@ -195,21 +219,8 @@ async function processSource(browser, source, searchJobId, criteria) {
   }
 
   // jobins は WAF/bot対策で headless Linux UA だと403になるため、
-  // Windows Chrome UA + locale ja-JP + navigator.webdriver 隠蔽で起動する。
-  const contextOpts = { viewport: { width: 1400, height: 1000 } }
-  if (source === 'jobins') {
-    contextOpts.userAgent =
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    contextOpts.locale = 'ja-JP'
-    contextOpts.viewport = { width: 1366, height: 768 }
-    contextOpts.extraHTTPHeaders = { 'Accept-Language': 'ja-JP,ja;q=0.9,en;q=0.8' }
-  }
-  const context = await browser.newContext(contextOpts)
-  if (source === 'jobins') {
-    await context.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
-    })
-  }
+  // Windows Chrome UA + locale ja-JP + navigator.webdriver 隠蔽で起動する（共通ヘルパー）。
+  const context = await newContextForSource(browser, source)
   const page = await context.newPage()
   const startedAt = Date.now()
   const useAI = (criteria.freeText || '').trim().length > 0
@@ -581,6 +592,51 @@ async function pollLoopForSource(browser, source) {
   }
 }
 
+// ============================================================
+// トレース(全求人ミラーリング)ポーリング
+//   /api/ingest/trace-pending を監視し、対象媒体があれば全件トレースを実行。
+//   AI検索(tickSource)とは独立したループで回す。
+// ============================================================
+async function tickTraceSource(browser, source) {
+  let jobs = []
+  try {
+    const r = await api(`/api/ingest/trace-pending?source=${source}`)
+    jobs = r.jobs || []
+  } catch (e) {
+    // trace系エンドポイントが未デプロイの旧webappだと404になる。静かにスキップ。
+    return
+  }
+  for (const j of jobs) {
+    console.log(`[trace:${source}] 全件トレース開始 traceJob=${j.traceJobId}`)
+    const context = await newContextForSource(browser, source)
+    const page = await context.newPage()
+    try {
+      await traceSource({
+        adapter: ADAPTERS[source],
+        page,
+        env,
+        appUrl: APP_URL,
+        ingestToken: TOKEN,
+        source,
+        traceJobId: j.traceJobId,
+        startedAt: j.startedAt,
+        log: (m) => console.log(m),
+      })
+    } catch (e) {
+      console.error(`[trace:${source}] fatal:`, e.message)
+    } finally {
+      await context.close()
+    }
+  }
+}
+
+async function traceLoopForSource(browser, source) {
+  while (true) {
+    await tickTraceSource(browser, source)
+    await new Promise((r) => setTimeout(r, TRACE_POLL))
+  }
+}
+
 async function main() {
   console.log(`外部ワーカー起動  APP_URL=${APP_URL}  headless=${HEADLESS}  sources=[${SOURCES.join(',')}]`)
   if (!TOKEN) console.warn('⚠️ INGEST_TOKEN が未設定です。.env を確認してください。')
@@ -592,8 +648,17 @@ async function main() {
     return
   }
 
-  // 各ソースを独立した並列ループで常駐ポーリング（相互ブロックなし）。
-  await Promise.all(SOURCES.map((source) => pollLoopForSource(browser, source)))
+  // トレース対象は全4媒体（AI検索のSOURCESにkintoneが含まれなくてもトレースは行う）。
+  const TRACE_SOURCES = (env.TRACE_SOURCES || 'circus,hitolink,jobins,kintone')
+    .split(',').map((s) => s.trim()).filter(Boolean)
+
+  // AI検索ループ + トレースループ を並列で常駐。
+  const loops = SOURCES.map((source) => pollLoopForSource(browser, source))
+  if (TRACE_ENABLED) {
+    console.log(`トレース(全求人同期)ループ有効  sources=[${TRACE_SOURCES.join(',')}]  poll=${TRACE_POLL}ms`)
+    loops.push(...TRACE_SOURCES.map((source) => traceLoopForSource(browser, source)))
+  }
+  await Promise.all(loops)
 }
 
 main().catch((e) => {

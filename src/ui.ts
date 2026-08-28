@@ -52,6 +52,9 @@ export function renderPage(): string {
     <div class="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
       <h1 class="text-xl font-bold"><i class="fas fa-magnifying-glass-chart mr-2"></i>求人横断検索AI</h1>
       <div class="flex items-center gap-3">
+        <a href="/manual" id="manualModeBtn" class="text-sm bg-white text-indigo-700 hover:bg-indigo-50 font-semibold rounded-full px-4 py-1.5 transition shadow-sm">
+          <i class="fas fa-sliders mr-1"></i>手動検索モード
+        </a>
         <button id="historyBtn" class="text-sm bg-white/20 hover:bg-white/30 rounded-full px-4 py-1.5 transition">
           <i class="fas fa-clock-rotate-left mr-1"></i>検索履歴
         </button>

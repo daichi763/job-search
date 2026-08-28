@@ -88,8 +88,38 @@
 | POST | `/api/ingest/result` | (外部ワーカー用) 求人結果の払い出し |
 | GET | `/api/ingest/cancelled?id=X` | (外部ワーカー用) 検索が中止されたかを軽量確認（ループ内でポーリング） |
 | POST | `/api/admin/reset-stale` | 詰まった`running`を強制回収。`?force=1`で経過時間を問わず即完了。認証は`X-Ingest-Token`または`?token=` |
+| GET | `/manual` | **手動検索モードページ**（自社DBを直接検索）。トップ右上の「手動検索モード」ボタンから遷移 |
+| GET | `/api/manual/facets` | 手動検索の絞り込み候補（職種/業種/雇用形態のユニーク値、媒体別件数） |
+| GET | `/api/manual/jobs` | **自社DB(jobs)の手動検索**。クエリ: `keyword, source, category, industry, employment, location, salaryMin, salaryMax, openOnly(1/0), sort(updated/new/salary_desc/salary_asc), page, pageSize`。`{total, page, totalPages, jobs[]}`を返す |
+| POST | `/api/trace/start` | **全求人同期を開始**。body=`{trigger:"manual"\|"cron", sources?:[...]}`。実行中は409。`{traceJobId}`を返す |
+| GET | `/api/trace/status?id=X` | 同期の進捗（媒体別 fetched/upserted/added/closed）。id省略で最新 |
+| GET | `/api/ingest/trace-pending?source=X` | (外部ワーカー用) 同期待ちの媒体を払い出す |
+| POST | `/api/ingest/trace-state` | (外部ワーカー用) 同期進捗の報告 |
+| POST | `/api/ingest/trace-result` | (外部ワーカー用) 取得求人を自社DBへupsert（trace_sync_atを刻む） |
+| POST | `/api/ingest/trace-close` | (外部ワーカー用) 今回見つからなかった求人を掲載終了(is_open=0)にする |
 
 ※ ingest系は `X-Ingest-Token` ヘッダによる認証あり
+
+## 手動検索モード（自社DBミラーリング）
+AI検索とは**完全に独立**した機能。4つのDB（circus/hitolink/jobins/kintone）の全求人を
+自社DB（D1 `jobs`テーブル）へコピーし、`/manual` ページで細かく手動検索できる。
+
+- **切替**: トップ右上「手動検索モード」ボタン → `/manual`（戻るボタンでAI検索へ）
+- **全件トレース**: `/manual`の「今すぐ全件同期」ボタン、または cron（`scripts/daily-trace.sh`）が
+  `/api/trace/start` を叩く → 常駐ワーカーの trace ループ（`worker/trace.js`）が各DBの全求人を
+  `buildQJson({})`（条件なし=全件）でページング取得し、`/api/ingest/trace-result` で自社DBへupsert。
+- **日次の擦り合わせ**（毎日実行）:
+  - **新着**: 初めて見た求人は新規INSERT（`added`に計上）
+  - **更新**: 既存求人は最新内容でUPDATE＆`is_open=1`に復活（再掲載対応）
+  - **掲載終了**: 同期開始時刻より `trace_sync_at` が古い＝今回見つからなかった求人を
+    `is_open=0`（論理削除）にする（`/api/ingest/trace-close`）
+- **cronセットアップ例**（VPSで `crontab -e`）:
+  ```
+  0 4 * * * /home/ubuntu/webapp/scripts/daily-trace.sh >> /home/ubuntu/webapp/logs/daily-trace.log 2>&1
+  ```
+- **ワーカー環境変数**（`worker/.env`、いずれも任意）:
+  `TRACE_ENABLED`(既定true) / `TRACE_SOURCES`(既定 circus,hitolink,jobins,kintone) /
+  `TRACE_POLL_INTERVAL`(既定15000ms) / `TRACE_PAGE_SIZE`(既定100) / `TRACE_PAGE_DELAY_MS`(既定400)
 
 ### 検索条件（POST /api/search body）
 ```json
@@ -113,6 +143,9 @@
 - `search_results`: 検索結果（逐次払い出し）
 - `score_memory`: AI採点結果の記憶（同一要望の高速再提案用）
 - `db_stats`: DB総件数キャッシュ
+- `trace_jobs`: 全求人同期の実行単位（手動/cron、開始時刻・合計upserted/added/closed）
+- `trace_states`: 同期の媒体別進捗（fetched/upserted/added/closed）
+- `jobs.trace_sync_at`（0004で追加）: 最後にトレース同期で掲載確認できた時刻。掲載終了判定の基準
 
 ## 使い方
 1. 左パネルで要望（フリー記述）と各種条件を入力

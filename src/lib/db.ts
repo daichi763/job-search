@@ -43,6 +43,79 @@ export async function upsertJob(db: D1, job: NormalizedJob): Promise<void> {
     .run()
 }
 
+// ============================================================
+// 手動検索モード: 全求人トレース(ミラーリング)用の upsert
+//   通常の upsertJob との違い:
+//    ・trace_sync_at に現在時刻を刻む(=今回の同期で掲載を確認できた印)。
+//    ・is_open を必ず1(公開中)に戻す(再掲載された求人の復活に対応)。
+//    ・戻り値で「新規登録(added)かどうか」を返す(追加件数の集計用)。
+// ============================================================
+export async function upsertTraceJob(db: D1, job: NormalizedJob): Promise<{ added: boolean }> {
+  const res = await db
+    .prepare(
+      `INSERT INTO jobs
+       (source, source_job_id, title, company, job_category, industry, employment,
+        locations, salary_min, salary_max, overtime, holiday, benefits, requirements,
+        description, raw_json, url, is_open, trace_sync_at, first_seen_at, last_seen_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,datetime('now'),datetime('now'),datetime('now'),datetime('now'))
+       ON CONFLICT(source, source_job_id) DO UPDATE SET
+        title=excluded.title, company=excluded.company, job_category=excluded.job_category,
+        industry=excluded.industry, employment=excluded.employment, locations=excluded.locations,
+        salary_min=excluded.salary_min, salary_max=excluded.salary_max, overtime=excluded.overtime,
+        holiday=excluded.holiday, benefits=excluded.benefits, requirements=excluded.requirements,
+        description=excluded.description, raw_json=excluded.raw_json, url=excluded.url,
+        is_open=1, trace_sync_at=datetime('now'),
+        last_seen_at=datetime('now'), updated_at=datetime('now')`
+    )
+    .bind(
+      job.source,
+      job.sourceJobId,
+      job.title,
+      job.company,
+      job.jobCategory,
+      job.industry,
+      job.employment,
+      JSON.stringify(job.locations),
+      job.salaryMin,
+      job.salaryMax,
+      job.overtime,
+      job.holiday,
+      job.benefits,
+      job.requirements,
+      job.description,
+      job.raw ? JSON.stringify(job.raw) : null,
+      job.url
+    )
+    .run()
+  // 新規判定は呼び出し側(index.tsx /api/ingest/trace-result)で
+  // 事前SELECTにより正確に行うため、ここでは常に false を返す。
+  return { added: false }
+}
+
+// 同期完了後: 今回の同期で掲載確認できなかった求人を掲載終了(is_open=0)にする。
+//   startedAt(同期開始時刻)より trace_sync_at が古い or NULL の
+//   「その媒体でトレース対象の」求人が対象。
+//   ただし trace_sync_at が一度も入ったことのない行(AI検索由来)は誤判定しないよう、
+//   「これまでに一度でもトレースされたことがある行(trace_sync_at IS NOT NULL)」のみを対象にする。
+export async function closeStaleTraceJobs(
+  db: D1,
+  source: SourceId,
+  startedAt: string
+): Promise<number> {
+  const res = await db
+    .prepare(
+      `UPDATE jobs
+       SET is_open=0, updated_at=datetime('now')
+       WHERE source=?
+         AND is_open=1
+         AND trace_sync_at IS NOT NULL
+         AND trace_sync_at < ?`
+    )
+    .bind(source, startedAt)
+    .run()
+  return res.meta?.changes ?? 0
+}
+
 export async function upsertJobsBatch(db: D1, jobs: NormalizedJob[]): Promise<void> {
   // D1のbatchで高速化
   const stmt = db.prepare(
