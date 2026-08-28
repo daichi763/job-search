@@ -75,7 +75,14 @@ export function renderManualPage(): string {
         <div class="mb-3"></div>
 
         <label class="block text-xs font-semibold text-gray-500 mb-1">勤務地</label>
-        <input id="f-location" type="text" placeholder="例: 東京 / 大阪" class="w-full border rounded-lg px-3 py-2 text-sm mb-3">
+        <input id="f-location" list="dl-location" type="text" placeholder="例: 東京 / 大阪" class="w-full border rounded-lg px-3 py-2 text-sm mb-1">
+        <datalist id="dl-location"></datalist>
+        <div class="mb-3"></div>
+
+        <label class="block text-xs font-semibold text-gray-500 mb-1">役職・ポジション</label>
+        <input id="f-position" list="dl-position" type="text" placeholder="例: マネージャー" class="w-full border rounded-lg px-3 py-2 text-sm mb-1">
+        <datalist id="dl-position"></datalist>
+        <div class="mb-3"></div>
 
         <label class="block text-xs font-semibold text-gray-500 mb-1">想定年収（万円）</label>
         <div class="flex items-center gap-2 mb-3">
@@ -84,10 +91,38 @@ export function renderManualPage(): string {
           <input id="f-salaryMax" type="number" placeholder="上限" class="w-full border rounded-lg px-2 py-2 text-sm">
         </div>
 
-        <label class="flex items-center gap-2 text-sm mb-4 cursor-pointer">
-          <input id="f-openOnly" type="checkbox" checked class="rounded text-emerald-600 focus:ring-emerald-400">
-          <span>掲載中のみ表示</span>
-        </label>
+        <!-- 詳細条件（折りたたみ） -->
+        <details class="mb-3 group" id="advBox">
+          <summary class="cursor-pointer text-xs font-semibold text-emerald-700 select-none py-1">
+            <i class="fas fa-chevron-right mr-1 group-open:rotate-90 transition-transform"></i>詳細条件（年齢・性別・学歴・報酬）
+          </summary>
+          <div class="mt-3 space-y-3">
+            <div>
+              <label class="block text-xs font-semibold text-gray-500 mb-1">応募者の年齢</label>
+              <input id="f-age" type="number" placeholder="例: 35（この年齢で応募可の求人）" class="w-full border rounded-lg px-3 py-2 text-sm">
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-gray-500 mb-1">性別条件</label>
+              <select id="f-gender" class="w-full border rounded-lg px-3 py-2 text-sm bg-white"><option value="">指定なし</option></select>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-gray-500 mb-1">学歴条件</label>
+              <input id="f-education" list="dl-education" type="text" placeholder="例: 大卒" class="w-full border rounded-lg px-3 py-2 text-sm">
+              <datalist id="dl-education"></datalist>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-gray-500 mb-1">成果報酬タイプ</label>
+              <select id="f-rewardType" class="w-full border rounded-lg px-3 py-2 text-sm bg-white"><option value="">指定なし</option></select>
+            </div>
+          </div>
+        </details>
+
+        <label class="block text-xs font-semibold text-gray-500 mb-1">掲載状態</label>
+        <select id="f-openState" class="w-full border rounded-lg px-3 py-2 text-sm mb-4 bg-white">
+          <option value="open">掲載中のみ</option>
+          <option value="closed">掲載終了のみ</option>
+          <option value="all">すべて</option>
+        </select>
 
         <button id="searchBtn" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg py-2.5 transition">
           <i class="fas fa-magnifying-glass mr-1"></i>検索
@@ -105,6 +140,7 @@ export function renderManualPage(): string {
           <select id="f-sort" class="border rounded-lg px-2 py-1.5 bg-white">
             <option value="updated">更新が新しい順</option>
             <option value="new">登録が新しい順</option>
+            <option value="source_new">媒体の掲載日が新しい順</option>
             <option value="salary_desc">年収が高い順</option>
             <option value="salary_asc">年収が低い順</option>
           </select>
@@ -120,6 +156,17 @@ export function renderManualPage(): string {
       </div>
     </section>
   </main>
+
+  <!-- 詳細モーダル -->
+  <div id="detailModal" class="hidden fixed inset-0 z-50 bg-black/50 flex items-start justify-center overflow-y-auto p-4">
+    <div class="bg-white rounded-2xl shadow-2xl max-w-3xl w-full my-8">
+      <div class="flex items-center justify-between px-6 py-4 border-b sticky top-0 bg-white rounded-t-2xl">
+        <h3 class="font-bold text-gray-800"><i class="fas fa-file-lines mr-2 text-emerald-600"></i>求人詳細</h3>
+        <button id="detailClose" class="text-gray-400 hover:text-gray-700 text-xl"><i class="fas fa-xmark"></i></button>
+      </div>
+      <div id="detailBody" class="px-6 py-5"></div>
+    </div>
+  </div>
 
   <script src="/static/manual.js"></script>
 </body>

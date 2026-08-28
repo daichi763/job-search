@@ -597,12 +597,50 @@ app.get('/api/manual/facets', async (c) => {
       .all()
     return (results || []).map((r: any) => String(r.v))
   }
-  const [categories, industries, employments] = await Promise.all([
+  // JSON配列カラム(job_categories_json 等)を展開してユニーク値を集計する。
+  //   拡充した職種/業種は配列で保持しているため、フラットな候補一覧を作る。
+  const distinctFromJsonArray = async (col: string): Promise<string[]> => {
+    const { results } = await db
+      .prepare(`SELECT ${col} AS v FROM jobs WHERE ${col} IS NOT NULL AND ${col} <> '' AND ${col} <> '[]'`)
+      .all()
+    const counts: Record<string, number> = {}
+    for (const r of results || []) {
+      let arr: string[] = []
+      try { arr = JSON.parse((r as any).v) } catch { arr = [] }
+      for (const item of arr) {
+        const k = String(item).trim()
+        if (k) counts[k] = (counts[k] || 0) + 1
+      }
+    }
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 300).map(([k]) => k)
+  }
+
+  const [
+    categories, industries, employments,
+    categoriesFlat, industriesFlat, positions,
+    genders, educations, locations,
+  ] = await Promise.all([
     distinct('job_category'),
     distinct('industry'),
     distinct('employment'),
+    distinctFromJsonArray('job_categories_json'),
+    distinctFromJsonArray('industries_json'),
+    distinctFromJsonArray('positions_json'),
+    distinct('required_gender'),
+    distinct('required_education'),
+    distinctFromJsonArray('locations'),
   ])
-  // 媒体ごとの件数（掲載中）
+
+  // 成果報酬タイプの件数
+  const { results: rewardRows } = await db
+    .prepare(
+      `SELECT reward_type AS v, COUNT(*) AS n FROM jobs
+       WHERE reward_type IS NOT NULL AND reward_type <> '' GROUP BY reward_type ORDER BY n DESC`
+    )
+    .all()
+  const rewardTypes = (rewardRows || []).map((r: any) => String(r.v))
+
+  // 媒体ごとの件数（掲載中/掲載終了）
   const { results: srcRows } = await db
     .prepare(
       `SELECT source, COUNT(*) AS total,
@@ -611,15 +649,24 @@ app.get('/api/manual/facets', async (c) => {
     )
     .all()
   const sources: Record<string, { total: number; open: number; label: string }> = {}
+  let grandTotal = 0
+  let grandOpen = 0
   for (const r of srcRows || []) {
     const s = (r as any).source
-    sources[s] = {
-      total: (r as any).total || 0,
-      open: (r as any).open || 0,
-      label: (SOURCE_LABELS as any)[s] || s,
-    }
+    const t = (r as any).total || 0
+    const o = (r as any).open || 0
+    grandTotal += t
+    grandOpen += o
+    sources[s] = { total: t, open: o, label: (SOURCE_LABELS as any)[s] || s }
   }
-  return c.json({ categories, industries, employments, sources })
+
+  return c.json({
+    categories, industries, employments,
+    categoriesFlat, industriesFlat, positions,
+    genders, educations, locations, rewardTypes,
+    sources,
+    totals: { total: grandTotal, open: grandOpen },
+  })
 })
 
 // 自社DBの手動検索本体
@@ -633,10 +680,16 @@ app.get('/api/manual/jobs', async (c) => {
   const industry = q('industry')
   const employment = q('employment')
   const location = q('location')
+  const position = q('position')       // 役職/ポジション
+  const gender = q('gender')           // 性別条件
+  const education = q('education')      // 学歴条件
+  const rewardType = q('rewardType')   // 成果報酬タイプ
+  const ageStr = q('age')              // 応募したい人の年齢(この年齢で応募可能な求人)
   const salaryMin = q('salaryMin')
   const salaryMax = q('salaryMax')
-  const openOnly = q('openOnly') !== '0' // 既定は掲載中のみ
-  const sort = q('sort') || 'updated' // updated|salary_desc|salary_asc|new
+  const openState = q('openState')     // ''(=既定openOnly) | 'open' | 'closed' | 'all'
+  const openOnlyLegacy = q('openOnly') // 後方互換
+  const sort = q('sort') || 'updated'  // updated|salary_desc|salary_asc|new|source_new
   const page = Math.max(1, parseInt(q('page') || '1', 10) || 1)
   const pageSize = Math.min(100, Math.max(1, parseInt(q('pageSize') || '20', 10) || 20))
   const offset = (page - 1) * pageSize
@@ -644,19 +697,38 @@ app.get('/api/manual/jobs', async (c) => {
   const where: string[] = []
   const binds: any[] = []
 
-  if (openOnly) where.push('is_open=1')
+  // 掲載状態: openState を優先。未指定時は従来どおり掲載中のみ(openOnly=0で全件)。
+  if (openState === 'closed') where.push('is_open=0')
+  else if (openState === 'all') { /* 制約なし */ }
+  else if (openState === 'open') where.push('is_open=1')
+  else if (openOnlyLegacy === '0') { /* 全件 */ }
+  else where.push('is_open=1')
+
   if (source) { where.push('source=?'); binds.push(source) }
-  if (category) { where.push('job_category LIKE ?'); binds.push(`%${category}%`) }
-  if (industry) { where.push('industry LIKE ?'); binds.push(`%${industry}%`) }
+  if (category) { where.push('(job_category LIKE ? OR job_categories_json LIKE ?)'); binds.push(`%${category}%`, `%${category}%`) }
+  if (industry) { where.push('(industry LIKE ? OR industries_json LIKE ?)'); binds.push(`%${industry}%`, `%${industry}%`) }
   if (employment) { where.push('employment LIKE ?'); binds.push(`%${employment}%`) }
   if (location) { where.push('locations LIKE ?'); binds.push(`%${location}%`) }
+  if (position) { where.push('positions_json LIKE ?'); binds.push(`%${position}%`) }
+  if (gender) { where.push('required_gender = ?'); binds.push(gender) }
+  if (education) { where.push('required_education LIKE ?'); binds.push(`%${education}%`) }
+  if (rewardType) { where.push('reward_type = ?'); binds.push(rewardType) }
   if (salaryMin) { where.push('(salary_max IS NULL OR salary_max >= ?)'); binds.push(parseInt(salaryMin, 10)) }
   if (salaryMax) { where.push('(salary_min IS NULL OR salary_min <= ?)'); binds.push(parseInt(salaryMax, 10)) }
+  // 年齢: 「この年齢の人が応募できる求人」= 下限<=age<=上限（範囲未設定は不問として通す）
+  const age = ageStr ? parseInt(ageStr, 10) : null
+  if (age != null && Number.isFinite(age)) {
+    where.push('(required_age_min IS NULL OR required_age_min <= ?)')
+    binds.push(age)
+    where.push('(required_age_max IS NULL OR required_age_max >= ?)')
+    binds.push(age)
+  }
   if (keyword) {
-    // タイトル/企業/仕事内容/必須条件/職種/業種を横断
+    // タイトル/企業/仕事内容/必須条件/職種/業種/福利厚生を横断
     where.push(`(
       title LIKE ?1 OR company LIKE ?1 OR description LIKE ?1
       OR requirements LIKE ?1 OR job_category LIKE ?1 OR industry LIKE ?1
+      OR benefits LIKE ?1
     )`)
     // ?1 名前付き参照のため、別途 keyword を最後にpush（下でbind順を組み直す）
   }
@@ -667,17 +739,16 @@ app.get('/api/manual/jobs', async (c) => {
   if (sort === 'salary_desc') orderSql = 'ORDER BY salary_max DESC NULLS LAST, salary_min DESC'
   else if (sort === 'salary_asc') orderSql = 'ORDER BY salary_min ASC NULLS LAST'
   else if (sort === 'new') orderSql = 'ORDER BY first_seen_at DESC'
+  else if (sort === 'source_new') orderSql = "ORDER BY publish_started_at DESC NULLS LAST"
 
   // keyword は ?1 名前付きなので、SQLを ?N 方式ではなく通常の順序bindに書き換える。
-  // → keyword を使う場合は WHERE 内の ?1 を ? に置換し、binds の該当位置へ差し込む。
   let finalWhere = whereSql
   const finalBinds = [...binds]
   if (keyword) {
     finalWhere = finalWhere.replace(/\?1/g, '?')
-    // keyword LIKE を6回使うので、その6個ぶんを WHERE の末尾グループに合わせて追加。
-    // 上でkeyword句を最後にpushしているため、ここで6個追加すれば順序が一致する。
+    // keyword LIKE を7回使うので、その7個ぶんを WHERE の末尾グループに合わせて追加。
     const kw = `%${keyword}%`
-    for (let i = 0; i < 6; i++) finalBinds.push(kw)
+    for (let i = 0; i < 7; i++) finalBinds.push(kw)
   }
 
   const countRow: any = await db
@@ -691,10 +762,21 @@ app.get('/api/manual/jobs', async (c) => {
     .bind(...finalBinds, pageSize, offset)
     .all()
 
+  const parseArr = (v: any): string[] => {
+    if (!v) return []
+    try { const a = JSON.parse(v); return Array.isArray(a) ? a : [] } catch { return [] }
+  }
+
   const jobs = (results || []).map((r: any) => {
     let locations: string[] = []
     try { locations = r.locations ? JSON.parse(r.locations) : [] }
     catch { locations = r.locations ? String(r.locations).split(',') : [] }
+    // 成果報酬の表示文言（テキストが無ければ率/額から組み立て）
+    let rewardText = r.reward_text || ''
+    if (!rewardText) {
+      if (r.reward_rate != null) rewardText = `理論年収の${r.reward_rate}%`
+      else if (r.reward_amount != null) rewardText = `${Math.round(r.reward_amount / 10000)}万円`
+    }
     return {
       id: r.id,
       source: r.source,
@@ -702,10 +784,16 @@ app.get('/api/manual/jobs', async (c) => {
       sourceJobId: r.source_job_id,
       title: r.title || '',
       company: r.company || '',
+      companyWebsite: r.company_website || '',
       jobCategory: r.job_category || '',
+      jobCategories: parseArr(r.job_categories_json),
       industry: r.industry || '',
+      industries: parseArr(r.industries_json),
       employment: r.employment || '',
       locations,
+      positions: parseArr(r.positions_json),
+      careerStage: r.career_stage || '',
+      experience: parseArr(r.experience_json),
       salaryMin: r.salary_min,
       salaryMax: r.salary_max,
       overtime: r.overtime || '',
@@ -713,8 +801,20 @@ app.get('/api/manual/jobs', async (c) => {
       benefits: r.benefits || '',
       requirements: r.requirements || '',
       description: r.description || '',
+      requiredAgeMin: r.required_age_min,
+      requiredAgeMax: r.required_age_max,
+      requiredGender: r.required_gender || '',
+      requiredEducation: r.required_education || '',
+      reward: {
+        type: r.reward_type || '',
+        rate: r.reward_rate,
+        amount: r.reward_amount,
+        text: rewardText,
+      },
       url: r.url || '',
       isOpen: r.is_open === 1,
+      publishStartedAt: r.publish_started_at,
+      sourceUpdatedAt: r.source_updated_at,
       firstSeenAt: r.first_seen_at,
       lastSeenAt: r.last_seen_at,
       updatedAt: r.updated_at,
@@ -812,6 +912,8 @@ app.get('/api/trace/status', async (c) => {
       upserted: r.upserted,
       added: r.added,
       closed: r.closed,
+      skipped: r.skipped || 0,
+      failedPages: r.failed_pages || 0,
       updatedAt: r.updated_at,
     })),
   })
@@ -849,8 +951,8 @@ app.post('/api/ingest/trace-state', async (c) => {
   const numOrNull = (v: any) => (v === undefined || v === null ? null : v)
   await c.env.DB.prepare(
     `INSERT INTO trace_states
-     (trace_job_id, source, phase, message, total, fetched, upserted, added, closed, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))
+     (trace_job_id, source, phase, message, total, fetched, upserted, added, closed, skipped, failed_pages, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
      ON CONFLICT(trace_job_id, source) DO UPDATE SET
       phase=excluded.phase, message=excluded.message,
       total=COALESCE(excluded.total, trace_states.total),
@@ -858,12 +960,14 @@ app.post('/api/ingest/trace-state', async (c) => {
       upserted=COALESCE(excluded.upserted, trace_states.upserted),
       added=COALESCE(excluded.added, trace_states.added),
       closed=COALESCE(excluded.closed, trace_states.closed),
+      skipped=COALESCE(excluded.skipped, trace_states.skipped),
+      failed_pages=COALESCE(excluded.failed_pages, trace_states.failed_pages),
       updated_at=datetime('now')`
   )
     .bind(
       b.traceJobId, b.source, b.phase || 'fetching', b.message || '',
       numOrNull(b.total), numOrNull(b.fetched), numOrNull(b.upserted),
-      numOrNull(b.added), numOrNull(b.closed)
+      numOrNull(b.added), numOrNull(b.closed), numOrNull(b.skipped), numOrNull(b.failedPages)
     )
     .run()
 
@@ -889,6 +993,8 @@ app.post('/api/ingest/trace-result', async (c) => {
       .first()
     if (!exist) added++
     const { upsertTraceJob } = await import('./lib/db')
+    // ワーカーの mapApiJob が出力する全フィールドをそのまま渡す
+    // （リッチ情報の欠落を防ぐため、既知フィールドを網羅してマッピング）
     await upsertTraceJob(c.env.DB, {
       source: job.source,
       sourceJobId: String(job.sourceJobId),
@@ -907,7 +1013,22 @@ app.post('/api/ingest/trace-result', async (c) => {
       description: job.description || '',
       url: job.url || '',
       isOpen: true,
-      raw: job.raw ?? null,
+      // --- リッチ情報 ---
+      companyWebsite: job.companyWebsite || '',
+      jobCategories: Array.isArray(job.jobCategories) ? job.jobCategories : [],
+      industries: Array.isArray(job.industries) ? job.industries : [],
+      positions: Array.isArray(job.positions) ? job.positions : [],
+      careerStage: job.careerStage || '',
+      experience: Array.isArray(job.experience) ? job.experience : [],
+      requiredAgeMin: job.requiredAgeMin ?? null,
+      requiredAgeMax: job.requiredAgeMax ?? null,
+      requiredGender: job.requiredGender ?? null,
+      requiredEducation: job.requiredEducation ?? null,
+      reward: job.reward ?? null,
+      publishStartedAt: job.publishStartedAt ?? null,
+      lastUpdatedAt: job.lastUpdatedAt ?? null,
+      // 元データ。worker は _raw に入れて送ってくる（raw も両対応）
+      _raw: job._raw ?? job.raw ?? null,
     } as any)
   }
   return c.json({ ok: true, added, upserted: jobs.length })
@@ -923,6 +1044,30 @@ app.post('/api/ingest/trace-close', async (c) => {
   const { closeStaleTraceJobs } = await import('./lib/db')
   const closed = await closeStaleTraceJobs(c.env.DB, source, startedAt)
   return c.json({ ok: true, closed })
+})
+
+// --- ワーカー用(差分同期): この媒体の既存 source_job_id → content_hash マップ ---
+app.get('/api/ingest/trace-hashes', async (c) => {
+  const auth = c.req.header('X-Ingest-Token')
+  if (auth !== (c.env as any).INGEST_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+  const source = c.req.query('source') || ''
+  if (!source) return c.json({ error: 'bad request' }, 400)
+  const { getExistingHashes } = await import('./lib/db')
+  const hashes = await getExistingHashes(c.env.DB, source as any)
+  return c.json({ ok: true, source, count: Object.keys(hashes).length, hashes })
+})
+
+// --- ワーカー用(差分同期): IDが一致し内容変化なしの求人の掲載確認印だけ更新 ---
+app.post('/api/ingest/trace-touch', async (c) => {
+  const auth = c.req.header('X-Ingest-Token')
+  if (auth !== (c.env as any).INGEST_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+  const b = await c.req.json<any>()
+  const { source } = b
+  const ids: string[] = Array.isArray(b.sourceJobIds) ? b.sourceJobIds.map((x: any) => String(x)) : []
+  if (!source || !ids.length) return c.json({ ok: true, touched: 0 })
+  const { touchTraceJobs } = await import('./lib/db')
+  const touched = await touchTraceJobs(c.env.DB, source as any, ids)
+  return c.json({ ok: true, touched })
 })
 
 // 全媒体の担当が done/error になったら trace_jobs を確定し、合計を集計する。
