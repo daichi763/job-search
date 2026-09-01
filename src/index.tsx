@@ -724,13 +724,17 @@ app.get('/api/manual/jobs', async (c) => {
     binds.push(age)
   }
   if (keyword) {
-    // タイトル/企業/仕事内容/必須条件/職種/業種/福利厚生を横断
+    // タイトル/企業/仕事内容/必須条件/職種/業種/福利厚生を横断。
+    // ★重要: 名前付き(?1)と無名(?)プレースホルダを混在させると D1/SQLite の
+    //   bind 解釈が崩れ、他フィルタ(gender/rewardType/age等)が誤バインドされて
+    //   0件になる。そのため keyword も無名 ? で統一し、値を7回 push する。
+    const kw = `%${keyword}%`
     where.push(`(
-      title LIKE ?1 OR company LIKE ?1 OR description LIKE ?1
-      OR requirements LIKE ?1 OR job_category LIKE ?1 OR industry LIKE ?1
-      OR benefits LIKE ?1
+      title LIKE ? OR company LIKE ? OR description LIKE ?
+      OR requirements LIKE ? OR job_category LIKE ? OR industry LIKE ?
+      OR benefits LIKE ?
     )`)
-    // ?1 名前付き参照のため、別途 keyword を最後にpush（下でbind順を組み直す）
+    for (let i = 0; i < 7; i++) binds.push(kw)
   }
 
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
@@ -741,15 +745,9 @@ app.get('/api/manual/jobs', async (c) => {
   else if (sort === 'new') orderSql = 'ORDER BY first_seen_at DESC'
   else if (sort === 'source_new') orderSql = "ORDER BY publish_started_at DESC NULLS LAST"
 
-  // keyword は ?1 名前付きなので、SQLを ?N 方式ではなく通常の順序bindに書き換える。
-  let finalWhere = whereSql
+  // すべて無名 ? で順序どおりに構築済み。binds をそのまま使う。
+  const finalWhere = whereSql
   const finalBinds = [...binds]
-  if (keyword) {
-    finalWhere = finalWhere.replace(/\?1/g, '?')
-    // keyword LIKE を7回使うので、その7個ぶんを WHERE の末尾グループに合わせて追加。
-    const kw = `%${keyword}%`
-    for (let i = 0; i < 7; i++) finalBinds.push(kw)
-  }
 
   const countRow: any = await db
     .prepare(`SELECT COUNT(*) AS n FROM jobs ${finalWhere}`)

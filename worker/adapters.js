@@ -1285,36 +1285,63 @@ export const hitolinkAdapter = {
     const pw = env.HITOLINK_PW || env.HITOLINK_PASSWORD
     if (!email || !pw) throw new Error('hitolink 認証情報(HITOLINK_ID / HITOLINK_PW)が未設定です')
 
-    await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
-    await page.waitForTimeout(1500)
+    // B2C はハイドレーション/リダイレクトのタイミングで一時的に失敗することがある。
+    // 並列ログインは呼び出し側(worker/index.js)の media ロックで排他済みだが、
+    // 単発の揺らぎに備えて最大3回リトライする（AI検索・トレース共通で堅牢化）。
+    const MAX_TRY = 3
+    let lastErr = null
+    for (let attempt = 1; attempt <= MAX_TRY; attempt++) {
+      try {
+        await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
+        await page.waitForTimeout(1500)
 
-    // 既にログイン済み（/manage 配下に居る）ならスキップ
-    if (/agent\.hito-link\.jp\/manage/.test(page.url())) return
+        // 既にログイン済み（/manage 配下に居る）ならスキップ
+        if (/agent\.hito-link\.jp\/manage/.test(page.url())) return
 
-    // /login 上の OAuth 開始リンクをクリックして B2C へ
-    const startLink = await page.$('a[href*="oauth2/authorization"]')
-    if (startLink) {
-      await startLink.click()
-    } else if (!/b2clogin|agent-login\.hito-link/.test(page.url())) {
-      // リンクが無く B2C 画面でもない場合は直接 authorization エンドポイントへ
-      await page.goto(`${this.base}/oauth2/authorization/agt`, { waitUntil: 'domcontentloaded', timeout: 45000 })
-    }
+        // /login 上の OAuth 開始リンクをクリックして B2C へ
+        const startLink = await page.$('a[href*="oauth2/authorization"]')
+        if (startLink) {
+          await startLink.click()
+        } else if (!/b2clogin|agent-login\.hito-link/.test(page.url())) {
+          // リンクが無く B2C 画面でもない場合は直接 authorization エンドポイントへ
+          await page.goto(`${this.base}/oauth2/authorization/agt`, { waitUntil: 'domcontentloaded', timeout: 45000 })
+        }
 
-    // B2C ログインフォーム（#email / #password / #next）
-    await page.waitForSelector('#email', { timeout: 20000 })
-    await page.waitForTimeout(1500) // ← ハイドレーション待ち（必須）
-    await page.fill('#email', email)
-    await page.fill('#password', pw)
-    await page.click('#next')
+        // B2C ログインフォーム（#email / #password / #next）
+        await page.waitForSelector('#email', { timeout: 20000 })
+        await page.waitForTimeout(2000) // ← ハイドレーション待ち（必須・やや長めに）
+        await page.fill('#email', email)
+        await page.fill('#password', pw)
+        // フォーム反映を待ってから送信（ハイドレーション直後の空送信を防ぐ）
+        await page.waitForTimeout(400)
+        await page.click('#next')
 
-    // ログイン完了 = /manage 配下へ遷移
-    await page.waitForURL(/agent\.hito-link\.jp\/manage/, { timeout: 40000 }).catch(() => {})
-    if (!/agent\.hito-link\.jp\/manage/.test(page.url())) {
-      const body = await page.innerText('body').catch(() => '')
-      if (page.url().includes('error') || body.includes('ログインに失敗')) {
+        // ログイン完了 = /manage 配下へ遷移
+        await page.waitForURL(/agent\.hito-link\.jp\/manage/, { timeout: 40000 }).catch(() => {})
+        if (/agent\.hito-link\.jp\/manage/.test(page.url())) return // 成功
+
+        // まだ /manage でない場合、少し待って最終確認（緩やかな遷移対策）
+        await page.waitForTimeout(2000)
+        if (/agent\.hito-link\.jp\/manage/.test(page.url())) return // 成功
+
+        const body = await page.innerText('body').catch(() => '')
+        // 認証情報自体が誤り（＝リトライ無意味）ならメッセージで区別
+        if (body.includes('ログインに失敗') || body.includes('正しくありません') || body.includes('無効')) {
+          throw new Error('hitolink ログイン失敗（認証情報が正しくない可能性）')
+        }
+        // それ以外（ハイドレーション/遷移遅延）はリトライ対象
         throw new Error('hitolink ログイン失敗（認証情報またはB2Cハイドレーション待ちを確認）')
+      } catch (e) {
+        lastErr = e
+        // 認証情報エラーは即中断（リトライしても無駄）
+        if (e && e.message && e.message.includes('認証情報が正しくない')) throw e
+        if (attempt < MAX_TRY) {
+          await page.waitForTimeout(1500 * attempt) // バックオフ
+          continue
+        }
       }
     }
+    throw lastErr || new Error('hitolink ログイン失敗（認証情報またはB2Cハイドレーション待ちを確認）')
   },
 
   // ---- 認証情報の取得 ----

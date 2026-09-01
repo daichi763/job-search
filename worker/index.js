@@ -143,6 +143,48 @@ async function api(path, opts = {}) {
   return res.json()
 }
 
+// ============================================================
+// 媒体ごとのログイン排他ロック（AI検索とトレースの並列ログイン競合を防止）
+//   hitolink は Azure AD B2C のセッション/ハイドレーションを共有ブラウザで
+//   奪い合うと双方が失敗する（「ログイン失敗（認証情報またはB2Cハイドレーション
+//   待ちを確認）」）。circus もシングルセッション制限がある。
+//   そこで「同一媒体に対しては同時に1つの処理しかログインさせない」ためのロックを
+//   媒体ごとに用意する。AI検索(processSource)とトレース(traceSource)はこのロックを
+//   通じて直列化される（別媒体同士は従来どおり並列）。
+// ============================================================
+const sourceLockTail = new Map() // source -> Promise（FIFOキューの末尾）
+const sourceLockDepth = new Map() // source -> number（キュー滞留数。0でMap掃除）
+const aiBusyCount = new Map() // source -> number（AI検索がロック待ち/実行中の件数）
+// 排他ロックを取得して fn を実行する。同一 source は必ず直列化される（別 source は並列）。
+// 連鎖は「末尾 Promise」を繋ぐ FIFO キュー方式。fn が throw しても連鎖は止まらない。
+//   kind='ai' のときは AI検索の占有カウントも増やし、トレース側が後回し判定に使う。
+async function withSourceLock(source, fn, kind = 'ai') {
+  sourceLockDepth.set(source, (sourceLockDepth.get(source) || 0) + 1)
+  if (kind === 'ai') aiBusyCount.set(source, (aiBusyCount.get(source) || 0) + 1)
+  const prev = sourceLockTail.get(source) || Promise.resolve()
+  let release
+  const done = new Promise((r) => { release = r })
+  sourceLockTail.set(source, prev.then(() => done)) // 末尾を今回の完了に更新
+  await prev.catch(() => {}) // 前の処理の完了を待機（前がエラーでも進む＝AI検索優先の直列化）
+  try {
+    return await fn()
+  } finally {
+    release()
+    if (kind === 'ai') {
+      const a = (aiBusyCount.get(source) || 1) - 1
+      if (a <= 0) aiBusyCount.delete(source); else aiBusyCount.set(source, a)
+    }
+    const n = (sourceLockDepth.get(source) || 1) - 1
+    if (n <= 0) { sourceLockDepth.delete(source); sourceLockTail.delete(source) }
+    else sourceLockDepth.set(source, n)
+  }
+}
+// トレースが「AI検索が忙しい媒体を後回し」にするための判定。
+// AI検索(processSource)がロック取得待ち/実行中なら true。
+function isAiBusy(source) {
+  return (aiBusyCount.get(source) || 0) > 0
+}
+
 // 媒体ごとのブラウザcontextを生成する（jobinsのWAF回避設定を共通化）。
 async function newContextForSource(browser, source) {
   const contextOpts = { viewport: { width: 1400, height: 1000 } }
@@ -203,7 +245,12 @@ async function isCancelled(searchJobId) {
 // 「連続空振り / ページ上限 / スキャン上限 / 時間上限 / トークン予算」で停止判断。
 // 探索後、プール上位を2次AI精読し、スコア順に逐次払い出す。
 // ============================================================
+// AI検索1件を処理する。同一媒体のログイン競合を防ぐため media ロックで直列化する。
 async function processSource(browser, source, searchJobId, criteria) {
+  return withSourceLock(source, () => runProcessSource(browser, source, searchJobId, criteria), 'ai')
+}
+
+async function runProcessSource(browser, source, searchJobId, criteria) {
   const adapter = ADAPTERS[source]
   if (!adapter) return
 
@@ -587,7 +634,12 @@ async function tickAllOnce(browser) {
 //   （以前は for ループの直列処理で、circus 完了まで hitolink が着手されなかった）
 async function pollLoopForSource(browser, source) {
   while (true) {
-    await tickSource(browser, source)
+    // AI検索ループも例外でループが止まらないよう防御（tickSource内でも握りつぶすが二重防御）。
+    try {
+      await tickSource(browser, source)
+    } catch (e) {
+      console.error(`[${source}] pollループ error（無視して継続）:`, e && e.message ? e.message : e)
+    }
     await new Promise((r) => setTimeout(r, POLL))
   }
 }
@@ -606,33 +658,55 @@ async function tickTraceSource(browser, source) {
     // trace系エンドポイントが未デプロイの旧webappだと404になる。静かにスキップ。
     return
   }
+  if (jobs.length === 0) return
+
+  // ★AI検索優先: 同一媒体でAI検索が実行/待機中ならトレースは今回スキップ（次tickで再挑戦）。
+  //   これにより hitolink 等の同時ログイン競合と、AI検索の遅延を防ぐ。
+  if (isAiBusy(source)) {
+    console.log(`[trace:${source}] AI検索が実行中のためトレースを保留（次回に回します）`)
+    return
+  }
+
   for (const j of jobs) {
-    console.log(`[trace:${source}] 全件トレース開始 traceJob=${j.traceJobId}`)
-    const context = await newContextForSource(browser, source)
-    const page = await context.newPage()
-    try {
-      await traceSource({
-        adapter: ADAPTERS[source],
-        page,
-        env,
-        appUrl: APP_URL,
-        ingestToken: TOKEN,
-        source,
-        traceJobId: j.traceJobId,
-        startedAt: j.startedAt,
-        log: (m) => console.log(m),
-      })
-    } catch (e) {
-      console.error(`[trace:${source}] fatal:`, e.message)
-    } finally {
-      await context.close()
+    // 各traceJob着手直前にも再確認（tick中にAI検索が入ってくる場合に備える）。
+    if (isAiBusy(source)) {
+      console.log(`[trace:${source}] AI検索割り込みを検知。残りのトレースは次回へ`)
+      break
     }
+    console.log(`[trace:${source}] 全件トレース開始 traceJob=${j.traceJobId}`)
+    // ★同時ログイン競合を防ぐため media ロック配下で実行（AI検索と直列化）。
+    await withSourceLock(source, async () => {
+      const context = await newContextForSource(browser, source)
+      const page = await context.newPage()
+      try {
+        await traceSource({
+          adapter: ADAPTERS[source],
+          page,
+          env,
+          appUrl: APP_URL,
+          ingestToken: TOKEN,
+          source,
+          traceJobId: j.traceJobId,
+          startedAt: j.startedAt,
+          log: (m) => console.log(m),
+        })
+      } catch (e) {
+        console.error(`[trace:${source}] fatal:`, e.message)
+      } finally {
+        await context.close()
+      }
+    }, 'trace')
   }
 }
 
 async function traceLoopForSource(browser, source) {
   while (true) {
-    await tickTraceSource(browser, source)
+    // ★トレースの例外は絶対にループ外へ出さない（AI検索/worker本体を巻き込まないため）。
+    try {
+      await tickTraceSource(browser, source)
+    } catch (e) {
+      console.error(`[trace:${source}] loop error（無視して継続）:`, e && e.message ? e.message : e)
+    }
     await new Promise((r) => setTimeout(r, TRACE_POLL))
   }
 }
@@ -653,12 +727,21 @@ async function main() {
     .split(',').map((s) => s.trim()).filter(Boolean)
 
   // AI検索ループ + トレースループ を並列で常駐。
-  const loops = SOURCES.map((source) => pollLoopForSource(browser, source))
+  // ★各ループを .catch で never-reject 化し、Promise.allSettled で待つ。
+  //   これにより「トレースループの1つが落ちても worker 本体（＝AI検索全体）は死なない」。
+  //   （従来は Promise.all で1つでも reject すると main が落ち process.exit → 全DB消失）
+  const guard = (name, p) =>
+    p.catch((e) => console.error(`[loop:${name}] 致命的例外（隔離して継続不能なループのみ停止）:`, e))
+
+  const loops = SOURCES.map((source) =>
+    guard(`ai:${source}`, pollLoopForSource(browser, source)))
+
   if (TRACE_ENABLED) {
     console.log(`トレース(全求人同期)ループ有効  sources=[${TRACE_SOURCES.join(',')}]  poll=${TRACE_POLL}ms`)
-    loops.push(...TRACE_SOURCES.map((source) => traceLoopForSource(browser, source)))
+    loops.push(...TRACE_SOURCES.map((source) =>
+      guard(`trace:${source}`, traceLoopForSource(browser, source))))
   }
-  await Promise.all(loops)
+  await Promise.allSettled(loops)
 }
 
 main().catch((e) => {
