@@ -84,6 +84,7 @@ node --no-warnings --test test/*.test.js                           # 自動テ�
 | `HUB_PAGE_DELAY_MS` | `500` | ページ間の待機（媒体への負荷軽減） |
 | `HUB_CIRCUS_PAGE_SIZE` | `200` | circus の1回の取得件数 |
 | `HUB_CIRCUS_ORDER_BY` | `publishStartedAt` | circus の並び順（おすすめ順は読んでいる間に順位が変わるため使わない） |
+| `HUB_REQUEST_TIMEOUT_MS` | `90000` | 1回の通信の上限時間（媒体が応答しないまま固まるのを防ぐ） |
 | `HUB_RECOVER_WAIT_MS` | `30000` | 取り直す前に待つ時間 |
 | `HUB_RECOVER_CHUNK` | `25` | 取り直しで小分けにする件数 |
 | `HUB_MAX_UNREADABLE` | `0` | どうしても取れない求人がこの件数以下なら「読み切れた」とみなす |

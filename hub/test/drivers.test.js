@@ -5,7 +5,7 @@ import { openDb } from '../lib/db.js'
 import { SyncSession } from '../lib/engine.js'
 import { hitolink } from '../lib/drivers.js'
 
-const cfg = { closeAfterMisses: 2, maxCloseRatio: 0.05, completeRatio: 0.98, pageRetry: 3, maxConsecutiveFail: 5, pageDelayMs: 0, recoverWaitMs: 0, recoverChunk: 25, maxUnreadable: 0, pageSize: { hitolink: 100 } }
+const cfg = { requestTimeoutMs: 5000, closeAfterMisses: 2, maxCloseRatio: 0.05, completeRatio: 0.98, pageRetry: 3, maxConsecutiveFail: 5, pageDelayMs: 0, recoverWaitMs: 0, recoverChunk: 25, maxUnreadable: 0, pageSize: { hitolink: 100 } }
 const fakeBrowser = { newContext: async () => ({ newPage: async () => ({}), close: async () => {} }) }
 function fakeHitolink(total, { failPage = null, failTimes = 0, badItem = null } = {}) {
   let fails = 0, logins = 0
@@ -77,4 +77,19 @@ test('ページの範囲指定: 指定範囲だけ読み、掲載終了の判定
   assert.equal(s2.stats.fetched, 300); assert.equal(s2.stats.added, 3); assert.equal(s2.stats.unchanged, 297)
   assert.equal(fin.missing, 0); assert.equal(fin.closed, 0); assert.equal(fin.complete, false)
   assert.equal(db.prepare(`SELECT COUNT(*) n FROM jobs`).get().n, 1000)
+})
+
+test('媒体が応答しないページは時間切れで失敗扱いにし、同期全体は止まらない', async () => {
+  const f = fakeHitolink(300)
+  const orig = f.hitolink.apiSearch
+  let hung = false
+  f.hitolink.apiSearch = async (p, t, o) => {
+    if (o.pageNo === 2 && o.limit === 100 && !hung) { hung = true; return new Promise(() => {}) } // 永遠に返らない
+    return orig(p, t, o)
+  }
+  const db = openDb(':memory:')
+  const c = { ...cfg, requestTimeoutMs: 300, pageRetry: 1 }
+  const session = new SyncSession(db, { source: 'hitolink', runId: 1, cfg: c })
+  const out = await hitolink.run({ cfg: c, env: {}, browser: fakeBrowser, log: () => {}, shouldStop: () => false, session, adapters: f, onPage: (x) => session.ingest(x) })
+  assert.equal(session.stats.fetched, 300); assert.equal(out.pagesRecovered, 1); assert.equal(out.complete, true)
 })

@@ -39,6 +39,16 @@ async function withRetry(n, fn, { log, label, onRetry, delayMs = 1500 }) {
   throw last
 }
 
+// 1回の通信に上限時間を設ける（媒体が応答を返さないまま固まると、同期全体が止まってしまうため）
+export function withTimeout(ms, fn, label = '通信') {
+  return (...args) => new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label}が${Math.round(ms / 1000)}秒以内に応答しませんでした（status=timeout）`)), ms)
+    Promise.resolve().then(() => fn(...args)).then(
+      (v) => { clearTimeout(t); resolve(v) },
+      (e) => { clearTimeout(t); reject(e) })
+  })
+}
+
 function judge({ remoteTotal, fetched, pagesFailed, stopped, cfg, extra }) {
   if (stopped) return { complete: false, reason: '時間切れ' }
   if (pagesFailed > 0) return { complete: false, reason: `${pagesFailed}ページ取得失敗` }
@@ -230,7 +240,7 @@ async function browserRun(ctx, source, { size, makeFetch, useLogout = false }) {
       await a.login(page, env)
       token = await a.getAuthToken(page)
     }
-    const fetchPage = makeFetch({ a, page, getToken: () => token })
+    const fetchPage = withTimeout(ctx.cfg.requestTimeoutMs, makeFetch({ a, page, getToken: () => token }), '媒体')
     return await pagedRun(ctx, { a, size, fetchPage, relogin })
   } finally {
     await context.close().catch(() => {})
@@ -288,19 +298,20 @@ export const circus = {
       const orderBy = ctx.cfg.circusOrderBy
       return async (pageNo, limit) => {
         const offset = (pageNo - 1) * limit
-        const { status, json } = await page.evaluate(async ({ token, qJson, limit, offset, pageNo, orderBy }) => {
+        const { status, json } = await page.evaluate(async ({ token, qJson, limit, offset, pageNo, orderBy, timeoutMs }) => {
           const qs = new URLSearchParams()
           for (const q of qJson) qs.append('qJson', JSON.stringify(q))
           qs.set('limit', String(limit)); qs.set('offset', String(offset)); qs.set('page', String(pageNo))
           qs.set('orderBy', orderBy); qs.set('order', 'desc')
           const res = await fetch('https://circus-job.com/api/jobSearch?' + qs.toString(), {
+            signal: AbortSignal.timeout(timeoutMs),
             credentials: 'include',
             headers: { accept: 'application/json, text/plain, */*', 'x-circus-authentication-token': token },
           })
           let json = null
           try { json = await res.json() } catch {}
           return { status: res.status, json }
-        }, { token: getToken(), qJson, limit, offset, pageNo, orderBy })
+        }, { token: getToken(), qJson, limit, offset, pageNo, orderBy, timeoutMs: ctx.cfg.requestTimeoutMs - 5000 })
         if (status !== 200 || !json) throw new Error(`circus status=${status}`)
         return { total: json.total ?? null, jobs: Array.isArray(json.jobs) ? json.jobs : [] }
       }
