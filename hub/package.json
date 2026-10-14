@@ -1,0 +1,14 @@
+{
+  "name": "job-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "求人データハブ: 各媒体の全求人を自社DB(SQLite)に保持し、差分(追加/更新/掲載終了/削除)だけを毎日反映する",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "sync": "node --no-warnings bin/sync.js",
+    "status": "node --no-warnings bin/status.js",
+    "search": "node --no-warnings bin/search.js",
+    "test": "node --no-warnings --test test/*.test.js"
+  }
+}
