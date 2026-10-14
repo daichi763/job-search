@@ -6,6 +6,7 @@
 //   オプション:
 //     --deadline=05:00   この時刻で取得を打ち切る（既定: hub/.env の HUB_SYNC_DEADLINE、未設定なら 05:00）
 //     --deadline=none    打ち切らない（手動テスト用）
+//     --pages=490-525    指定したページだけ読む（取りこぼし分の取り直し用。1媒体のみ・掲載終了の判定はしない）
 // ============================================================
 import { runSync } from '../lib/sync.js'
 import { DRIVERS } from '../lib/drivers.js'
@@ -20,7 +21,14 @@ if (!sources.length) {
 const ts = () => new Date().toLocaleString('ja-JP', { hour12: false })
 const log = (m) => console.log(`[${ts()}] ${m}`)
 
-runSync({ sources, trigger: opt('trigger') || 'manual', deadline: opt('deadline'), log })
+let pageRange = null
+if (opt('pages')) {
+  const m = opt('pages').match(/^(\d+)-(\d+)$/)
+  if (!m || +m[1] > +m[2]) { console.error('--pages は 490-525 のように指定してください'); process.exit(2) }
+  pageRange = [+m[1], +m[2]]
+}
+
+runSync({ sources, trigger: opt('trigger') || 'manual', deadline: opt('deadline'), pageRange, log })
   .then((r) => {
     const bad = Object.values(r).some((x) => x.status === 'error')
     process.exit(bad ? 1 : 0)

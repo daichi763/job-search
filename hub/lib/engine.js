@@ -170,9 +170,15 @@ export class SyncSession {
 
   // 取得後の後処理: 掲載終了の判定（安全装置つき）
   //   complete: 最後まで読み切れたか / remoteTotal: 媒体の総件数
-  finalize({ complete, remoteTotal, reason }) {
+  finalize({ complete, remoteTotal, reason, partialRead = false }) {
     const now = nowIso()
     const res = { missing: 0, closed: 0, complete: !!complete, note: null }
+    // 一部のページだけ読んだ回は「一覧に無い」を数えない（読んでいないだけなので）
+    if (partialRead) {
+      res.complete = false
+      res.note = `${reason || '一部のページだけ読んだ回'}のため、掲載終了の判定はしていません`
+      return res
+    }
     const db = this.db
     const openRows = [...this.existing.entries()].filter(([, r]) => r.status === 'open')
     const missing = openRows.filter(([sid]) => !this.seen.has(sid)).map(([sid, r]) => ({ sid, r }))

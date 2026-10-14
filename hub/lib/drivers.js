@@ -100,7 +100,12 @@ async function pagedRun(ctx, { a, size, fetchPage, relogin }) {
   if (remoteTotal == null) throw new Error('媒体の総数を取得できませんでした')
   const pages = Math.ceil(remoteTotal / size)
   log(`媒体の総数 ${remoteTotal.toLocaleString()} 件 / ${pages} ページ（${size}件ずつ）`)
-  const every = Math.max(1, Math.round(pages / 12))
+  // 範囲指定（取りこぼし分だけ読む）: 指定ページだけ読む。全件ではないので掲載終了の判定はしない
+  const range = ctx.pageRange
+  const pFrom = range ? Math.max(1, range[0]) : 1
+  const pTo = range ? Math.min(range[1], pages + 1) : pages + 1
+  if (range) log(`範囲指定: p${pFrom}〜p${pTo}（${(pTo - pFrom + 1)}ページ）だけ読みます`)
+  const every = Math.max(1, Math.round((pTo - pFrom + 1) / 12))
   const t0 = Date.now()
   const take = (jobs) => onPage(jobs.map((raw) => ({ mapped: a.mapApiJob(raw), raw })))
   const tryPage = (p, limit, label) => withRetry(cfg.pageRetry, () => fetchPage(p, limit),
@@ -108,7 +113,7 @@ async function pagedRun(ctx, { a, size, fetchPage, relogin }) {
 
   let pagesOk = 0, consecutive = 0, stopped = false, extra = null
   const failed = [] // 取れなかったページ番号（あとで取り直す）
-  for (let p = 1; p <= pages + 1; p++) {
+  for (let p = pFrom; p <= pTo; p++) {
     if (shouldStop()) { stopped = true; break }
     let res
     try {
@@ -124,9 +129,10 @@ async function pagedRun(ctx, { a, size, fetchPage, relogin }) {
     if (!jobs.length) break
     pagesOk++
     take(jobs)
-    if (p % every === 0 || p === pages) {
+    if ((p - pFrom + 1) % every === 0 || p === pages) {
       const min = (Date.now() - t0) / 60000
-      const eta = p < pages ? ` / 残り約${Math.ceil(min / p * (pages - p))}分` : ''
+      const done = p - pFrom + 1, rest = pTo - p
+      const eta = rest > 0 && p < pages ? ` / 残り約${Math.ceil(min / done * rest)}分` : ''
       log(`p${p}/${pages} 取得累計 ${session.stats.fetched.toLocaleString()} 件（${min.toFixed(0)}分経過${eta}）`)
     }
     if (jobs.length < size) break
@@ -174,6 +180,7 @@ async function pagedRun(ctx, { a, size, fetchPage, relogin }) {
     }
   }
   if (notTried) extra = extra || '時間切れで取り直しができませんでした'
+  if (range) extra = extra || '範囲指定の取り直し（全件ではない）'
   if (stopped && failed.length && !recovered) extra = extra || `${failed.length}ページ取得失敗`
   let unreadNote = null
   if (unreadable > cfg.maxUnreadable) unreadNote = `${unreadable}件取得できず`

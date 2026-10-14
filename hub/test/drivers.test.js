@@ -63,3 +63,18 @@ test('ジョビンズ・circus も同じ読み方で全件を読む / 時間切�
   const o2 = await jobins.run({ cfg: c2, env: {}, browser: fakeBrowser, log: () => {}, shouldStop: () => ++n > 2, session: s2, adapters: fake, onPage: (x) => s2.ingest(x) })
   assert.equal(o2.complete, false); assert.equal(o2.reason, '時間切れ')
 })
+
+test('ページの範囲指定: 指定範囲だけ読み、掲載終了の判定はしない', async () => {
+  const db = openDb(':memory:')
+  const f = fakeHitolink(1000)
+  const s1 = new SyncSession(db, { source: 'hitolink', runId: 1, cfg })
+  const all = await hitolink.run({ cfg, env: {}, browser: fakeBrowser, log: () => {}, shouldStop: () => false, session: s1, adapters: f, onPage: (x) => s1.ingest(x) })
+  s1.finalize({ complete: all.complete, remoteTotal: all.remoteTotal })
+  db.prepare(`DELETE FROM jobs WHERE source_job_id IN ('450','451','452')`).run() // 取りこぼしを再現
+  const s2 = new SyncSession(db, { source: 'hitolink', runId: 2, cfg })
+  const out = await hitolink.run({ cfg, env: {}, browser: fakeBrowser, log: () => {}, shouldStop: () => false, session: s2, adapters: f, pageRange: [4, 6], onPage: (x) => s2.ingest(x) })
+  const fin = s2.finalize({ complete: out.complete, remoteTotal: out.remoteTotal, reason: out.reason, partialRead: true })
+  assert.equal(s2.stats.fetched, 300); assert.equal(s2.stats.added, 3); assert.equal(s2.stats.unchanged, 297)
+  assert.equal(fin.missing, 0); assert.equal(fin.closed, 0); assert.equal(fin.complete, false)
+  assert.equal(db.prepare(`SELECT COUNT(*) n FROM jobs`).get().n, 1000)
+})

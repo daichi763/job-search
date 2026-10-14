@@ -48,9 +48,12 @@ async function waitForAiIdle(appUrl, log, maxMinutes = 30) {
   return false
 }
 
-export async function runSync({ sources, trigger = 'manual', deadline, log = console.log } = {}) {
+export async function runSync({ sources, trigger = 'manual', deadline, pageRange = null, log = console.log } = {}) {
   const cfg = config()
   const env = loadEnv()
+  if (pageRange && (sources.length !== 1 || !DRIVERS[sources[0]]?.needsBrowser)) {
+    throw new Error('ページの範囲指定は、ヒトリンク・ジョビンズ・circus のどれか1つだけを指定したときに使えます')
+  }
   const unknown = sources.filter((s) => !DRIVERS[s])
   if (unknown.length) throw new Error(`未対応の媒体: ${unknown.join(', ')}（対応: ${Object.keys(DRIVERS).join(', ')}）`)
 
@@ -77,11 +80,11 @@ export async function runSync({ sources, trigger = 'manual', deadline, log = con
       const slog = (msg) => log(`[${source}] ${msg}`)
       const t0 = Date.now()
       const runId = Number(db.prepare(`INSERT INTO sync_runs(source, trigger, status, started_at) VALUES (?,?, 'running', ?)`)
-        .run(source, trigger, nowIso()).lastInsertRowid)
+        .run(source, pageRange ? `range:p${pageRange[0]}-${pageRange[1]}` : trigger, nowIso()).lastInsertRowid)
       const session = new SyncSession(db, { source, runId, cfg, authoritative: drv.authoritative, log: slog })
       let out = null, err = null
       try {
-        out = await drv.run({ cfg, env, browser, log: slog, shouldStop, session, onPage: (items) => session.ingest(items) })
+        out = await drv.run({ cfg, env, browser, log: slog, shouldStop, session, pageRange, onPage: (items) => session.ingest(items) })
       } catch (e) {
         err = e
         slog(`エラー: ${e.message}`)
@@ -90,6 +93,7 @@ export async function runSync({ sources, trigger = 'manual', deadline, log = con
         complete: !err && out?.complete,
         remoteTotal: out?.remoteTotal,
         reason: err ? `エラー: ${err.message}` : out?.reason,
+        partialRead: !!pageRange,
       })
       const st = session.stats
       const status = err ? (st.fetched ? 'partial' : 'error') : (fin.complete ? 'done' : 'partial')
@@ -101,6 +105,10 @@ export async function runSync({ sources, trigger = 'manual', deadline, log = con
           fin.note, err ? String(err.message).slice(0, 500) : null, Math.round((Date.now() - t0) / 1000), runId)
       results[source] = { status, remoteTotal: out?.remoteTotal ?? null, ...st, missing: fin.missing, closed: fin.closed, note: fin.note, error: err?.message }
       if (out?.pagesRecovered) slog(`取り直しで回復したページ: ${out.pagesRecovered}`)
+      if (pageRange) {
+        const n = db.prepare(`SELECT COUNT(*) AS n FROM jobs WHERE source=? AND status='open'`).get(source).n
+        slog(`DBの件数 ${n.toLocaleString()} 件 / 媒体の総数 ${out?.remoteTotal?.toLocaleString() ?? '?'} 件（差 ${out?.remoteTotal != null ? (out.remoteTotal - n).toLocaleString() : '?'} 件）`)
+      }
       slog(`${status}: 取得${st.fetched} 追加${st.added} 更新${st.updated} 軽更新${st.refreshed} 変化なし${st.unchanged} 再掲載${st.reopened} 一覧に無し${fin.missing} 掲載終了${fin.closed}${fin.note ? ' / ' + fin.note : ''}`)
     }))
 
