@@ -57,7 +57,7 @@ export function config() {
     requestTimeoutMs: int(e.HUB_REQUEST_TIMEOUT_MS, 90000), // 1回の通信の上限時間
     recoverWaitMs: int(e.HUB_RECOVER_WAIT_MS, 30000), // 取り直す前に待つ時間
     recoverChunk: int(e.HUB_RECOVER_CHUNK, 25),       // 取り直しで小分けにする件数
-    maxUnreadable: int(e.HUB_MAX_UNREADABLE, 0),      // どうしても取れない件数がこれ以下なら「読み切れた」とみなす
+    maxUnreadable: int(e.HUB_MAX_UNREADABLE, 5),      // どうしても取れない件数がこれ以下なら「読み切れた」とみなす（circus に媒体側の不具合で取れない求人が1件あるため）
     headless: (e.HEADLESS || 'true') === 'true',
     pageSize: {
       hitolink: int(e.HUB_HITOLINK_PAGE_SIZE, 1000),
