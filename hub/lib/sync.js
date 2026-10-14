@@ -100,6 +100,7 @@ export async function runSync({ sources, trigger = 'manual', deadline, log = con
           st.added, st.updated, st.refreshed, st.unchanged, st.reopened, fin.missing, fin.closed, fin.complete ? 1 : 0,
           fin.note, err ? String(err.message).slice(0, 500) : null, Math.round((Date.now() - t0) / 1000), runId)
       results[source] = { status, remoteTotal: out?.remoteTotal ?? null, ...st, missing: fin.missing, closed: fin.closed, note: fin.note, error: err?.message }
+      if (out?.pagesRecovered) slog(`取り直しで回復したページ: ${out.pagesRecovered}`)
       slog(`${status}: 取得${st.fetched} 追加${st.added} 更新${st.updated} 軽更新${st.refreshed} 変化なし${st.unchanged} 再掲載${st.reopened} 一覧に無し${fin.missing} 掲載終了${fin.closed}${fin.note ? ' / ' + fin.note : ''}`)
     }))
 

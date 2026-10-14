@@ -93,23 +93,29 @@ export const kintone = {
 // ------------------------------------------------------------
 async function pagedRun(ctx, { a, size, fetchPage, relogin }) {
   const { cfg, log, onPage, shouldStop, session } = ctx
-  const first = await withRetry(cfg.pageRetry, () => fetchPage(1, 1), { log, label: '総数の取得', onRetry: relogin })
+  // 再ログインは認証切れが疑われる時だけ（サーバー側の 500 エラーでは再ログインしても直らない）
+  const reloginIfAuth = (e) => (relogin && !/status=5\d\d/.test(String(e && e.message)) ? relogin() : null)
+  const first = await withRetry(cfg.pageRetry, () => fetchPage(1, 1), { log, label: '総数の取得', onRetry: reloginIfAuth })
   const remoteTotal = first.total
   if (remoteTotal == null) throw new Error('媒体の総数を取得できませんでした')
   const pages = Math.ceil(remoteTotal / size)
   log(`媒体の総数 ${remoteTotal.toLocaleString()} 件 / ${pages} ページ（${size}件ずつ）`)
   const every = Math.max(1, Math.round(pages / 12))
   const t0 = Date.now()
+  const take = (jobs) => onPage(jobs.map((raw) => ({ mapped: a.mapApiJob(raw), raw })))
+  const tryPage = (p, limit, label) => withRetry(cfg.pageRetry, () => fetchPage(p, limit),
+    { log, label, onRetry: (e, i) => (i === 1 ? reloginIfAuth(e) : null) })
 
-  let pagesOk = 0, pagesFailed = 0, consecutive = 0, stopped = false, extra = null
+  let pagesOk = 0, consecutive = 0, stopped = false, extra = null
+  const failed = [] // 取れなかったページ番号（あとで取り直す）
   for (let p = 1; p <= pages + 1; p++) {
     if (shouldStop()) { stopped = true; break }
     let res
     try {
-      res = await withRetry(cfg.pageRetry, () => fetchPage(p, size),
-        { log, label: `p${p}`, onRetry: (e, i) => (i === 1 && relogin ? relogin() : null) })
+      res = await tryPage(p, size, `p${p}`)
     } catch (e) {
-      pagesFailed++
+      failed.push(p)
+      log(`p${p} を後で取り直します`)
       if (++consecutive >= cfg.maxConsecutiveFail) { extra = `連続${consecutive}ページ失敗で打ち切り`; break }
       continue
     }
@@ -117,7 +123,7 @@ async function pagedRun(ctx, { a, size, fetchPage, relogin }) {
     const jobs = res.jobs || []
     if (!jobs.length) break
     pagesOk++
-    onPage(jobs.map((raw) => ({ mapped: a.mapApiJob(raw), raw })))
+    take(jobs)
     if (p % every === 0 || p === pages) {
       const min = (Date.now() - t0) / 60000
       const eta = p < pages ? ` / 残り約${Math.ceil(min / p * (pages - p))}分` : ''
@@ -126,7 +132,56 @@ async function pagedRun(ctx, { a, size, fetchPage, relogin }) {
     if (jobs.length < size) break
     if (cfg.pageDelayMs) await sleep(cfg.pageDelayMs)
   }
-  return { remoteTotal, pagesOk, pagesFailed, ...judge({ remoteTotal, fetched: session.stats.fetched, pagesFailed, stopped, cfg, extra }) }
+
+  // ---- 取れなかったページの取り直し ----
+  //   1) 少し時間を置いて同じページをもう一度
+  //   2) それでも駄目なら細かく分けて（既定25件ずつ）取り直す
+  //   3) さらに失敗した小分けは1件ずつ（各1回だけ）取り直す
+  //      → 壊れた1件だけがエラーの原因になっている場合でも、残りは取れる
+  //   取り直しの最中に順番が少しずれて前後と重複することがあるが、重複は同期エンジンが1件にまとめる。
+  let unreadable = 0, recovered = 0, notTried = 0
+  if (failed.length && !stopped && !extra) {
+    log(`取れなかった ${failed.length} ページを取り直します: p${failed.join(', p')}`)
+    await sleep(cfg.recoverWaitMs)
+    const sub = Math.max(1, Math.min(cfg.recoverChunk, size))
+    for (const p of failed) {
+      if (shouldStop()) { stopped = true; notTried++; continue }
+      try {
+        take((await tryPage(p, size, `取り直し p${p}`)).jobs || [])
+        log(`p${p} 取り直し成功`); recovered++
+        continue
+      } catch {}
+      if (size % sub !== 0 || sub === size) { unreadable += size; continue }
+      const per = size / sub
+      let lost = 0
+      for (let k = 1; k <= per; k++) {
+        const subPage = (p - 1) * per + k
+        try {
+          take((await tryPage(subPage, sub, `取り直し p${p} の小分け${k}/${per}`)).jobs || [])
+        } catch {
+          for (let j = 1; j <= sub; j++) {
+            const nth = (subPage - 1) * sub + j // 何件目か
+            if (shouldStop()) { lost += sub - j + 1; break }
+            try { take((await fetchPage(nth, 1)).jobs || []) }
+            catch { lost++; log(`${nth}件目の求人はどうしても取得できません`) }
+          }
+        }
+        if (cfg.pageDelayMs) await sleep(cfg.pageDelayMs)
+      }
+      unreadable += lost
+      if (!lost) recovered++
+      log(lost ? `p${p} 取り直し: ${lost} 件だけ取得できませんでした` : `p${p} 小分けで取り直し成功`)
+    }
+  }
+  if (notTried) extra = extra || '時間切れで取り直しができませんでした'
+  if (stopped && failed.length && !recovered) extra = extra || `${failed.length}ページ取得失敗`
+  let unreadNote = null
+  if (unreadable > cfg.maxUnreadable) unreadNote = `${unreadable}件取得できず`
+  else if (unreadable) log(`取得できなかった ${unreadable} 件は許容範囲（HUB_MAX_UNREADABLE=${cfg.maxUnreadable}）として扱います`)
+  return {
+    remoteTotal, pagesOk, pagesFailed: failed.length - recovered, pagesRecovered: recovered, unreadable,
+    ...judge({ remoteTotal, fetched: session.stats.fetched, pagesFailed: 0, stopped, cfg, extra: extra || unreadNote }),
+  }
 }
 
 // ブラウザの用意（ジョビンズは不正アクセス対策で Windows の Chrome に見せる必要がある＝既存 worker と同じ設定）

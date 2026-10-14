@@ -54,6 +54,9 @@ export function config() {
     pageDelayMs: int(e.HUB_PAGE_DELAY_MS, 500), // ページ間の待機（媒体への負荷軽減）
     pageRetry: int(e.HUB_PAGE_RETRY, 3),
     maxConsecutiveFail: int(e.HUB_MAX_CONSECUTIVE_FAIL, 5),
+    recoverWaitMs: int(e.HUB_RECOVER_WAIT_MS, 30000), // 取り直す前に待つ時間
+    recoverChunk: int(e.HUB_RECOVER_CHUNK, 25),       // 取り直しで小分けにする件数
+    maxUnreadable: int(e.HUB_MAX_UNREADABLE, 0),      // どうしても取れない件数がこれ以下なら「読み切れた」とみなす
     headless: (e.HEADLESS || 'true') === 'true',
     pageSize: {
       hitolink: int(e.HUB_HITOLINK_PAGE_SIZE, 1000),
