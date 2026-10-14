@@ -61,5 +61,9 @@ export function config() {
       jobins: 100,
       circus: int(e.HUB_CIRCUS_PAGE_SIZE, 200),
     },
+    circusOrderBy: e.HUB_CIRCUS_ORDER_BY || 'publishStartedAt',
+    // バックアップ
+    backupDir: e.HUB_BACKUP_DIR || path.join(process.env.HOME || '/tmp', 'backups', 'hub'),
+    backupKeep: int(e.HUB_BACKUP_KEEP, 3), // 何世代残すか
   }
 }

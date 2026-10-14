@@ -8,14 +8,16 @@
 - ログイン・API呼び出し・データ変換: 既存の `worker/adapters.js` をそのまま使う
 - 依存パッケージ: 追加なし（Node.js 22 標準の `node:sqlite` ＋ worker の playwright / dotenv を借用）
 
-## 対応状況（段階1）
+## 対応状況（段階2）
 
-| 媒体 | 状態 | 読み方 |
-|---|---|---|
-| kintone | ✅ | `$id` 昇順カーソルで全件（数秒） |
-| ヒトリンク | ✅ | 1,000件ずつ全ページ（約6〜10分の見込み） |
-| ジョビンズ | 段階2 | |
-| circus | 段階2 | |
+| 媒体 | 状態 | 読み方 | 所要時間 |
+|---|---|---|---|
+| kintone | ✅ VPSで確認済み | `$id` 昇順カーソルで全件 | 数秒 |
+| ヒトリンク | ✅ VPSで確認済み（107,222件） | 1,000件ずつ全ページ | 約9分 |
+| ジョビンズ | 段階2で追加 | 100件ずつ全ページ（上限100件） | 約40分の見込み |
+| circus | 段階2で追加 | 200件ずつ・掲載開始日の新しい順 | 約1.5時間の見込み |
+
+4媒体は別のサイトなので **同時に** 読む。全体の所要時間は一番遅い circus で決まる。
 
 ## 同期の考え方
 
@@ -55,6 +57,8 @@ node --no-warnings bin/sync.js --all --trigger=cron                # cron 用（
 node --no-warnings bin/status.js                                   # 状況の確認（読み取りのみ）
 node --no-warnings bin/search.js 営業 --prefecture=東京都 --salaryMin=4000000   # 検索の確認
 node --no-warnings bin/search.js --bench                           # 検索速度の測定
+node --no-warnings bin/backup.js                                   # バックアップ（~/backups/hub に3世代）
+bash bin/nightly.sh                                                # 毎晩の処理（同期→バックアップ）を手動で実行
 node --no-warnings --test test/*.test.js                           # 自動テスト（媒体に接続しない）
 ```
 
@@ -73,6 +77,29 @@ node --no-warnings --test test/*.test.js                           # 自動テ�
 | `HUB_COMPLETE_RATIO` | `0.98` | 媒体総数に対して何割取れたら「読み切れた」とみなすか |
 | `HUB_HITOLINK_PAGE_SIZE` | `1000` | ヒトリンクの1回の取得件数 |
 | `HUB_PAGE_DELAY_MS` | `500` | ページ間の待機（媒体への負荷軽減） |
+| `HUB_CIRCUS_PAGE_SIZE` | `200` | circus の1回の取得件数 |
+| `HUB_CIRCUS_ORDER_BY` | `publishStartedAt` | circus の並び順（おすすめ順は読んでいる間に順位が変わるため使わない） |
+| `HUB_BACKUP_DIR` | `~/backups/hub` | バックアップの保存先 |
+| `HUB_BACKUP_KEEP` | `3` | バックアップを何世代残すか |
+
+## 毎晩の自動実行（cron）
+
+```bash
+crontab -e
+# 次の1行を追加（毎日 2:00 に開始。同期は 5:00 で打ち切り）
+0 2 * * * /home/ubuntu/webapp/hub/bin/nightly.sh
+```
+- ログ: `/home/ubuntu/webapp/logs/hub/hub_YYYY-MM-DD.log`（30日で自動削除）
+- 前日の処理がまだ動いていれば、その日はスキップする
+- 時間切れで読み切れなかった媒体は、掲載終了の判定をしない（翌日に持ち越し）
+
+## バックアップからの復元
+```bash
+cd /home/ubuntu/webapp/hub
+mv data/jobs_hub.sqlite data/jobs_hub.sqlite.broken
+zcat ~/backups/hub/jobs_hub_YYYY-MM-DD_HHMM.sqlite.gz > data/jobs_hub.sqlite
+node --no-warnings bin/status.js
+```
 
 ## 既存アプリとの関係
 - 同期中に既存アプリでAI検索が実行中なら、終わるまで待つ（最大30分。circus/ヒトリンクの同時ログイン競合を避けるため）
