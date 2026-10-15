@@ -20,6 +20,7 @@ import crypto from 'node:crypto'
 import { openDb } from '../lib/db.js'
 import { config, loadEnv, HUB_DIR } from '../lib/env.js'
 import { searchJobs, getJob, getOverview } from '../lib/search.js'
+import { handleApiV1 } from '../lib/api.js'
 
 const env = loadEnv()
 const cfg = config()
@@ -35,6 +36,22 @@ if (!LOOPBACK && (!PASS || PASS.length < 8)) {
   process.exit(1)
 }
 const AUTH_REQUIRED = !!PASS
+// 外部向けAPI（/api/v1）のAPIキー（任意）。カンマ区切りで複数可。未設定なら鍵なしで使える
+const API_KEYS = (env.HUB_API_KEYS || '').split(',').map((s) => s.trim()).filter(Boolean)
+const apiKeyOk = (req, url) => {
+  if (!API_KEYS.length) return true
+  const h = req.headers.authorization || ''
+  const key = req.headers['x-api-key'] || (h.startsWith('Bearer ') ? h.slice(7) : '')
+  return API_KEYS.some((k) => safeEq(k, key))
+}
+// 簡易の回数制限（同じ接続元から1分あたり HUB_API_RATE 回まで。既定 300）
+const RATE = parseInt(env.HUB_API_RATE || '300', 10)
+const hits = new Map()
+function rateOk(id) {
+  const now = Date.now(), h = hits.get(id)
+  if (!h || now - h.t > 60000) { hits.set(id, { t: now, n: 1 }); if (hits.size > 10000) hits.clear(); return true }
+  return ++h.n <= RATE
+}
 if (!fs.existsSync(cfg.dbPath)) {
   console.error(`DBがありません: ${cfg.dbPath}`)
   process.exit(1)
@@ -58,8 +75,9 @@ function authorized(req) {
 const fails = new Map()
 const blocked = (ip) => (fails.get(ip)?.n || 0) >= 10 && Date.now() - fails.get(ip).t < 15 * 60 * 1000
 
-function send(res, code, body, type = 'application/json; charset=utf-8') {
+function send(res, code, body, type = 'application/json; charset=utf-8', extra = {}) {
   res.writeHead(code, {
+    ...extra,
     'Content-Type': type,
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
@@ -73,6 +91,28 @@ const server = http.createServer((req, res) => {
   const ip = req.socket.remoteAddress
   if (blocked(ip)) return send(res, 429, { error: 'too_many_attempts' })
   if (req.url === '/favicon.ico') { res.writeHead(204); return res.end() }
+
+  // ---- 外部向け検索API v1（別アプリ用。画面用のログインとは別にAPIキーで管理）----
+  if (req.url.startsWith('/api/v1/')) {
+    const cors = { 'Access-Control-Allow-Origin': env.HUB_API_CORS_ORIGIN || '*', 'Access-Control-Allow-Headers': 'Authorization, X-API-Key', 'Access-Control-Allow-Methods': 'GET, OPTIONS' }
+    if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end() }
+    if (req.method !== 'GET') return send(res, 405, { error: { code: 'method_not_allowed', message: 'GET のみ使えます' } }, undefined, cors)
+    const url = new URL(req.url, 'http://x')
+    if (!apiKeyOk(req, url)) return send(res, 401, { error: { code: 'unauthorized', message: 'APIキーが正しくありません' } }, undefined, cors)
+    const who = req.headers['x-forwarded-for']?.split(',')[0].trim() || ip
+    if (!rateOk(who)) return send(res, 429, { error: { code: 'rate_limited', message: `1分あたり${RATE}回までです` } }, undefined, { ...cors, 'Retry-After': '60' })
+    const t0 = performance.now()
+    try {
+      const r = handleApiV1(db, url.pathname, url.searchParams)
+      const ms = Math.round(performance.now() - t0)
+      if (r.status === 200 && r.body.meta) r.body.meta.took_ms = ms
+      return send(res, r.status, r.body, undefined, { ...cors, 'X-Response-Time': `${ms}ms` })
+    } catch (e) {
+      console.error(new Date().toISOString(), req.url, e.message)
+      if (/database|disk|malformed/i.test(e.message)) { try { db.close() } catch {}; db = openDb(cfg.dbPath, { readonly: true }) }
+      return send(res, 500, { error: { code: 'internal_error', message: '検索中にエラーが発生しました' } }, undefined, cors)
+    }
+  }
   if (AUTH_REQUIRED && !authorized(req)) {
     if (req.headers.authorization) {
       const f = fails.get(ip) || { n: 0, t: 0 }

@@ -3,6 +3,14 @@
 // ============================================================
 import { toMatchQuery } from './text.js'
 
+// 該当件数の記憶（同じ条件の2ページ目以降・同じ検索の繰り返しで件数を数え直さない）
+//   データが変わる（同期が終わる）と自動で捨てる
+const countCache = new Map()
+let cacheVersion = null
+function dataVersion(db) {
+  try { return db.prepare(`SELECT MAX(id) AS v, MAX(finished_at) AS f FROM sync_runs`).get() } catch { return null }
+}
+
 export function searchJobs(db, q = {}) {
   const where = []
   if (q.status === 'closed') where.push(`j.status = 'closed'`)
@@ -55,7 +63,15 @@ export function searchJobs(db, q = {}) {
   const offset = Math.max(parseInt(q.offset ?? 0, 10) || 0, 0)
   const w = where.length ? where.join(' AND ') : '1=1'
 
-  const total = db.prepare(`SELECT COUNT(*) AS n FROM ${from} WHERE ${w}`).get(...args).n
+  const ver = JSON.stringify(dataVersion(db))
+  if (ver !== cacheVersion) { countCache.clear(); cacheVersion = ver }
+  const key = w + '\u0001' + JSON.stringify(args)
+  let total = countCache.get(key)
+  if (total === undefined) {
+    total = db.prepare(`SELECT COUNT(*) AS n FROM ${from} WHERE ${w}`).get(...args).n
+    if (countCache.size > 2000) countCache.clear()
+    countCache.set(key, total)
+  }
   const rows = db.prepare(`SELECT j.* FROM ${from} WHERE ${w} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...args, limit, offset)
   return { total, limit, offset, jobs: rows }
 }

@@ -130,6 +130,14 @@ node --no-warnings bin/status.js
 
 ※ hub-api を単体で外部公開する場合のみ `HUB_HOST=0.0.0.0` と `HUB_VIEWER_PASSWORD`（必須）を hub/.env に設定する。
 
+## 外部向け検索API v1（別アプリ用）
+
+仕様書: **[API.md](./API.md)**
+
+- URL: `http://<VPS>:3000/api/v1/jobs?q=営業&prefecture=東京都&salary_min=400`（webapp が hub-api へ中継）
+- APIキー: `hub/.env` の `HUB_API_KEYS`（カンマ区切り・未設定なら鍵なし）。設定後 `pm2 restart hub-api`
+- 速度の目安（38万件規模の試験データ）: キーワード検索 0.1〜0.35秒。同じ条件の2ページ目以降は件数を数え直さないので速い
+
 ## 既存アプリとの関係
 - 同期中に既存アプリでAI検索が実行中なら、終わるまで待つ（最大30分。circus/ヒトリンクの同時ログイン競合を避けるため）
 - 二重起動は `hub/data/sync.lock` で防止

@@ -1164,6 +1164,29 @@ app.get('/hub-api/api/*', async (c) => {
   }
 })
 
+// 外部向け検索API v1（別アプリ用）→ hub の検索サーバーへ中継（GET / OPTIONS のみ）
+//   APIキー（hub/.env の HUB_API_KEYS）の確認や回数制限は hub 側で行う
+const relayV1 = async (c: any) => {
+  const url = new URL(c.req.url)
+  const headers: Record<string, string> = {}
+  for (const h of ['authorization', 'x-api-key']) { const v = c.req.header(h); if (v) headers[h] = v }
+  const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || c.req.header('x-real-ip')
+  if (ip) headers['x-forwarded-for'] = ip
+  try {
+    const r = await fetch(`${hubBase(c)}${url.pathname}${url.search}`, { method: c.req.method, headers, signal: AbortSignal.timeout(20000) })
+    const out = new Headers()
+    for (const h of ['content-type', 'access-control-allow-origin', 'access-control-allow-headers', 'access-control-allow-methods', 'retry-after', 'x-response-time']) {
+      const v = r.headers.get(h); if (v) out.set(h, v)
+    }
+    out.set('Cache-Control', 'no-store')
+    return new Response(r.body, { status: r.status, headers: out })
+  } catch (e: any) {
+    return c.json({ error: { code: 'hub_unavailable', message: '検索サーバーに接続できません' } }, 502)
+  }
+}
+app.get('/api/v1/*', relayV1)
+app.options('/api/v1/*', relayV1)
+
 // 旧・手動検索モード（切り戻し用に残す。新画面が安定したら削除）
 app.get('/manual-old', (c) => {
   return c.html(renderManualPage())

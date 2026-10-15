@@ -175,6 +175,7 @@ async function pagedRun(ctx, { a, size, fetchPage, relogin }) {
         try {
           take((await tryPage(subPage, sub, `取り直し p${p} の小分け${k}/${per}`)).jobs || [])
         } catch {
+          log(`取り直し p${p} の小分け${k}/${per} を1件ずつ取り直します（${sub}件・数分かかります）`)
           for (let j = 1; j <= sub; j++) {
             const nth = (subPage - 1) * sub + j // 何件目か
             if (shouldStop()) { lost += sub - j + 1; break }
@@ -182,6 +183,7 @@ async function pagedRun(ctx, { a, size, fetchPage, relogin }) {
             catch { lost++; log(`${nth}件目の求人はどうしても取得できません`) }
           }
         }
+        log(`取り直し p${p}: 小分け${k}/${per} 完了`)
         if (cfg.pageDelayMs) await sleep(cfg.pageDelayMs)
       }
       unreadable += lost
