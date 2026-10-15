@@ -9,12 +9,13 @@
 //   ・使ったトークン数と費用の目安を集計する
 // ============================================================
 
-// 1Mトークンあたりの料金（米ドル）。費用の目安の表示にだけ使う
+// 1Mトークンあたりの料金（米ドル）[入力, キャッシュ済み入力, 出力]。費用の目安の表示にだけ使う
+//   同じ前置き（要望・経歴）を繰り返し送るため、2回目以降はキャッシュ料金になることが多い
 const PRICES = {
-  'gpt-6-astra': [10, 50], 'gpt-6.1-sol': [2, 10], 'gpt-6-sol': [2, 10], 'gpt-6-luna': [0.1, 0.5],
-  'gpt-5.6-sol': [4, 20], 'gpt-5.6': [4, 20],
-  'gpt-5.5': [5, 30], 'gpt-5.4': [2.5, 15], 'gpt-5.2': [1.75, 14], 'gpt-5.1': [1.25, 10], 'gpt-5': [1.25, 10],
-  'gpt-5-mini': [0.25, 2], 'gpt-5-nano': [0.05, 0.4],
+  'gpt-6-astra': [10, 1, 50], 'gpt-6.1-sol': [2, 0.1, 10], 'gpt-6-sol': [2, 0.1, 10], 'gpt-6-luna': [0.1, 0.01, 0.5],
+  'gpt-5.6-sol': [4, 0.4, 20], 'gpt-5.6': [4, 0.4, 20],
+  'gpt-5.5': [5, 0.5, 30], 'gpt-5.4': [2.5, 0.25, 15], 'gpt-5.2': [1.75, 0.175, 14], 'gpt-5.1': [1.25, 0.125, 10], 'gpt-5': [1.25, 0.125, 10],
+  'gpt-5-mini': [0.25, 0.025, 2], 'gpt-5-nano': [0.05, 0.005, 0.4],
 }
 // 推論の深さ（reasoning_effort）を指定できないモデル（none / minimal 非対応など）の補正
 const NO_NONE = /^gpt-6-astra|^gpt-6\.1-sol/
@@ -25,34 +26,47 @@ export function aiModels(env) {
     smart: env.HUB_AI_MODEL_SMART || 'gpt-6.1-sol',
     top: env.HUB_AI_MODEL_TOP || 'gpt-6-astra',
     fast: env.HUB_AI_MODEL_FAST || 'gpt-6-luna',
+    write: env.HUB_AI_MODEL_WRITE || '',   // 推薦文（未設定なら smart と同じ）
     fallbackSmart: list(env.HUB_AI_FALLBACK_MODELS || 'gpt-5.5,gpt-5.2,gpt-5'),
     fallbackFast: list(env.HUB_AI_FALLBACK_FAST_MODELS || 'gpt-5-mini,gpt-5-nano'),
   }
 }
 
 export class Usage {
-  constructor() { this.byModel = {} ; this.calls = 0 }
-  add(model, u) {
-    const m = (this.byModel[model] ||= { input: 0, output: 0, calls: 0 })
-    m.input += u?.prompt_tokens || u?.input_tokens || 0
-    m.output += u?.completion_tokens || u?.output_tokens || 0
-    m.calls++
+  constructor() { this.byModel = {}; this.byStage = {}; this.calls = 0 }
+  add(model, u, stage = 'その他') {
+    const input = u?.prompt_tokens || u?.input_tokens || 0
+    const cached = u?.prompt_tokens_details?.cached_tokens || u?.input_tokens_details?.cached_tokens || 0
+    const output = u?.completion_tokens || u?.output_tokens || 0
+    for (const m of [(this.byModel[model] ||= { input: 0, cached: 0, output: 0, calls: 0 }), (this.byStage[stage] ||= { input: 0, cached: 0, output: 0, calls: 0, usd: 0, models: {} })]) {
+      m.input += input; m.cached += cached; m.output += output; m.calls++
+    }
+    const st = this.byStage[stage]
+    st.models[model] = (st.models[model] || 0) + 1
+    const c = costOf(model, input, cached, output)
+    st.usd = st.usd == null || c == null ? null : st.usd + c
     this.calls++
   }
   get tokens() { return Object.values(this.byModel).reduce((a, m) => a + m.input + m.output, 0) }
   get usd() {
     let t = 0
     for (const [model, m] of Object.entries(this.byModel)) {
-      const p = PRICES[model] || PRICES[model.replace(/-\d{4}-\d{2}-\d{2}$/, '')]
-      if (!p) return null
-      t += (m.input * p[0] + m.output * p[1]) / 1e6
+      const c = costOf(model, m.input, m.cached, m.output)
+      if (c == null) return null
+      t += c
     }
     return t
   }
   summary() {
-    const usd = this.usd
-    return { tokens: this.tokens, calls: this.calls, usd: usd == null ? null : Math.round(usd * 1000) / 1000, byModel: this.byModel }
+    const r3 = (v) => (v == null ? null : Math.round(v * 1000) / 1000)
+    const byStage = Object.fromEntries(Object.entries(this.byStage).map(([k, v]) => [k, { ...v, usd: r3(v.usd) }]))
+    return { tokens: this.tokens, calls: this.calls, usd: r3(this.usd), byModel: this.byModel, byStage }
   }
+}
+function costOf(model, input, cached, output) {
+  const p = PRICES[model] || PRICES[String(model).replace(/-\d{4}-\d{2}-\d{2}$/, '')]
+  if (!p) return null
+  return ((input - cached) * p[0] + cached * p[1] + output * p[2]) / 1e6
 }
 
 // 使えないと分かったモデル（プロセスが動いている間は覚えておき、毎回試さない）
@@ -87,7 +101,7 @@ function parseJson(text) {
 }
 
 // JSONで答えさせる呼び出し。models は試す順（先頭が第一候補）
-export async function chatJson(env, { models, system, user, effort = 'low', maxTokens = 4000, usage, timeoutMs = 240000, label = '' }) {
+export async function chatJson(env, { models, system, user, effort = 'low', maxTokens = 4000, usage, timeoutMs = 240000, label = '', stage }) {
   const base = (env.HUB_AI_BASE_URL || env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '')
   const key = env.HUB_AI_API_KEY || env.OPENAI_API_KEY
   if (!key) throw new Error('OpenAI のAPIキー（OPENAI_API_KEY）が設定されていません')
@@ -123,7 +137,7 @@ export async function chatJson(env, { models, system, user, effort = 'low', maxT
       if (res.ok) {
         let data
         try { data = JSON.parse(text) } catch { lastErr = new Error(`${model}: 応答を読めません`); continue }
-        usage?.add(model, data.usage)
+        usage?.add(model, data.usage, stage || label || 'その他')
         const content = data.choices?.[0]?.message?.content
         const parsed = parseJson(content)
         if (parsed) return { data: parsed, model }

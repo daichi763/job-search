@@ -141,3 +141,21 @@ export function profileToText(p) {
   if (list(p.inferredDirections).length) L.push(`【狙える方向性（推測）】${list(p.inferredDirections).map((d) => `${d.direction}（${d.why || ''}）`).join('、')}`)
   return L.join('\n')
 }
+
+// 一次審査用の短い経歴（600字程度。大量の求人をふるい分けるときに毎回送るため）
+export function profileBrief(p) {
+  if (!p || typeof p !== 'object') return ''
+  const list = (a) => (Array.isArray(a) ? a.filter(Boolean) : [])
+  const L = []
+  if (p.summary) L.push(String(p.summary).slice(0, 200))
+  const jty = Object.entries(p.jobTypeYears || {}).filter(([, y]) => y != null)
+  if (jty.length) L.push(`職種別経験: ${jty.map(([k, y]) => `${k}${y}年`).join('、')}`)
+  if (p.education?.level) L.push(`学歴: ${p.education.level}`)
+  if (p.management) L.push(`マネジメント: ${p.management.has ? `あり${p.management.maxReports ? `(${p.management.maxReports}名)` : ''}` : 'なし'}`)
+  const lic = list(p.licenses).map((x) => x.name)
+  L.push(`資格: ${lic.join('、') || 'なし'}`)
+  if (list(p.tools).length) L.push(`ツール: ${list(p.tools).slice(0, 8).join('、')}`)
+  if (list(p.languages).length) L.push(`語学: ${list(p.languages).map((x) => `${x.language}${x.level ? ` ${x.level}` : ''}`).join('、')}`)
+  if (list(p.inferredDirections).length) L.push(`狙える方向: ${list(p.inferredDirections).map((d) => d.direction).slice(0, 4).join('、')}`)
+  return L.join('\n')
+}

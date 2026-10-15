@@ -12,6 +12,7 @@
 //     --conditions=条件.json  条件をJSONで渡す（画面と同じ項目名）
 //     --depth=standard|deep|all   一次審査にかける件数（標準2000 / 徹底8000 / 全件）
 //     --precision=high|top        精査のモデル（top=最高精度モデル）
+//     --cost=economy|standard|quality  費用モード（既定 standard。hub/.env の HUB_AI_COST_MODE でも指定可）
 //     --top=20                提案件数
 //     --out=結果.json         結果を保存（未指定なら hub/data/ai-results/ に保存）
 //     --dry                   AIを呼ばず、母集団の件数とキーワードの当たり具合だけ確認
@@ -83,7 +84,7 @@ async function main() {
   }
 
   const result = await runAiSearch(env, db, criteria, {
-    profile, keepScreen: true, depth: opt.depth || 'standard', precision: opt.precision || 'high', log,
+    profile, keepScreen: true, costMode: opt.cost, depth: opt.depth || 'standard', precision: opt.precision || 'high', log,
     onProgress: (p) => { if (p.stage !== 'screen' || /終わり/.test(p.message) || (p.screened || 0) % 400 === 0) log(`${p.message}（${p.elapsedSec}秒・トークン ${p.usage.tokens.toLocaleString()}）`) },
   })
 
@@ -111,6 +112,8 @@ async function main() {
   const s = result.summary
   console.log(`\n所要 ${s.elapsedSec}秒 / 母集団 ${s.poolSize.toLocaleString()} / 一次審査 ${s.screened.toLocaleString()} / 精査 ${s.judged} / トークン ${s.usage.tokens.toLocaleString()}${s.usage.usd != null ? ` / 費用の目安 約$${s.usage.usd}（約${Math.round(s.usage.usd * 150)}円）` : ''}`)
   console.log(`モデル別: ${Object.entries(s.usage.byModel).map(([k, v]) => `${k} ${v.calls}回`).join(' / ')}`)
+  console.log(`段階別: ${Object.entries(s.usage.byStage).map(([k, v]) => `${k} ${(v.input + v.output).toLocaleString()}トークン${v.usd != null ? `（約${Math.round(v.usd * 150)}円）` : ''}`).join(' / ')}`)
+  console.log(`費用モード: ${s.costMode}${s.stopReason === 'enough' ? ' / 十分な候補が集まったため精査を早めに終了' : s.stopReason === 'budget' ? ' / 費用の上限で精査を終了' : ''}`)
 
   const out = opt.out || path.join(HUB_DIR, 'data', 'ai-results', `ai_${new Date().toISOString().replace(/[:.]/g, '-')}.json`)
   fs.mkdirSync(path.dirname(out), { recursive: true })

@@ -16,22 +16,36 @@ import { buildWhere, jobUrl } from '../search.js'
 import { toMatchQuery } from '../text.js'
 import { FEATURES } from '../features.js'
 import { chatJson, mapLimit, Usage, aiModels } from './llm.js'
-import { profileToText } from './profile.js'
+import { profileToText, profileBrief } from './profile.js'
 
 const int = (v, d) => { const n = parseInt(v ?? '', 10); return Number.isFinite(n) ? n : d }
 
-export function engineConfig(env = {}) {
+// 費用モード: economy（安い）/ standard（既定）/ quality（精度優先）
+const COST_MODES = {
+  economy:  { screenStandard: 1200, deepFirst: 1.5, deepMaxFactor: 2.5, judgeEffort: 'low',    descChars: 1500 },
+  standard: { screenStandard: 2000, deepFirst: 2,   deepMaxFactor: 4,   judgeEffort: 'medium', descChars: 2000 },
+  quality:  { screenStandard: 3000, deepFirst: 3,   deepMaxFactor: 6,   judgeEffort: 'high',   descChars: 2800 },
+}
+export function engineConfig(env = {}, mode) {
+  const cm = COST_MODES[mode || env.HUB_AI_COST_MODE] || COST_MODES.standard
   return {
-    screenStandard: int(env.HUB_AI_SCREEN_STANDARD, 2000), // 標準: 一次審査にかける件数
+    costMode: COST_MODES[mode || env.HUB_AI_COST_MODE] ? (mode || env.HUB_AI_COST_MODE) : 'standard',
+    screenStandard: int(env.HUB_AI_SCREEN_STANDARD, cm.screenStandard), // 標準: 一次審査にかける件数
     screenDeep: int(env.HUB_AI_SCREEN_DEEP, 8000),         // 徹底: 一次審査にかける件数
-    screenBatch: int(env.HUB_AI_SCREEN_BATCH, 20),
+    screenBatch: int(env.HUB_AI_SCREEN_BATCH, 25),
     deepBatch: int(env.HUB_AI_DEEP_BATCH, 4),
-    deepMax: int(env.HUB_AI_DEEP_MAX, 120),                // 精査する最大件数
+    deepMax: int(env.HUB_AI_DEEP_MAX, 120),                // 精査する最大件数（上限）
+    deepFirst: cm.deepFirst,                               // 精査の1回目 = 提案件数 × この倍率
+    deepMaxFactor: cm.deepMaxFactor,                       // 精査の最大 = 提案件数 × この倍率（deepMax を超えない）
+    judgeEffort: env.HUB_AI_JUDGE_EFFORT || cm.judgeEffort,
+    descChars: int(env.HUB_AI_DESC_CHARS, cm.descChars),   // 精査で渡す仕事内容の文字数（応募条件は常に全文）
     deepMinScreen: int(env.HUB_AI_DEEP_MIN_SCREEN, 50),    // 一次審査でこの点以上だけ精査
     concurrency: int(env.HUB_AI_CONCURRENCY, 8),
     capUnmet: int(env.HUB_AI_CAP_UNMET, 55),               // 必須要件を満たさない求人の上限点
     capUnknown: int(env.HUB_AI_CAP_UNKNOWN, 84),           // 書類があるのに必須要件を確認できない求人の上限点
     minScore: int(env.HUB_AI_MIN_SCORE, 60),               // 提案する最低点
+    goodScore: int(env.HUB_AI_GOOD_SCORE, 80),             // 「十分に良い」とみなす点（精査の打ち切り判定）
+    maxUsd: env.HUB_AI_MAX_USD ? Number(env.HUB_AI_MAX_USD) : null, // 1回の検索の費用上限（米ドル。超えたら精査を打ち切る）
   }
 }
 
@@ -281,16 +295,25 @@ function loadJobs(db, ids, { full }) {
 }
 const oneLine = (s, n) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n)
 
-function jobBrief(j) {
+// 一次審査用の短い要約（1件あたり約250字。大量に送るため、判断に効く項目だけ）
+//   ・応募条件は先頭の必須部分（「歓迎」以降は落とす）
+//   ・仕事内容は冒頭だけ
+function reqHead(s, n) {
+  const t = oneLine(s, 600)
+  const cut = t.search(/【?(歓迎|尚可|あれば尚|優遇)/)
+  return (cut > 20 ? t.slice(0, cut) : t).slice(0, n)
+}
+export function jobBrief(j, { req = 130, desc = 70 } = {}) {
   return [
-    oneLine(j.title, 90), j.company ? `社:${oneLine(j.company, 30)}` : '', j.job_category ? `職種:${oneLine(j.job_category, 50)}` : '',
-    j.locations_text ? `地:${oneLine(j.locations_text, 40)}` : '', (j.salary_min || j.salary_max) ? `年収${man(j.salary_min)}〜${man(j.salary_max)}万` : '',
-    j.employment ? `雇:${oneLine(j.employment, 12)}` : '', j.features.length ? `特:${j.features.map((f) => FEATURES[f] || f).join('・')}` : '',
-    j.requirements ? `必須:${oneLine(j.requirements, 220)}` : '', j.description ? `内容:${oneLine(j.description, 160)}` : '',
-  ].filter(Boolean).join(' / ')
+    oneLine(j.title, 60), j.company ? oneLine(j.company, 20) : '', j.job_category ? oneLine(j.job_category, 30) : '',
+    (j.salary_min || j.salary_max) ? `${man(j.salary_min)}-${man(j.salary_max)}万` : '',
+    j.employment && !/正社員/.test(j.employment) ? oneLine(j.employment, 10) : '',
+    j.features.length ? j.features.map((f) => FEATURES[f] || f).join('・') : '',
+    j.requirements ? `必須:${reqHead(j.requirements, req)}` : '', j.description ? `内容:${oneLine(j.description, desc)}` : '',
+  ].filter(Boolean).join('/')
 }
 
-function jobFull(j) {
+function jobFull(j, descChars = 2800) {
   const L = [
     `タイトル: ${oneLine(j.title, 200)}`,
     `会社: ${oneLine(j.company, 80)}${j.industry ? ` / 業種: ${oneLine(j.industry, 80)}` : ''}`,
@@ -301,8 +324,8 @@ function jobFull(j) {
     j.features.length ? `働き方: ${j.features.map((f) => FEATURES[f] || f).join('・')}` : '',
     j.overtime ? `残業: ${oneLine(j.overtime, 150)}` : '', j.holiday ? `休日: ${oneLine(j.holiday, 200)}` : '',
     `【応募条件・必須要件（全文）】\n${String(j.requirements || '記載なし').slice(0, 3500)}`,
-    `【仕事内容】\n${String(j.description || '記載なし').slice(0, 2800)}`,
-    j.benefits ? `【待遇・その他】${oneLine(j.benefits, 600)}` : '',
+    `【仕事内容】\n${String(j.description || '記載なし').slice(0, descChars)}`,
+    j.benefits ? `【待遇・その他】${oneLine(j.benefits, 400)}` : '',
   ]
   return L.filter(Boolean).join('\n')
 }
@@ -332,7 +355,7 @@ function contextBlock(ctx, { short }) {
   if (p?.mustHave?.length) L.push(`【要望上の必須】${p.mustHave.join(' / ')}`)
   if (p?.dealbreakers?.length) L.push(`【避けたい条件】${p.dealbreakers.join(' / ')}`)
   if (p?.angles?.length) L.push(`【探す切り口】${p.angles.map((a) => `${a.type}:${a.label}`).join(' / ')}`)
-  if (ctx.profileText) L.push(`【求職者の経歴】\n${short ? ctx.profileText.slice(0, 2200) : ctx.profileText}`)
+  if (ctx.profileText) L.push(`【求職者の経歴】\n${short ? (ctx.profileBrief || ctx.profileText.slice(0, 1200)) : ctx.profileText}`)
   else L.push('【求職者の経歴】書類なし（要望と確定条件だけで判断する）')
   return L.join('\n')
 }
@@ -410,34 +433,35 @@ export async function _screenForTest(env, db, criteria, profile, plan, ids, effo
 // 段階4: 精査（必須要件を1つずつ判定）
 // ------------------------------------------------------------
 const DEEP_SYSTEM = `あなたは人材紹介会社の熟練キャリアアドバイザーです。求職者に本当に推薦できる求人かを厳密に審査します。
-求人票の全文と求職者の経歴を突き合わせ、次を行ってください。
+求人票の全文と求職者の経歴を突き合わせ、次を判定してください（推薦文はこの段階では書かない）。
 
 1. 求人票から「必須要件」をすべて抜き出し、1つずつ判定する（must）
    - 必須要件 = 「必須」「要」「〜以上」「〜をお持ちの方」「経験者のみ」など応募に必要な条件。
-     経験年数・職種経験・資格・免許・スキル・語学・マネジメント経験・学歴など。
-   - 「歓迎」「尚可」「あれば」「優遇」は nice に入れる（必須ではない）。
+     経験年数・職種経験・資格・免許・スキル・語学・マネジメント経験・学歴・年齢・性別など。
+   - 「歓迎」「尚可」「あれば」「優遇」は必須ではないので must に入れない。
    - 「未経験歓迎」「学歴不問」など条件を緩める記載は要件ではない。
    - status:
-     met     … 経歴の事実から満たすと言える（evidence に根拠となる経歴を書く）
-     unmet   … 経歴の事実から満たさないと言える（例: 「営業経験3年以上」に対し営業1年）
-     unknown … 書類に情報がなく判断できない
+     met     … 経歴の事実・確定条件から満たすと言える（evidence に根拠）
+     unmet   … 経歴の事実・確定条件から満たさないと言える（例: 「営業経験3年以上」に対し営業1年）
+     unknown … 情報がなく判断できない
    - 経験年数は「職種別の経験年数」「職歴の期間」で照合する。似た職種は内容で判断する（例: ルート営業も法人営業経験に含みうる）。
-   - 書類がない場合、経歴に関わる要件は unknown にする。年齢・学歴・性別などは確定条件と照合する。
+   - 書類がない場合、経歴に関わる要件は unknown にする（要望欄の自己申告だけでは met にしない）。
    - 都合よく解釈しない。根拠のない met は禁止。
-2. 求職者の要望（重視点・避けたい条件・確定条件）にどれだけ合うかを評価する
-3. score（0〜100）: 必須要件を満たす前提で、要望・経歴とどれだけ合うか。
+   - req と evidence はそれぞれ30字以内で簡潔に。
+2. score（0〜100）: 必須要件を満たす前提で、要望（重視点・避けたい条件・確定条件）と経歴にどれだけ合うか。
    90以上=迷わず推薦 / 80台=強く推薦 / 70台=推薦できる / 60台=条件付き / 60未満=推薦しない
-4. angle: この求人の位置づけ（王道=経験そのまま / 発展=キャリアアップ / 意外=隣接領域で経験が活きる）
-5. reason: 求職者本人に提案する想定の丁寧な日本語（180〜240字）。なぜこの人に合うのかを、要望と経歴に具体的に結びつける。
-6. concerns: 懸念点（要望と合わない点・確認すべき点）。無ければ空配列。
-7. checkPoints: 応募前に担当者が求職者や企業に確認すべきこと（unknown の要件など）。
+3. angle: 王道=経験そのまま / 発展=キャリアアップ / 意外=隣接領域で経験が活きる
+4. fit: 要望との合致点と最大の懸念を40字以内で
 
 必ず次のJSONだけを返す:
-{"r":[{"i":0,
-  "must":[{"req":"要件（短く）","status":"met|unmet|unknown","evidence":"根拠（短く）"}],
-  "nice":[{"req":"...","status":"met|unmet|unknown"}],
-  "fit":"要望との合致（60字以内）","angle":"王道|発展|意外","score":82,
-  "reason":"...","concerns":["..."],"checkPoints":["..."]}]}`
+{"r":[{"i":0,"must":[{"req":"要件","status":"met|unmet|unknown","evidence":"根拠"}],"angle":"王道|発展|意外","score":82,"fit":"..."}]}`
+
+const WRITE_SYSTEM = `あなたは人材紹介会社の熟練キャリアアドバイザーです。審査済みの求人について、求職者に提案する文章を書きます。
+各求人について次を書いてください。
+- reason: 求職者本人に提案する想定の丁寧な日本語（180〜240字）。なぜこの人に合うのかを、要望と経歴に具体的に結びつける。必須要件の判定（○×？）と矛盾しないこと。
+- concerns: 懸念点（要望と合わない点など）。最大3つ、各40字以内。無ければ空配列。
+- checkPoints: 応募前に担当者が求職者や企業に確認すべきこと。「？」の必須要件を優先。最大3つ、各40字以内。
+必ず次のJSONだけを返す: {"r":[{"i":0,"reason":"...","concerns":["..."],"checkPoints":["..."]}]}`
 
 export function finalizeScore(r, { hasProfile, cfg }) {
   const must = Array.isArray(r.must) ? r.must : []
@@ -452,6 +476,7 @@ export function finalizeScore(r, { hasProfile, cfg }) {
   return { score, rawScore: raw, capped, eligibility, unmetCount: unmet.length, unknownCount: unknown.length }
 }
 
+const STATUS = ['met', 'unmet', 'unknown']
 async function deepJudge(env, ctx, jobs, onBatch) {
   const cfg = ctx.cfg
   const head = contextBlock(ctx, { short: false })
@@ -461,12 +486,12 @@ async function deepJudge(env, ctx, jobs, onBatch) {
   let done = 0
   await mapLimit(batches, Math.max(2, Math.ceil(cfg.concurrency / 2)), async (batch) => {
     if (ctx.isCancelled?.()) return
-    const body = batch.map((j, i) => `===== 求人[${i}] =====\n${jobFull(j)}`).join('\n\n')
+    const body = batch.map((j, i) => `===== 求人[${i}] =====\n${jobFull(j, cfg.descChars)}`).join('\n\n')
     let arr = []
     try {
       const { data, model } = await chatJson(env, {
-        models: ctx.models.deepList, system: DEEP_SYSTEM, effort: ctx.precision === 'top' ? 'high' : 'medium',
-        maxTokens: 4000 + 2200 * batch.length, usage: ctx.usage, label: '精査',
+        models: ctx.models.deepList, system: DEEP_SYSTEM, effort: ctx.precision === 'top' ? 'high' : cfg.judgeEffort,
+        maxTokens: 3000 + 1500 * batch.length, usage: ctx.usage, label: '精査', stage: '精査（判定）',
         user: `${head}\n\n${body}\n\n各求人[i]を審査してJSONで返してください。`,
       })
       arr = (Array.isArray(data.r) ? data.r : Array.isArray(data.results) ? data.results : []).map((x) => ({ ...x, _model: model }))
@@ -479,11 +504,9 @@ async function deepJudge(env, ctx, jobs, onBatch) {
       const fin = finalizeScore(r, { hasProfile: !!ctx.profileText, cfg })
       const item = {
         job: batch[i], ...fin,
-        must: (r.must || []).slice(0, 15).map((m) => ({ req: String(m.req || '').slice(0, 120), status: ['met', 'unmet', 'unknown'].includes(m.status) ? m.status : 'unknown', evidence: String(m.evidence || '').slice(0, 160) })),
-        nice: (r.nice || []).slice(0, 10).map((m) => ({ req: String(m.req || '').slice(0, 120), status: ['met', 'unmet', 'unknown'].includes(m.status) ? m.status : 'unknown' })),
+        must: (r.must || []).slice(0, 15).map((m) => ({ req: String(m.req || '').slice(0, 120), status: STATUS.includes(m.status) ? m.status : 'unknown', evidence: String(m.evidence || '').slice(0, 160) })),
         fit: String(r.fit || '').slice(0, 120), angle: ['王道', '発展', '意外'].includes(r.angle) ? r.angle : null,
-        reason: String(r.reason || '').slice(0, 400), concerns: (r.concerns || []).map(String).slice(0, 6), checkPoints: (r.checkPoints || []).map(String).slice(0, 6),
-        model: r._model,
+        reason: '', concerns: [], checkPoints: [], model: r._model,
       }
       results.push(item)
       ctx.onJudged?.(item)
@@ -492,6 +515,45 @@ async function deepJudge(env, ctx, jobs, onBatch) {
     onBatch?.(done, jobs.length)
   })
   return results
+}
+
+// 提案に残った求人だけ、推薦文・懸念・確認事項を書く（全件に書くと費用の大半を占めるため）
+function jobForWriting(j, r) {
+  const mark = { met: '○', unmet: '×', unknown: '？' }
+  return [
+    `タイトル: ${oneLine(j.title, 120)} / 会社: ${oneLine(j.company, 60)}`,
+    `勤務地: ${oneLine(j.locations_text, 100) || '不明'} / 年収: ${(j.salary_min || j.salary_max) ? `${man(j.salary_min)}〜${man(j.salary_max)}万円` : '不明'} / 雇用形態: ${j.employment || '不明'}`,
+    j.features.length ? `働き方: ${j.features.map((f) => FEATURES[f] || f).join('・')}` : '',
+    `必須要件の判定: ${r.must.map((m) => `${mark[m.status]}${m.req}（${m.evidence}）`).join(' / ') || 'なし'}`,
+    `審査メモ: ${r.fit} / 位置づけ: ${r.angle || '-'} / 点数: ${r.score}`,
+    `応募条件: ${oneLine(j.requirements, 900)}`,
+    `仕事内容: ${oneLine(j.description, 900)}`,
+  ].filter(Boolean).join('\n')
+}
+async function writeReasons(env, ctx, items) {
+  if (!items.length) return
+  const head = contextBlock(ctx, { short: true })
+  const batches = []
+  for (let i = 0; i < items.length; i += 5) batches.push(items.slice(i, i + 5))
+  await mapLimit(batches, Math.max(2, Math.ceil(ctx.cfg.concurrency / 2)), async (batch) => {
+    try {
+      const { data } = await chatJson(env, {
+        models: ctx.models.writeList || ctx.models.smartList, system: WRITE_SYSTEM, effort: 'low', maxTokens: 1500 + 700 * batch.length, usage: ctx.usage,
+        label: '推薦文', stage: '推薦文',
+        user: `${head}\n\n${batch.map((r, i) => `===== 求人[${i}] =====\n${jobForWriting(r.job, r)}`).join('\n\n')}\n\n各求人[i]の推薦文をJSONで返してください。`,
+      })
+      for (const x of Array.isArray(data.r) ? data.r : []) {
+        const r = batch[Number(x.i)]
+        if (!r) continue
+        r.reason = String(x.reason || '').slice(0, 400)
+        r.concerns = (x.concerns || []).map(String).slice(0, 3)
+        r.checkPoints = (x.checkPoints || []).map(String).slice(0, 3)
+      }
+    } catch (e) {
+      ctx.log?.(`推薦文の作成に一部失敗: ${e.message}`)
+    }
+    for (const r of batch) if (!r.reason) r.reason = r.fit
+  })
 }
 
 // 精査する求人を選ぶ
@@ -505,9 +567,15 @@ export function pickForDeep(ids, screen, score, angles, n, minScreen) {
   // 切り口ごとの枠（合計で全体の6割まで）。順番に1件ずつ取り、特定の切り口が枠を独占しないようにする
   const per = angles.length ? Math.max(1, Math.floor((n * 0.6) / angles.length)) : 0
   const lanes = angles.map((_, ai) => ok.filter((id) => main(id) === ai).slice(0, per))
-  for (let k = 0; k < per; k++) for (const l of lanes) if (l[k] != null && chosen.size < n) chosen.add(l[k])
+  // 各切り口の上位3件は、精査の1回目に必ず入るよう先頭に置く
+  const early = []
+  for (let k = 0; k < Math.min(per, 3); k++) for (const l of lanes) if (l[k] != null && !chosen.has(l[k]) && chosen.size < n) { chosen.add(l[k]); early.push(l[k]) }
+  for (let k = 3; k < per; k++) for (const l of lanes) if (l[k] != null && chosen.size < n) chosen.add(l[k])
   for (const id of ok) { if (chosen.size >= n) break; chosen.add(id) }
-  return [...chosen].sort(sortKey).slice(0, n)
+  const rest = [...chosen].filter((id) => !early.includes(id)).sort(sortKey)
+  // 先頭: 一次審査の上位を少し + 切り口ごとの代表 → そのあと点数順
+  const head = rest.slice(0, Math.max(0, Math.ceil(n / 4) - early.length))
+  return [...early, ...head, ...rest.slice(head.length)].slice(0, n)
 }
 
 // ------------------------------------------------------------
@@ -517,16 +585,18 @@ export function pickForDeep(ids, screen, score, angles, n, minScreen) {
 //   options : { profile, depth: standard|deep|all, precision: high|top, onProgress, onJudged, isCancelled, log }
 // ------------------------------------------------------------
 export async function runAiSearch(env, db, criteria, options = {}) {
-  const cfg = { ...engineConfig(env), ...(options.config || {}) }
+  const cfg = { ...engineConfig(env, options.costMode), ...(options.config || {}) }
   const m = aiModels(env)
   const precision = options.precision === 'top' ? 'top' : 'high'
   const ctx = {
     criteria, cfg, precision, usage: new Usage(), log: options.log, onJudged: options.onJudged, isCancelled: options.isCancelled,
     profileText: options.profileText || profileToText(options.profile),
+    profileBrief: options.profile ? profileBrief(options.profile) : null,
     models: {
       smartList: [m.smart, ...m.fallbackSmart],
       deepList: precision === 'top' ? [m.top, m.smart, ...m.fallbackSmart] : [m.smart, ...m.fallbackSmart],
       fastList: [m.fast, ...m.fallbackFast],
+      writeList: m.write ? [m.write, m.smart, ...m.fallbackSmart] : [m.smart, ...m.fallbackSmart],
     },
   }
   const t0 = Date.now()
@@ -566,12 +636,30 @@ export async function runAiSearch(env, db, criteria, options = {}) {
   const passed = [...screen.values()].filter((v) => v >= cfg.deepMinScreen).length
   progress('screen', `一次審査が終わりました（有望 ${passed.toLocaleString()}件）`, { screened: screen.size, passed })
 
-  // 段階4
-  const deepN = Math.min(cfg.deepMax, Math.max(topN * 4, 40))
-  const deepIds = directDeep ? screenIds : pickForDeep([...screen.keys()], screen, score, ctx.plan.angles, deepN, cfg.deepMinScreen)
-  progress('deep', `有望な ${deepIds.length}件の求人票を全文で精査しています…`, { deepSize: deepIds.length })
-  const deepJobs = loadJobs(db, deepIds, { full: true })
-  const judged = await deepJudge(env, ctx, deepJobs, (d, n) => progress('deep', `精査中… ${d} / ${n}件`, { judged: d }))
+  // 段階4: 精査（判定）。いっぺんに全部ではなく、有望な順に少しずつ進め、
+  //   「十分に良い求人」が提案件数より少し多く集まったら打ち切る（費用の大半はここ）
+  const deepN = directDeep ? screenIds.length : Math.min(cfg.deepMax, Math.ceil(topN * cfg.deepMaxFactor))
+  const order = directDeep ? screenIds : pickForDeep([...screen.keys()], screen, score, ctx.plan.angles, deepN, cfg.deepMinScreen)
+  const target = topN + Math.ceil(topN * 0.25)
+  const firstN = directDeep ? order.length : Math.min(order.length, Math.max(cfg.deepBatch * 4, Math.ceil(topN * cfg.deepFirst)))
+  progress('deep', `有望な求人の求人票を全文で精査しています（最大 ${order.length}件。十分な候補が集まり次第終了）…`, { deepSize: order.length })
+  const judged = []
+  let stopReason = null
+  for (let pos = 0; pos < order.length;) {
+    if (ctx.isCancelled?.()) { stopReason = 'cancelled'; break }
+    const size = pos === 0 ? firstN : Math.max(cfg.deepBatch * 2, Math.ceil(topN / 2))
+    const wave = loadJobs(db, order.slice(pos, pos + size), { full: true })
+    pos += size
+    const r = await deepJudge(env, ctx, wave, () => {})
+    judged.push(...r)
+    const good = new Set(judged.filter((x) => x.eligibility !== 'unmet' && x.score >= cfg.goodScore).map((x) => dupKey(x.job) || x.job.id)).size
+    progress('deep', `精査中… ${judged.length} / ${order.length}件（十分に良い候補 ${good}件）`, { judged: judged.length, good })
+    if (!directDeep && good >= target) { stopReason = 'enough'; break }
+    const usd = ctx.usage.usd
+    if (cfg.maxUsd != null && usd != null && usd >= cfg.maxUsd * 0.85) { stopReason = 'budget'; break }
+  }
+  if (stopReason === 'enough') progress('deep', `十分な候補が集まったため精査を終了しました（${judged.length}件を精査）`)
+  if (stopReason === 'budget') progress('deep', `費用の上限（$${cfg.maxUsd}）に近づいたため精査を終了しました（${judged.length}件を精査）`)
 
   // 仕上げ: 点数順。必須要件を満たさない求人は「参考」に回す
   for (const r of judged) {
@@ -599,10 +687,13 @@ export async function runAiSearch(env, db, criteria, options = {}) {
   for (let k = 0; k < want; k++) recommended.splice(recommended.length - 1 - k, 1, others[k])
   recommended.sort((a, b) => b.score - a.score)
   const reference = uniq.filter((r) => r.eligibility === 'unmet' && r.rawScore >= 75).slice(0, 10)
+  for (const r of [...uniq]) if (!recommended.includes(r)) r.reason = r.reason || r.fit
+  progress('write', `提案する ${recommended.length}件の推薦文を書いています…`)
+  await writeReasons(env, ctx, recommended)
 
   const summary = {
     elapsedSec: Math.round((Date.now() - t0) / 1000), poolSize: pool.ids.length, screened: screen.size, judged: judged.length,
-    recommended: recommended.length, usage: ctx.usage.summary(), depth, precision, cancelled: !!ctx.isCancelled?.(),
+    recommended: recommended.length, usage: ctx.usage.summary(), depth, precision, costMode: cfg.costMode, stopReason, cancelled: !!ctx.isCancelled?.(),
   }
   progress('done', `完了: ${recommended.length}件を提案`, summary)
   // 振り返り用: 一次審査の点数（職種別の分布を見て、取りこぼしを確認できるように）

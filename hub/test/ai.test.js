@@ -96,10 +96,15 @@ test('AI検索の全体: 理解→絞込→一次審査→精査、満たさな�
       angles: [{ type: '王道', label: '法人営業', why: '経験', keywords: ['法人営業', '提案営業'] }, { type: '意外', label: 'CS', why: '隣接', keywords: ['カスタマーサクセス'] }] }
     if (sys.includes('ふるい分け')) {
       const n = (j.messages[1].content.match(/^\[\d+\]/gm) || []).length
-      return { s: Array.from({ length: n }, (_, i) => [i, 80]) }
+      return { s: Array.from({ length: n }, (_, i) => [i, 4, 1, 1]) }
+    }
+    const u = j.messages[1].content
+    // 推薦文（提案に残った求人だけ）
+    if (sys.includes('提案する文章')) {
+      const n = (u.match(/===== 求人\[\d+\] =====/g) || []).length
+      return { r: Array.from({ length: n }, (_, i) => ({ i, reason: `推薦文${i}`, concerns: [], checkPoints: ['確認'] })) }
     }
     // 精査: 求人票の内容で判定を変える
-    const u = j.messages[1].content
     const blocks = u.split(/===== 求人\[(\d+)\] =====/).slice(1)
     const r = []
     for (let k = 0; k < blocks.length; k += 2) {
@@ -115,7 +120,7 @@ test('AI検索の全体: 理解→絞込→一次審査→精査、満たさな�
     profile: { summary: '法人営業5年', jobTypeYears: { 法人営業: 5 } }, onProgress: (p) => stages.push(p.stage),
   })
   assert.equal(res.pool.size, 4) // 派遣を除く
-  assert.deepEqual([...new Set(stages)], ['plan', 'pool', 'screen', 'deep', 'done'])
+  assert.deepEqual([...new Set(stages)], ['plan', 'pool', 'screen', 'deep', 'write', 'done'])
   const titles = res.recommended.map((r) => r.job.title)
   assert.equal(titles[0], '法人営業（IT商材）')
   assert.ok(!titles.includes('営業マネージャー'))                       // 必須要件を満たさない
@@ -125,6 +130,9 @@ test('AI検索の全体: 理解→絞込→一次審査→精査、満たさな�
   const models = f.calls.map((c) => c.model)
   assert.ok(models.includes('m-fast') && models.includes('m-smart'))
   assert.ok(res.summary.usage.tokens > 0)
+  assert.ok(res.recommended.every((r) => r.reason.startsWith('推薦文')))           // 推薦文は提案に残った求人だけ
+  assert.ok(!f.calls.some((c) => c.messages[0].content.includes('提案する文章') && c.messages[1].content.includes('マネジメント経験5年以上')))
+  assert.ok(res.summary.usage.byStage['一次審査'] && res.summary.usage.byStage['精査（判定）'] && res.summary.usage.byStage['推薦文'])
   f.server.close()
 })
 
