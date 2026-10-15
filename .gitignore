@@ -35,3 +35,4 @@ lerna-debug.log*
 # Worker investigation/probe scripts (temporary)
 worker/probe_*.js
 worker/inspect.js
+hub/data/

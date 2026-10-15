@@ -144,3 +144,57 @@ node --no-warnings bin/status.js
 - 同期中に既存アプリでAI検索が実行中なら、終わるまで待つ（最大30分。circus/ヒトリンクの同時ログイン競合を避けるため）
 - 二重起動は `hub/data/sync.lock` で防止
 - ヒトリンクは既存 worker と同じアカウントでログインする。深夜2〜5時はAI検索を使わない運用とする
+
+## AI検索エンジン（新方式・評価中）
+
+求人DB（このハブ）の全求人を母集団として、AIが求職者に合う求人を探す。媒体には直接ログインしない。
+**今は評価用のコマンドだけで、画面・稼働中のAI検索には組み込んでいない**（Phase 2〜3 で組み込む）。
+
+### 仕組み（4段階）
+| 段階 | 内容 | モデル |
+|---|---|---|
+| 1. 理解 | 要望と書類の経歴から「探し方の切り口」（王道・発展・意外）とキーワードを作る | 優秀（`HUB_AI_MODEL_SMART`） |
+| 2. 絞込 | 確定条件（勤務地・年齢・年収・雇用形態・働き方・学歴・性別・紹介済み除外）で全求人から母集団を作り、切り口のキーワードで関連の強い順に並べる | なし（DB検索・数秒） |
+| 3. 一次審査 | 関連の強い順に 2,000件（徹底: 8,000件 / 全件）を、安いモデルで「要望の中心に沿うか・必須要件を満たしそうか」まで素早く審査 | 高速（`HUB_AI_MODEL_FAST`） |
+| 4. 精査 | 有望な上位（最大120件）の求人票を**全文**で読み、必須要件を1つずつ ○（満たす）×（満たさない）？（不明）で判定 | 優秀（最高精度を選ぶと `HUB_AI_MODEL_TOP`） |
+
+**85点問題の対策**: 点数はAIの採点をそのまま使わず、必須要件の判定で上限をかける。
+- 必須要件に × が1つでもあれば **55点まで**（提案から外し、「参考」に回す）
+- 書類があるのに ？ が残る場合は **84点まで**（応募前に確認すべき点として表示）
+- 学歴・性別の条件は AI に任せず、プログラムで確実に除外する
+
+### 評価のしかた（VPS）
+```bash
+cd /home/ubuntu/webapp/hub
+# まずAIを使わずに母集団の件数だけ確認
+node --no-warnings bin/ai-search.js --text="要望" --locations=東京都 --age=30 --dry
+# 本番
+node --no-warnings bin/ai-search.js \
+  --text="顧客を長く支援する仕事がしたい。転勤は避けたい" \
+  --doc=cv:/home/ubuntu/test/職務経歴書.pdf --doc=resume:/home/ubuntu/test/履歴書.pdf --names="山田 太郎" \
+  --locations=東京都,神奈川県 --age=31 --education=大卒 --salaryMin=500 --top=20
+```
+| オプション | 内容 |
+|---|---|
+| `--doc=種類:パス` | 書類（PDF）。種類は `resume`（履歴書）/ `cv`（職務経歴書）/ `other`。複数指定可 |
+| `--names=` | 求職者の氏名（書類の本文から伏せるため。AIには送らない） |
+| `--features=remote,flex` | 働き方（すべて満たす） |
+| `--category=` `--employment=` `--source=` | 職種・雇用形態・媒体（カンマで複数） |
+| `--exclude=circus:1,jobins:2` | 除外する求人（紹介済みなど） |
+| `--jobs=circus:1,...` | この求人だけを審査（手動検索で選んだ求人をAIにかける想定。120件以内なら一次審査を飛ばして全件精査） |
+| `--depth=standard / deep / all` | 一次審査の件数（2,000 / 8,000 / 全件） |
+| `--precision=top` | 精査を最高精度モデルで行う |
+
+結果は画面に表示し、`hub/data/ai-results/` にJSONで保存する（必須要件の判定・懸念点・確認事項・一次審査の点数をすべて含む）。
+
+### モデルの設定（`hub/.env`。未設定なら既定値）
+```
+HUB_AI_MODEL_SMART=gpt-6.1-sol      # 理解・書類の読み取り・精査
+HUB_AI_MODEL_TOP=gpt-6-astra        # 「最高精度」の精査
+HUB_AI_MODEL_FAST=gpt-6-luna        # 一次審査
+HUB_AI_FALLBACK_MODELS=gpt-5.5,gpt-5.2,gpt-5   # 上が使えないときに順に試す
+HUB_AI_FALLBACK_FAST_MODELS=gpt-5-mini,gpt-5-nano
+# APIキーは worker/.env の OPENAI_API_KEY を使う（別にしたい場合は HUB_AI_API_KEY / HUB_AI_BASE_URL）
+```
+使えないモデル（契約・提供状況）は自動で次の候補に切り替わり、ログに表示される。
+件数や点数の上限は `HUB_AI_SCREEN_STANDARD` `HUB_AI_DEEP_MAX` `HUB_AI_CAP_UNMET` などで調整できる（`lib/ai/engine.js` の `engineConfig`）。
