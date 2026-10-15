@@ -72,3 +72,19 @@ test('既存の求人へのタグ付け直し', () => {
   const r = backfillFeatures(db)
   assert.equal(r.total, 3); assert.equal(r.counts.remote, 1); assert.equal(r.counts.flex, 1)
 })
+
+test('ジョビンズの求人URLは詳細ページ（古いデータも元データから作り直す）', async () => {
+  const { jobUrl } = await import('../lib/search.js')
+  const enc = 'eyJpdiI6IjFM+/='
+  assert.equal(jobUrl('jobins', 'https://jobins.jp/agent/job/search_1#/', JSON.stringify({ encrypted_vacancy_no: enc })),
+    `https://jobins.jp/agent/job/detail/${encodeURIComponent(enc)}?activeTab=job-description`)
+  assert.equal(jobUrl('jobins', 'https://jobins.jp/agent/job/search_1#/', '{}'), 'https://jobins.jp/agent/job/search_1#/')
+  assert.equal(jobUrl('circus', 'https://x', null), 'https://x')
+  const db = openDb(':memory:')
+  const s = new SyncSession(db, { source: 'jobins', runId: 1, cfg: { closeAfterMisses: 1, maxCloseRatio: 1 } })
+  s.ingest([{ mapped: { sourceJobId: 'u1', title: 't', url: 'https://jobins.jp/agent/job/search_1#/' }, raw: { encrypted_vacancy_no: enc } }])
+  s.finalize({ complete: true, remoteTotal: 1 })
+  const r = handleApiV1(db, '/api/v1/jobs', new URLSearchParams(''))
+  assert.match(r.body.data[0].url, /\/agent\/job\/detail\//)
+  assert.match(handleApiV1(db, '/api/v1/jobs/jobins:u1', new URLSearchParams('')).body.data.url, /\/agent\/job\/detail\//)
+})

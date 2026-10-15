@@ -61,6 +61,8 @@ async function main() {
   log(`確定条件: ${JSON.stringify(criteriaToQuery(criteria))}`)
   log(`母集団: ${pool.ids.length.toLocaleString()}件（学歴で除外 ${pool.excluded.education} / 性別で除外 ${pool.excluded.gender}）`)
   if (opt.dry) return
+  const missing = docs.filter((d) => !fs.existsSync(d.file))
+  if (missing.length) throw new Error(`書類が見つかりません: ${missing.map((d) => path.resolve(d.file)).join(', ')}（--doc=cv:/home/ubuntu/書類/職務経歴書.pdf のように、場所を含めて指定してください）`)
 
   // 書類の読み取り
   let profile = null

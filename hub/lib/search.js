@@ -87,6 +87,16 @@ export function poolIds(db, q = {}) {
   return db.prepare(`SELECT j.id FROM jobs j WHERE ${w} ORDER BY j.id`).all(...args).map((r) => r.id)
 }
 
+// 求人ページのURL（ジョビンズは同期前の古いデータだと検索画面のURLが入っているので、元データの暗号化番号から作り直す）
+export function jobUrl(source, url, rawJsonOrObj) {
+  if (source !== 'jobins' || (url && url.includes('/job/detail/'))) return url || null
+  let raw = rawJsonOrObj
+  if (typeof raw === 'string') { try { raw = JSON.parse(raw) } catch { raw = null } }
+  const enc = raw && raw.encrypted_vacancy_no
+  return enc ? `https://jobins.jp/agent/job/detail/${encodeURIComponent(enc)}?activeTab=job-description` : (url || null)
+}
+const ENC_NO = `CASE WHEN j.source='jobins' AND (j.url IS NULL OR j.url NOT LIKE '%/job/detail/%') THEN (SELECT json_extract(r.raw_json,'$.encrypted_vacancy_no') FROM job_raw r WHERE r.job_id=j.id) END AS enc_no`
+
 // 表示用の求人番号（ジョビンズは画面に出る「求人ID」、それ以外は媒体の求人ID）
 const REF_NO = `CASE WHEN j.source='jobins' THEN COALESCE((SELECT json_extract(r.raw_json,'$.vacancy_no') FROM job_raw r WHERE r.job_id=j.id), j.source_job_id) ELSE j.source_job_id END AS ref_no`
 
@@ -112,9 +122,12 @@ export function searchJobs(db, q = {}) {
     if (countCache.size > 2000) countCache.clear()
     countCache.set(key, total)
   }
-  const rows = db.prepare(`SELECT j.*, ${REF_NO}, (SELECT group_concat(feature) FROM job_features f WHERE f.job_id=j.id) AS features_csv
+  const rows = db.prepare(`SELECT j.*, ${REF_NO}, ${ENC_NO}, (SELECT group_concat(feature) FROM job_features f WHERE f.job_id=j.id) AS features_csv
                            FROM ${from} WHERE ${w} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...args, limit, offset)
-  for (const r of rows) { r.features = r.features_csv ? r.features_csv.split(',') : []; delete r.features_csv }
+  for (const r of rows) {
+    r.features = r.features_csv ? r.features_csv.split(',') : []; delete r.features_csv
+    if (r.enc_no) r.url = jobUrl('jobins', r.url, { encrypted_vacancy_no: r.enc_no }); delete r.enc_no
+  }
   return { total, limit, offset, jobs: rows }
 }
 
@@ -131,6 +144,7 @@ export function getJob(db, id) {
   const parse = (s) => { try { return s ? JSON.parse(s) : null } catch { return null } }
   return {
     ...j,
+    url: jobUrl(j.source, j.url, r.raw_json),
     job_categories: parse(j.job_categories_json) || [], industries: parse(j.industries_json) || [],
     experience: parse(j.experience_json) || [], positions: parse(j.positions_json) || [],
     prefectures: prefs, features, ...t,

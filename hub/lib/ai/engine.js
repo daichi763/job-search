@@ -12,7 +12,7 @@
 //
 //   AIの点数をそのまま使わず、必須要件の判定結果から最終点をプログラムで決める。
 // ============================================================
-import { buildWhere } from '../search.js'
+import { buildWhere, jobUrl } from '../search.js'
 import { toMatchQuery } from '../text.js'
 import { FEATURES } from '../features.js'
 import { chatJson, mapLimit, Usage, aiModels } from './llm.js'
@@ -267,12 +267,16 @@ function loadJobs(db, ids, { full }) {
     const part = ids.slice(i, i + 500)
     const rows = db.prepare(`SELECT j.*, t.description, t.requirements, t.benefits,
         (SELECT group_concat(feature) FROM job_features f WHERE f.job_id=j.id) AS features_csv,
-        CASE WHEN j.source='jobins' THEN (SELECT json_extract(r.raw_json,'$.vacancy_no') FROM job_raw r WHERE r.job_id=j.id) END AS vacancy_no
+        CASE WHEN j.source='jobins' THEN (SELECT json_extract(r.raw_json,'$.vacancy_no') FROM job_raw r WHERE r.job_id=j.id) END AS vacancy_no,
+        CASE WHEN j.source='jobins' THEN (SELECT json_extract(r.raw_json,'$.encrypted_vacancy_no') FROM job_raw r WHERE r.job_id=j.id) END AS enc_no
       FROM jobs j LEFT JOIN job_texts t ON t.job_id=j.id WHERE j.id IN (${part.map(() => '?').join(',')})`).all(...part)
     const byId = new Map(rows.map((r) => [r.id, r]))
     for (const id of part) if (byId.has(id)) out.push(byId.get(id))
   }
-  for (const r of out) r.features = r.features_csv ? r.features_csv.split(',') : []
+  for (const r of out) {
+    r.features = r.features_csv ? r.features_csv.split(',') : []
+    if (r.enc_no) r.url = jobUrl('jobins', r.url, { encrypted_vacancy_no: r.enc_no })
+  }
   return out
 }
 const oneLine = (s, n) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n)

@@ -14,7 +14,7 @@
 //   GET /api/v1/facets            絞り込みの選択肢（職種・雇用形態・働き方の特徴）
 //   GET /api/v1/jobs.csv          検索結果のCSVダウンロード（Excelで開ける）
 // ============================================================
-import { searchJobs } from './search.js'
+import { searchJobs, jobUrl } from './search.js'
 import { FEATURES } from './features.js'
 
 export const SOURCES = ['circus', 'hitolink', 'jobins', 'kintone']
@@ -88,7 +88,9 @@ export function jobSummary(j) {
 function getByKey(db, key) {
   const m = String(key).match(/^([a-z]+):(.+)$/)
   if (!m || !SOURCES.includes(m[1])) return null
-  return db.prepare(`SELECT * FROM jobs WHERE source=? AND source_job_id=?`).get(m[1], m[2])
+  const j = db.prepare(`SELECT * FROM jobs WHERE source=? AND source_job_id=?`).get(m[1], m[2])
+  if (j && j.source === 'jobins') j.url = jobUrl(j.source, j.url, db.prepare(`SELECT raw_json FROM job_raw WHERE job_id=?`).get(j.id)?.raw_json)
+  return j
 }
 
 export function jobDetail(db, j, { includeRaw = false } = {}) {

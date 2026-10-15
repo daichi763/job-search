@@ -1972,7 +1972,11 @@ export const jobinsAdapter = {
       reward,
       requirements: raw.application_condition || '',
       description: raw.job_description || '',
-      url: `${this.base}/agent/job/search_1#/`,
+      // 求人ごとの詳細ページ。一覧APIの encrypted_vacancy_no（サーバーが暗号化した求人番号）を使う。
+      //   無い場合だけ検索画面に飛ばす（旧動作）
+      url: raw.encrypted_vacancy_no
+        ? `${this.base}/agent/job/detail/${encodeURIComponent(raw.encrypted_vacancy_no)}?activeTab=job-description`
+        : `${this.base}/agent/job/search_1#/`,
       isOpen: true, // 検索結果に出る=公開中
       publishStartedAt: iso(raw.created_at && raw.created_at.raw),
       lastUpdatedAt: iso(raw.updated_at && raw.updated_at.raw),
