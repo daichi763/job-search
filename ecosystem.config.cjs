@@ -8,6 +8,7 @@
 // __dirname を基準にした絶対パスを使うので、どこから pm2 start しても正しく動く。
 const path = require('path')
 const WORKER_CWD = path.join(__dirname, 'worker')
+const HUB_CWD = path.join(__dirname, 'hub')
 
 module.exports = {
   apps: [
@@ -31,6 +32,23 @@ module.exports = {
       instances: 1,
       exec_mode: 'fork',
       // クラッシュ時の無限再起動暴走を防ぐ（10秒以内に15回落ちたら停止）
+      min_uptime: 10000,
+      max_restarts: 15,
+      restart_delay: 5000,
+    },
+    {
+      // 求人データハブの検索サーバー（127.0.0.1:3100 のサーバー内部専用・DBは読み取り専用）
+      // 画面は webapp の /manual から表示する（webapp が中継）。Node.js 22 以上が必要
+      name: 'hub-api',
+      script: 'bin/server.js',
+      cwd: HUB_CWD,
+      interpreter: 'node',
+      interpreter_args: '--no-warnings',
+      env: { NODE_ENV: 'production' },
+      watch: false,
+      instances: 1,
+      exec_mode: 'fork',
+      max_memory_restart: '1G',
       min_uptime: 10000,
       max_restarts: 15,
       restart_delay: 5000,

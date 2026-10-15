@@ -1121,8 +1121,51 @@ app.get('/', (c) => {
   return c.html(renderPage())
 })
 
-// 手動検索モードページ
-app.get('/manual', (c) => {
+// ---------------------------------------------------------
+// 手動検索モード（新）: 求人データハブ（hub/）の検索画面を表示する
+//   hub の検索サーバー（PM2: hub-api、127.0.0.1:3100 のサーバー内部専用）へ中継する。
+//   旧画面は /manual-old に残している（切り戻し用）。
+//   中継先は .dev.vars の HUB_API_URL で変更可（既定 http://127.0.0.1:3100）
+// ---------------------------------------------------------
+const hubBase = (c: any) => ((c.env as any).HUB_API_URL || 'http://127.0.0.1:3100').replace(/\/$/, '')
+const hubDown = (c: any, e: any) =>
+  c.html(`<!DOCTYPE html><meta charset="utf-8"><title>手動検索</title>
+    <body style="font-family:sans-serif;padding:2rem;line-height:1.8">
+    <h1>手動検索の検索サーバーに接続できません</h1>
+    <p>VPSで <code>pm2 list</code> を実行し、<b>hub-api</b> が online か確認してください。</p>
+    <p>停止している場合: <code>pm2 start ecosystem.config.cjs --only hub-api</code></p>
+    <p><a href="/">← AI検索に戻る</a>　<a href="/manual-old">旧・手動検索</a></p>
+    <p style="color:#888;font-size:12px">${String(e && e.message || e).replace(/[<>&]/g, '')}</p></body>`, 502)
+
+app.get('/manual', async (c) => {
+  try {
+    const r = await fetch(`${hubBase(c)}/`, { signal: AbortSignal.timeout(5000) })
+    if (!r.ok) throw new Error(`hub-api ${r.status}`)
+    const html = (await r.text()).replace('<meta name="api-base" content="">', '<meta name="api-base" content="/hub-api">')
+    return c.html(html)
+  } catch (e) {
+    return hubDown(c, e)
+  }
+})
+
+// hub の読み取り用API への中継（GET のみ・決まったパスのみ）
+app.get('/hub-api/api/*', async (c) => {
+  const url = new URL(c.req.url)
+  const path = url.pathname.replace(/^\/hub-api/, '')
+  if (!/^\/api\/(overview|jobs(\/\d+)?)$/.test(path)) return c.json({ error: 'not_found' }, 404)
+  try {
+    const r = await fetch(`${hubBase(c)}${path}${url.search}`, { signal: AbortSignal.timeout(15000) })
+    return new Response(r.body, {
+      status: r.status,
+      headers: { 'Content-Type': r.headers.get('Content-Type') || 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+    })
+  } catch (e: any) {
+    return c.json({ error: 'hub_unavailable', message: String(e?.message || e) }, 502)
+  }
+})
+
+// 旧・手動検索モード（切り戻し用に残す。新画面が安定したら削除）
+app.get('/manual-old', (c) => {
   return c.html(renderManualPage())
 })
 

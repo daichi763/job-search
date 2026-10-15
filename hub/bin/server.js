@@ -2,12 +2,10 @@
 // ============================================================
 // 求人データハブの閲覧画面＋読み取り用API（DBは読み取り専用で開く）
 //
-//   node --no-warnings bin/server.js
-//   → http://<VPS>:3100/  （ポートは HUB_PORT で変更）
-//
-//   ・既存アプリ（webapp: 3000番）とは別のプロセス・別のポート。既存アプリには触れない
-//   ・ログイン必須（ベーシック認証）。ID/パスワードは hub/.env の HUB_VIEWER_USER / HUB_VIEWER_PASSWORD
-//     パスワード未設定のときは起動しない（求人データ・成果報酬を誤って公開しないため）
+//   node --no-warnings bin/server.js   （PM2 では ecosystem.config.cjs の hub-api）
+//   ・既定は 127.0.0.1（サーバー内部専用）で起動し、既存アプリ（3000番）の /manual・/hub-api から中継して使う
+//   ・外部に直接公開する場合（HUB_HOST=0.0.0.0）はベーシック認証が必須
+//     ID/パスワードは hub/.env の HUB_VIEWER_USER / HUB_VIEWER_PASSWORD
 //   ・同期中も見られる（DBは同期中も読み取りできる形式で動いている）
 //
 //   API（段階3の検索APIの土台。今は画面から使うだけ）
@@ -26,13 +24,17 @@ import { searchJobs, getJob, getOverview } from '../lib/search.js'
 const env = loadEnv()
 const cfg = config()
 const PORT = parseInt(env.HUB_PORT || '3100', 10)
-const HOST = env.HUB_HOST || '0.0.0.0'
+// 既定は「このサーバー内からだけ接続できる」127.0.0.1。外からは既存アプリ（3000番）経由で使う。
+const HOST = env.HUB_HOST || '127.0.0.1'
+const LOOPBACK = ['127.0.0.1', 'localhost', '::1'].includes(HOST)
 const USER = env.HUB_VIEWER_USER || 'admin'
 const PASS = env.HUB_VIEWER_PASSWORD || ''
-if (!PASS || PASS.length < 8) {
-  console.error('hub/.env に HUB_VIEWER_PASSWORD（8文字以上）を設定してください。未設定では起動しません。')
+// 外部に直接公開する設定（HUB_HOST=0.0.0.0 など）のときはパスワード必須
+if (!LOOPBACK && (!PASS || PASS.length < 8)) {
+  console.error('HUB_HOST を外部公開にする場合は hub/.env に HUB_VIEWER_PASSWORD（8文字以上）を設定してください。')
   process.exit(1)
 }
+const AUTH_REQUIRED = !!PASS
 if (!fs.existsSync(cfg.dbPath)) {
   console.error(`DBがありません: ${cfg.dbPath}`)
   process.exit(1)
@@ -71,7 +73,7 @@ const server = http.createServer((req, res) => {
   const ip = req.socket.remoteAddress
   if (blocked(ip)) return send(res, 429, { error: 'too_many_attempts' })
   if (req.url === '/favicon.ico') { res.writeHead(204); return res.end() }
-  if (!authorized(req)) {
+  if (AUTH_REQUIRED && !authorized(req)) {
     if (req.headers.authorization) {
       const f = fails.get(ip) || { n: 0, t: 0 }
       fails.set(ip, { n: f.n + 1, t: Date.now() })
@@ -107,5 +109,5 @@ const server = http.createServer((req, res) => {
   }
 })
 
-server.listen(PORT, HOST, () => console.log(`求人データハブ 閲覧画面: http://${HOST}:${PORT}/  (ユーザー: ${USER})`))
+server.listen(PORT, HOST, () => console.log(`求人データハブ 検索サーバー: http://${HOST}:${PORT}/  ${LOOPBACK ? '（サーバー内部専用）' : '（外部公開）'} 認証=${AUTH_REQUIRED ? 'あり' : 'なし'}`))
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { server.close(); try { db.close() } catch {}; process.exit(0) })

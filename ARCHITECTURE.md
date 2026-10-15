@@ -19,7 +19,10 @@
 | 0 | `webapp` | `wrangler pages dev dist --d1=webapp-production --local --port 3000` | フロント＋API（Hono）。`--local` なので **D1はローカルSQLite**（`.wrangler/state/v3/d1`）。クラウドのD1ではない |
 | 1 | `worker` | `node index.js`（cwd=`worker/`） | circus等をPlaywrightでスクレイピングし ingest API 経由で払い出す外部ワーカー |
 
+| 2 | `hub-api` | `node bin/server.js`（cwd=`hub/`） | 求人データハブの検索サーバー（127.0.0.1:3100 内部専用・読み取り専用）。webapp の `/manual` が中継 |
+
 - 両者は `APP_URL=http://localhost:3000` で連携。
+- 求人データハブ（`hub/`）: 全媒体の求人を `hub/data/jobs_hub.sqlite` に保持し、cron（毎日 2:00 `hub/bin/nightly.sh`）で差分同期。詳細は `hub/README.md`。
 - `wrangler pages dev` は **単にHonoアプリをローカルで動かすためのランナー**。デプロイ先はVPSであってCloudflareではない。
 
 ## 環境変数の置き場所（混同注意）

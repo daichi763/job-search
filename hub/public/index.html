@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="robots" content="noindex, nofollow">
 <link rel="icon" href="data:,">
-<title>求人データハブ</title>
+<meta name="api-base" content="">
+<title>手動検索｜求人横断検索AI</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   .clamp2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden }
@@ -15,7 +16,8 @@
 <body class="bg-slate-50 text-slate-800">
 <header class="bg-white border-b sticky top-0 z-10">
   <div class="max-w-7xl mx-auto px-4 py-3 flex flex-wrap items-center gap-4">
-    <h1 class="text-lg font-bold">求人データハブ <span class="text-xs font-normal text-slate-500">（閲覧専用）</span></h1>
+    <a id="back-link" href="/" class="hidden text-sm text-blue-600 hover:underline">← AI検索に戻る</a>
+    <h1 class="text-lg font-bold">手動検索 <span class="text-xs font-normal text-slate-500">（全媒体の求人DB・毎晩更新）</span></h1>
     <div id="source-summary" class="flex flex-wrap gap-2 text-sm"></div>
   </div>
 </header>
@@ -104,8 +106,11 @@ const reward = (j) => j.reward_type === 'rate' && j.reward_rate != null ? `報�
 const jst = (iso) => (iso ? new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) : '-')
 const badge = (s) => `<span class="text-xs px-2 py-0.5 rounded-full ${COLOR[s] || 'bg-slate-100'}">${esc(LABEL[s] || s)}</span>`
 
+// 既存アプリ経由で表示している時は "/hub-api"、単体で動かしている時は ""（同じサーバー）
+const API_BASE = document.querySelector('meta[name="api-base"]').content || ''
+if (API_BASE) document.getElementById('back-link').classList.remove('hidden')
 async function api(path) {
-  const r = await fetch(path, { credentials: 'same-origin' })
+  const r = await fetch(API_BASE + path, { credentials: 'same-origin' })
   if (!r.ok) throw new Error(`${r.status}`)
   return r.json()
 }
