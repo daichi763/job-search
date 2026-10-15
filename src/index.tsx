@@ -7,12 +7,106 @@ import type { SearchCriteria, SourceId } from './lib/types'
 import { SOURCE_LABELS } from './lib/types'
 import { renderPage } from './ui'
 import { renderManualPage } from './ui_manual'
+import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
+import {
+  SESSION_COOKIE, SESSION_DAYS, login, logout, userFromToken, listUsers, createUser, updateUser, deleteUser, changeOwnPassword,
+  type User,
+} from './lib/auth'
+import { renderLoginPage, renderUsersPage, renderAccountPage, userBadge } from './ui_auth'
 
 type Bindings = Env
 
-const app = new Hono<{ Bindings: Bindings }>()
+const app = new Hono<{ Bindings: Bindings; Variables: { user: User | null } }>()
 
 app.use('/api/*', cors())
+
+// ---------------------------------------------------------
+// ログイン制
+//   ・画面と API はログインした担当者だけが使える（未ログインは画面→/login、API→401）
+//   ・サーバー同士の呼び出し（worker・cron）は X-Ingest-Token（.dev.vars の INGEST_TOKEN）で通す
+//   ・別アプリ向けの検索API（/api/v1/*）は hub 側の APIキーで守るので対象外
+// ---------------------------------------------------------
+const PUBLIC_PATHS = new Set(['/login', '/api/auth/login', '/favicon.ico', '/favicon.svg'])
+const isSecure = (c: any) => new URL(c.req.url).protocol === 'https:' || (c.req.header('x-forwarded-proto') || '').includes('https')
+app.use('*', async (c, next) => {
+  const path = new URL(c.req.url).pathname
+  c.set('user', null)
+  if (PUBLIC_PATHS.has(path) || path.startsWith('/static/') || path.startsWith('/api/v1/')) return next()
+  const token = c.req.header('x-ingest-token') || c.req.query('token')
+  const ingest = (c.env as any).INGEST_TOKEN
+  if (ingest && token === ingest) return next()
+  const user = await userFromToken(c.env.DB, getCookie(c, SESSION_COOKIE)).catch(() => null)
+  if (!user) {
+    if (path.startsWith('/api/') || path.startsWith('/hub-api/')) return c.json({ error: 'login_required', message: 'ログインしてください' }, 401)
+    const nextPath = path + new URL(c.req.url).search
+    return c.redirect(`/login${nextPath && nextPath !== '/' ? `?next=${encodeURIComponent(nextPath)}` : ''}`)
+  }
+  // 別サイトからの書き込み要求を拒否（Cookie は SameSite=Lax だが念のため）
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(c.req.method)) {
+    const origin = c.req.header('origin')
+    if (origin && new URL(origin).host !== (c.req.header('x-forwarded-host') || c.req.header('host'))) return c.json({ error: 'bad_origin' }, 403)
+  }
+  c.set('user', user)
+  return next()
+})
+const adminOnly = async (c: any, next: any) => {
+  const u = c.get('user')
+  if (!u || u.role !== 'admin') return c.json({ error: 'forbidden', message: '管理者だけが使えます' }, 403)
+  return next()
+}
+// 画面の HTML に、ログイン中の担当者の表示（名前・ログアウト）を差し込む
+const withBadge = (c: any, html: string) => {
+  const u = c.get('user')
+  return u ? html.replace(/<\/body>/i, `${userBadge(u)}</body>`) : html
+}
+
+app.get('/login', async (c) => {
+  const next = c.req.query('next') || '/'
+  const u = await userFromToken(c.env.DB, getCookie(c, SESSION_COOKIE)).catch(() => null)
+  if (u) return c.redirect(/^\/(?!\/)/.test(next) ? next : '/')
+  return c.html(renderLoginPage(next))
+})
+app.post('/api/auth/login', async (c) => {
+  let body: any = {}
+  try { body = await c.req.json() } catch {}
+  const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || null
+  const r = await login(c.env.DB, body.login_id, body.password, ip)
+  if (!r.ok) return c.json({ ok: false, error: r.error }, r.locked ? 429 : 401)
+  setCookie(c, SESSION_COOKIE, r.token, { httpOnly: true, sameSite: 'Lax', secure: isSecure(c), path: '/', maxAge: SESSION_DAYS * 86400 })
+  return c.json({ ok: true, user: r.user })
+})
+app.post('/api/auth/logout', async (c) => {
+  await logout(c.env.DB, getCookie(c, SESSION_COOKIE))
+  deleteCookie(c, SESSION_COOKIE, { path: '/' })
+  return c.json({ ok: true })
+})
+app.get('/api/auth/me', (c) => c.json({ user: c.get('user') }))
+app.post('/api/auth/password', async (c) => {
+  const u = c.get('user')
+  if (!u) return c.json({ ok: false, error: 'ログインしてください' }, 401)
+  const body: any = await c.req.json().catch(() => ({}))
+  const r = await changeOwnPassword(c.env.DB, u, body.current, body.next)
+  return c.json(r, r.ok ? 200 : 400)
+})
+app.get('/account', (c) => c.html(renderAccountPage(c.get('user')!)))
+app.get('/admin/users', (c) => {
+  const u = c.get('user')
+  if (!u || u.role !== 'admin') return c.redirect('/')
+  return c.html(renderUsersPage(u))
+})
+app.get('/api/admin/users', adminOnly, async (c) => c.json({ users: await listUsers(c.env.DB) }))
+app.post('/api/admin/users', adminOnly, async (c) => {
+  const r = await createUser(c.env.DB, await c.req.json().catch(() => ({})))
+  return c.json(r, r.ok ? 200 : 400)
+})
+app.patch('/api/admin/users/:id', adminOnly, async (c) => {
+  const r = await updateUser(c.env.DB, Number(c.req.param('id')), await c.req.json().catch(() => ({})), c.get('user')!)
+  return c.json(r, r.ok ? 200 : 400)
+})
+app.delete('/api/admin/users/:id', adminOnly, async (c) => {
+  const r = await deleteUser(c.env.DB, Number(c.req.param('id')), c.get('user')!)
+  return c.json(r, r.ok ? 200 : 400)
+})
 
 // UUID生成
 function uuid(): string {
@@ -102,9 +196,9 @@ app.post('/api/search', async (c) => {
 
   const searchJobId = uuid()
   await c.env.DB.prepare(
-    `INSERT INTO search_jobs (id, criteria_json, free_text, top_n, status) VALUES (?,?,?,?,'running')`
+    `INSERT INTO search_jobs (id, criteria_json, free_text, top_n, status, user_id, user_name, engine) VALUES (?,?,?,?,'running',?,?,'legacy')`
   )
-    .bind(searchJobId, JSON.stringify(criteria), criteria.freeText, criteria.topN)
+    .bind(searchJobId, JSON.stringify(criteria), criteria.freeText, criteria.topN, c.get('user')?.id ?? null, c.get('user')?.name ?? null)
     .run()
 
   // バックグラウンドで検索実行（レスポンスは即返す）
@@ -260,7 +354,7 @@ app.get('/api/history', async (c) => {
 
   const { results } = await c.env.DB.prepare(
     `SELECT id, criteria_json, free_text, top_n, status, created_at, finished_at,
-            total_scanned, total_matched
+            total_scanned, total_matched, user_name
        FROM search_jobs
       ORDER BY created_at DESC, id DESC
       LIMIT ? OFFSET ?`
@@ -281,6 +375,7 @@ app.get('/api/history', async (c) => {
       totalScanned: r.total_scanned,
       totalMatched: r.total_matched,
       freeText: r.free_text || '',
+      userName: r.user_name || '',
       summary: summarizeCriteria(criteria),
       sources: (criteria.sources || []).map((s: string) => SOURCE_LABELS[s as SourceId] || s),
     }
@@ -1118,7 +1213,7 @@ app.get('/favicon.ico', faviconResponse)
 app.get('/favicon.svg', faviconResponse)
 
 app.get('/', (c) => {
-  return c.html(renderPage())
+  return c.html(withBadge(c, renderPage()))
 })
 
 // ---------------------------------------------------------
@@ -1142,7 +1237,7 @@ app.get('/manual', async (c) => {
     const r = await fetch(`${hubBase(c)}/`, { signal: AbortSignal.timeout(5000) })
     if (!r.ok) throw new Error(`hub-api ${r.status}`)
     const html = (await r.text()).replace('<meta name="api-base" content="">', '<meta name="api-base" content="/hub-api">')
-    return c.html(html)
+    return c.html(withBadge(c, html))
   } catch (e) {
     return hubDown(c, e)
   }
@@ -1189,7 +1284,7 @@ app.options('/api/v1/*', relayV1)
 
 // 旧・手動検索モード（切り戻し用に残す。新画面が安定したら削除）
 app.get('/manual-old', (c) => {
-  return c.html(renderManualPage())
+  return c.html(withBadge(c, renderManualPage()))
 })
 
 export default app

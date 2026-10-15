@@ -16,6 +16,11 @@
 set -euo pipefail
 
 APP_URL="${APP_URL:-http://127.0.0.1:3000}"
+# ログイン制のため、サーバー同士の呼び出しは INGEST_TOKEN で認証する（未指定なら .dev.vars から読む）
+if [ -z "${INGEST_TOKEN:-}" ]; then
+  INGEST_TOKEN=$(sed -n 's/^INGEST_TOKEN=//p' "$(dirname "$0")/../.dev.vars" 2>/dev/null | tr -d '"\r' | head -1)
+fi
+AUTH=(-H "X-Ingest-Token: ${INGEST_TOKEN:-}")
 
 # 対象媒体（カンマ区切り環境変数 → JSON配列）。未指定なら全媒体をサーバ既定に任せる。
 BODY='{"trigger":"cron"}'
@@ -26,7 +31,7 @@ if [ -n "${TRACE_SOURCES:-}" ]; then
 fi
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] 日次同期を開始します APP_URL=${APP_URL}"
-RESP=$(curl -sS -X POST "${APP_URL}/api/trace/start" \
+RESP=$(curl -sS -X POST "${APP_URL}/api/trace/start" "${AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d "${BODY}")
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] レスポンス: ${RESP}"
@@ -41,7 +46,7 @@ fi
 # 最大30分、30秒ごとに状態を確認
 for i in $(seq 1 60); do
   sleep 30
-  ST=$(curl -sS "${APP_URL}/api/trace/status?id=${TRACE_ID}")
+  ST=$(curl -sS "${AUTH[@]}" "${APP_URL}/api/trace/status?id=${TRACE_ID}")
   STATUS=$(printf '%s' "$ST" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
   if [ "$STATUS" = "done" ] || [ "$STATUS" = "error" ]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] 同期完了 status=${STATUS}"

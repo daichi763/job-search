@@ -617,7 +617,7 @@ async function showHistoryList() {
           return `
           <button class="history-item w-full text-left border border-slate-200 hover:border-indigo-300 hover:bg-indigo-50/40 rounded-lg p-3 transition" data-id="${escapeHtml(it.id)}">
             <div class="flex items-center justify-between gap-2 mb-1">
-              <span class="text-xs text-slate-500"><i class="fas fa-clock mr-1"></i>${fmtDateTime(it.createdAt)}</span>
+              <span class="text-xs text-slate-500"><i class="fas fa-clock mr-1"></i>${fmtDateTime(it.createdAt)}${it.userName ? `<i class="fas fa-user ml-3 mr-1"></i>${escapeHtml(it.userName)}` : ''}</span>
               <span class="text-[10px] px-2 py-0.5 rounded ${b.cls}">${b.label}</span>
             </div>
             <p class="text-sm text-slate-800 font-medium leading-snug">${query}</p>

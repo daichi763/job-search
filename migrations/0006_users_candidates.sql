@@ -10,7 +10,7 @@
 
 CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  login_id      TEXT NOT NULL UNIQUE,
+  login_id      TEXT NOT NULL UNIQUE,       -- メールアドレス（小文字で保存）
   name          TEXT NOT NULL,              -- 表示名（検索担当者名）
   password_hash TEXT NOT NULL,              -- pbkdf2$反復回数$salt$hash
   role          TEXT NOT NULL DEFAULT 'staff', -- admin | staff
@@ -26,6 +26,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+-- ログイン失敗の記録（総当たり対策: 同じログインIDで15分に10回失敗したら一時的にロック）
+CREATE TABLE IF NOT EXISTS login_failures (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  login_id   TEXT NOT NULL,
+  ip         TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_login_failures ON login_failures(login_id, created_at);
 
 CREATE TABLE IF NOT EXISTS candidates (
   id            INTEGER PRIMARY KEY AUTOINCREMENT, -- 自動採番（画面では No.123）
