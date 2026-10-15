@@ -28,13 +28,15 @@
       <label class="block text-sm">キーワード
         <input name="keyword" id="search-input" class="mt-1 w-full border rounded px-2 py-1.5" placeholder="例: 法人営業 未経験">
       </label>
-      <label class="block text-sm">媒体
-        <select name="source" class="mt-1 w-full border rounded px-2 py-1.5">
-          <option value="">すべて</option>
-          <option value="circus">circus</option><option value="hitolink">ヒトリンク</option>
-          <option value="jobins">ジョビンズ</option><option value="kintone">kintone（自社）</option>
-        </select>
-      </label>
+      <fieldset id="source-filter" class="text-sm">
+        <legend class="flex justify-between w-full">媒体 <span class="text-xs text-slate-400">未選択＝すべて</span></legend>
+        <div class="mt-1 space-y-1">
+          <label class="flex items-center gap-2 whitespace-nowrap"><input type="checkbox" name="source" value="circus"> circus <span class="source-count ml-auto text-xs text-slate-400" data-source="circus"></span></label>
+          <label class="flex items-center gap-2 whitespace-nowrap"><input type="checkbox" name="source" value="hitolink"> ヒトリンク <span class="source-count ml-auto text-xs text-slate-400" data-source="hitolink"></span></label>
+          <label class="flex items-center gap-2 whitespace-nowrap"><input type="checkbox" name="source" value="jobins"> ジョビンズ <span class="source-count ml-auto text-xs text-slate-400" data-source="jobins"></span></label>
+          <label class="flex items-center gap-2 whitespace-nowrap"><input type="checkbox" name="source" value="kintone"> kintone <span class="source-count ml-auto text-xs text-slate-400" data-source="kintone"></span></label>
+        </div>
+      </fieldset>
       <label class="block text-sm">都道府県
         <select name="prefecture" id="pref-select" class="mt-1 w-full border rounded px-2 py-1.5"><option value="">すべて</option></select>
       </label>
@@ -119,6 +121,7 @@ async function loadOverview() {
   const o = await api('/api/overview')
   $('#source-summary').innerHTML = o.bySource.map((s) => `${badge(s.source)} <span>${(s.open || 0).toLocaleString()}件</span>`).join('') +
     `<span class="text-slate-500">合計 ${o.bySource.reduce((a, s) => a + (s.open || 0), 0).toLocaleString()}件</span>`
+  for (const s of o.bySource) { const el = document.querySelector(`.source-count[data-source="${s.source}"]`); if (el) el.textContent = `(${(s.open || 0).toLocaleString()})` }
   $('#pref-select').innerHTML = '<option value="">すべて</option>' + o.prefectures.map((p) => `<option value="${esc(p.prefecture)}">${esc(p.prefecture)}（${p.n.toLocaleString()}）</option>`).join('')
   const ch = {}
   for (const c of o.changes24h) (ch[c.source] ||= []).push(`${CHANGE[c.change_type] || c.change_type} ${c.n.toLocaleString()}`)
@@ -135,7 +138,7 @@ async function loadOverview() {
 function query() {
   const f = new FormData($('#search-form'))
   const q = new URLSearchParams()
-  for (const [k, v] of f) if (v !== '') q.set(k, v)
+  for (const [k, v] of f) if (v !== '') q.set(k, q.has(k) ? `${q.get(k)},${v}` : v)
   if (q.get('salaryMinMan')) { q.set('salaryMin', String(Number(q.get('salaryMinMan')) * 10000)); q.delete('salaryMinMan') }
   q.set('limit', PAGE_SIZE); q.set('offset', offset)
   return q
@@ -200,6 +203,7 @@ async function openJob(id) {
 }
 
 $('#search-form').addEventListener('submit', (e) => { e.preventDefault(); offset = 0; search() })
+document.querySelectorAll('#source-filter input').forEach((b) => b.addEventListener('change', () => { offset = 0; search() }))
 $('#reset-button').addEventListener('click', () => setTimeout(() => { offset = 0; search() }))
 document.addEventListener('click', (e) => {
   const p = e.target.closest('[data-offset]')
@@ -213,12 +217,14 @@ $('#job-dialog').addEventListener('click', (e) => { if (e.target.id === 'job-dia
 // URLの条件を復元（ブラウザの再読み込みやURL共有に対応）
 const init = new URLSearchParams(location.search)
 for (const [k, v] of init) {
+  const boxes = document.querySelectorAll(`#search-form input[type="checkbox"][name="${k}"]`)
+  if (boxes.length) { const vs = v.split(','); boxes.forEach((b) => { b.checked = vs.includes(b.value) }); continue }
   const el = $(`#search-form [name="${k}"]`)
   if (el) el.value = v
 }
 if (init.get('salaryMin')) $('#search-form [name="salaryMinMan"]').value = Number(init.get('salaryMin')) / 10000
 offset = Number(init.get('offset') || 0)
-loadOverview().then(() => { for (const [k, v] of init) { const el = $(`#search-form [name="${k}"]`); if (el && el.tagName === 'SELECT') el.value = v } search() }).catch((e) => { $('#result-count').textContent = `読み込みエラー: ${e.message}` })
+loadOverview().then(() => { for (const [k, v] of init) { const el = $(`#search-form select[name="${k}"]`); if (el) el.value = v } search() }).catch((e) => { $('#result-count').textContent = `読み込みエラー: ${e.message}` })
 </script>
 </body>
 </html>
