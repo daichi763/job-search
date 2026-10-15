@@ -47,8 +47,28 @@ export function searchJobs(db, q = {}) {
     where.push(`(j.age_min IS NULL OR j.age_min <= ?) AND (j.age_max IS NULL OR j.age_max >= ?)`)
     args.push(Number(q.age), Number(q.age))
   }
-  if (q.employment) { where.push(`j.employment LIKE ?`); args.push(`%${q.employment}%`) }
-  if (q.category) { where.push(`(j.job_category LIKE ? OR j.job_categories_json LIKE ?)`); args.push(`%${q.category}%`, `%${q.category}%`) }
+  // 雇用形態・職種は複数指定可（カンマ区切り = いずれかを含む）
+  const anyLike = (cols, value) => {
+    const words = [].concat(value).flatMap((v) => String(v).split(',')).map((w) => w.trim()).filter(Boolean)
+    if (!words.length) return
+    where.push('(' + words.map(() => '(' + cols.map((c) => `${c} LIKE ?`).join(' OR ') + ')').join(' OR ') + ')')
+    for (const w of words) for (const _ of cols) args.push(`%${w}%`)
+  }
+  if (q.employment) anyLike(['j.employment'], q.employment)
+  if (q.category) anyLike(['j.job_category', 'j.job_categories_json'], q.category)
+  // 働き方の特徴（カンマ区切り = すべて満たす）: remote, flex, side_job, no_transfer, holidays_120, weekend_off, inexperienced_ok, short_time
+  if (q.features) {
+    const fs = [].concat(q.features).flatMap((v) => String(v).split(',')).map((w) => w.trim()).filter(Boolean)
+    for (const f of fs) { where.push(`j.id IN (SELECT job_id FROM job_features WHERE feature = ?)`); args.push(f) }
+  }
+  // 除外する求人（「媒体:ID」のカンマ区切り。紹介済みなどを外す用途）
+  if (q.excludeKeys) {
+    const ks = [].concat(q.excludeKeys).flatMap((v) => String(v).split(',')).map((w) => w.trim()).filter((w) => w.includes(':')).slice(0, 1000)
+    if (ks.length) {
+      where.push(`(j.source || ':' || j.source_job_id) NOT IN (${ks.map(() => '?').join(',')})`)
+      args.push(...ks)
+    }
+  }
   if (q.company) { where.push(`j.company LIKE ?`); args.push(`%${q.company}%`) }
   if (q.rewardType) { where.push(`j.reward_type = ?`); args.push(q.rewardType) }
   if (q.changedSince) { where.push(`j.last_changed_at >= ?`); args.push(q.changedSince) }
@@ -72,7 +92,9 @@ export function searchJobs(db, q = {}) {
     if (countCache.size > 2000) countCache.clear()
     countCache.set(key, total)
   }
-  const rows = db.prepare(`SELECT j.* FROM ${from} WHERE ${w} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...args, limit, offset)
+  const rows = db.prepare(`SELECT j.*, (SELECT group_concat(feature) FROM job_features f WHERE f.job_id=j.id) AS features_csv
+                           FROM ${from} WHERE ${w} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...args, limit, offset)
+  for (const r of rows) { r.features = r.features_csv ? r.features_csv.split(',') : []; delete r.features_csv }
   return { total, limit, offset, jobs: rows }
 }
 
@@ -83,6 +105,7 @@ export function getJob(db, id) {
   const t = db.prepare(`SELECT description, requirements, benefits FROM job_texts WHERE job_id=?`).get(j.id) || {}
   const r = db.prepare(`SELECT raw_json, detail_json, fetched_at FROM job_raw WHERE job_id=?`).get(j.id) || {}
   const prefs = db.prepare(`SELECT prefecture FROM job_prefectures WHERE job_id=? ORDER BY prefecture`).all(j.id).map((x) => x.prefecture)
+  const features = db.prepare(`SELECT feature FROM job_features WHERE job_id=? ORDER BY feature`).all(j.id).map((x) => x.feature)
   const changes = db.prepare(`SELECT change_type, changed_fields, changed_at FROM job_changes
                               WHERE source=? AND source_job_id=? ORDER BY id DESC LIMIT 30`).all(j.source, j.source_job_id)
   const parse = (s) => { try { return s ? JSON.parse(s) : null } catch { return null } }
@@ -90,7 +113,7 @@ export function getJob(db, id) {
     ...j,
     job_categories: parse(j.job_categories_json) || [], industries: parse(j.industries_json) || [],
     experience: parse(j.experience_json) || [], positions: parse(j.positions_json) || [],
-    prefectures: prefs, ...t,
+    prefectures: prefs, features, ...t,
     raw: parse(r.raw_json), detail: parse(r.detail_json), raw_fetched_at: r.fetched_at || null,
     changes: changes.map((c) => ({ ...c, changed_fields: parse(c.changed_fields) })),
   }
@@ -105,5 +128,7 @@ export function getOverview(db) {
                            FROM sync_runs WHERE id IN (SELECT MAX(id) FROM sync_runs GROUP BY source)`).all()
   const since = new Date(Date.now() - 86400000).toISOString()
   const changes = db.prepare(`SELECT source, change_type, COUNT(*) AS n FROM job_changes WHERE changed_at >= ? GROUP BY 1,2`).all(since)
-  return { bySource, prefectures: prefs, lastRuns: runs, changes24h: changes }
+  const features = db.prepare(`SELECT f.feature, COUNT(*) AS n FROM job_features f JOIN jobs j ON j.id=f.job_id
+                               WHERE j.status='open' GROUP BY f.feature`).all()
+  return { bySource, prefectures: prefs, features, lastRuns: runs, changes24h: changes }
 }

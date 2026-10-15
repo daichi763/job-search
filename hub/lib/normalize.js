@@ -3,6 +3,7 @@
 // ============================================================
 import crypto from 'node:crypto'
 import { toBigrams } from './text.js'
+import { detectFeatures } from './features.js'
 
 const PREFS = [
   '北海道', '青森県', '岩手県', '宮城県', '秋田県', '山形県', '福島県', '茨城県', '栃木県', '群馬県',
@@ -68,6 +69,8 @@ export const CONTENT_FIELDS = [
   'reward_type', 'reward_rate', 'reward_amount', 'reward_text', 'url', 'source_published_at',
   'description', 'requirements', 'benefits', 'prefectures',
 ]
+// ※ features（働き方タグ）は内容ハッシュに含めない。判定ルールを改良したときに
+//   全求人が「更新」扱いになるのを避けるため。タグの付け直しは bin/features.js で行う。
 
 // mapApiJob の出力（＋元データ raw）→ ハブの1件分
 export function normalizeJob(source, m, raw) {
@@ -111,6 +114,8 @@ export function normalizeJob(source, m, raw) {
     benefits: str(m.benefits),
     prefectures: extractPrefectures(locations),
   }
+  const rawObj0 = raw ?? m._raw ?? null
+  rec.features = detectFeatures(source, { ...rec, experience: arr(m.experience) }, rawObj0)
   const content = {}
   for (const f of CONTENT_FIELDS) content[f] = rec[f] ?? null
   rec.content_hash = hashOf(content)

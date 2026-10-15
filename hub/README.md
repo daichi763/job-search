@@ -50,6 +50,7 @@
 | `job_texts` | 仕事内容・応募条件など長い文章 |
 | `job_raw` | 媒体の元データ（JSONそのまま。一覧に出ている全項目） |
 | `job_prefectures` | 勤務地の都道府県（複数可） |
+| `job_features` | 働き方タグ（リモート可・フレックス・副業可・転勤なし・年休120日以上・土日祝休み・未経験可・時短勤務可） |
 | `jobs_fts` | 全文検索の索引（2文字単位。「営業」「経理」など2文字語も高速） |
 | `job_changes` | 変更履歴（追加/更新/掲載終了/再掲載/削除、90日保存） |
 | `sync_runs` | 同期の実行記録（媒体ごと・回ごとの件数、完走したか、注意事項） |
@@ -64,11 +65,12 @@ node --no-warnings bin/search.js 営業 --prefecture=東京都 --salaryMin=40000
 node --no-warnings bin/search.js --bench                           # 検索速度の測定
 node --no-warnings bin/backup.js                                   # バックアップ（~/backups/hub に3世代）
 bash bin/nightly.sh                                                # 毎晩の処理（同期→バックアップ）を手動で実行
+node --no-warnings bin/features.js                                 # 既存の求人へ働き方タグを付け直す（判定ルールを変えたとき。同期中は不可）
 node --no-warnings --test test/*.test.js                           # 自動テスト（媒体に接続しない）
 ```
 
 検索の条件: `--prefecture=東京都,大阪府` `--salaryMin=円` `--salaryMax=円` `--age=歳` `--source=hitolink`
-`--employment=正社員` `--category=営業` `--sort=updated|new|salary_desc|salary_asc` `--limit=20` `--offset=0`
+`--employment=正社員,契約社員` `--category=営業,企画`（カンマ＝いずれか） `--features=remote,flex`（すべて満たす） `--sort=updated|new|salary_desc|salary_asc` `--limit=20` `--offset=0`
 
 ## 設定（任意: `hub/.env`）
 

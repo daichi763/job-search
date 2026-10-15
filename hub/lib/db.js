@@ -17,7 +17,7 @@ import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import path from 'node:path'
 
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -99,6 +99,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS jobs_fts USING fts5(
   content='', contentless_delete=1,
   tokenize='unicode61 remove_diacritics 0'
 );
+
+-- 働き方の特徴タグ（remote / flex / side_job / no_transfer / holidays_120 / weekend_off / inexperienced_ok / short_time）
+CREATE TABLE IF NOT EXISTS job_features (
+  job_id  INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  feature TEXT NOT NULL,
+  PRIMARY KEY (job_id, feature)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_job_features ON job_features(feature, job_id);
 
 CREATE TABLE IF NOT EXISTS job_changes (
   id             INTEGER PRIMARY KEY,

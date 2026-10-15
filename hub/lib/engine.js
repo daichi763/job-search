@@ -54,7 +54,8 @@ export class SyncSession {
       reopen: db.prepare(`UPDATE jobs SET status='open', closed_at=NULL, miss_count=0, source_updated_at=? WHERE id=?`),
       refresh: db.prepare(`UPDATE jobs SET source_updated_at=? WHERE id=?`),
       getOld: db.prepare(`SELECT j.*, t.description, t.requirements, t.benefits,
-                            (SELECT json_group_array(prefecture) FROM job_prefectures p WHERE p.job_id=j.id) AS prefs
+                            (SELECT json_group_array(prefecture) FROM job_prefectures p WHERE p.job_id=j.id) AS prefs,
+                            (SELECT json_group_array(feature) FROM job_features f WHERE f.job_id=j.id) AS feats
                           FROM jobs j LEFT JOIN job_texts t ON t.job_id=j.id WHERE j.id=?`),
       upText: db.prepare(`INSERT INTO job_texts(job_id, description, requirements, benefits) VALUES (?,?,?,?)
                           ON CONFLICT(job_id) DO UPDATE SET description=excluded.description,
@@ -64,6 +65,8 @@ export class SyncSession {
                          raw_hash=excluded.raw_hash, fetched_at=excluded.fetched_at`),
       delPref: db.prepare(`DELETE FROM job_prefectures WHERE job_id=?`),
       insPref: db.prepare(`INSERT OR IGNORE INTO job_prefectures(job_id, prefecture) VALUES (?,?)`),
+      delFeat: db.prepare(`DELETE FROM job_features WHERE job_id=?`),
+      insFeat: db.prepare(`INSERT OR IGNORE INTO job_features(job_id, feature) VALUES (?,?)`),
       delFts: db.prepare(`DELETE FROM jobs_fts WHERE rowid=?`),
       insFts: db.prepare(`INSERT INTO jobs_fts(rowid, head, body) VALUES (?,?,?)`),
       change: db.prepare(`INSERT INTO job_changes(job_id, source, source_job_id, change_type, changed_fields, sync_run_id, changed_at)
@@ -106,6 +109,8 @@ export class SyncSession {
     s.upRaw.run(id, rec.raw_json, rec.raw_hash, now)
     s.delPref.run(id)
     for (const p of rec.prefectures) s.insPref.run(id, p)
+    s.delFeat.run(id)
+    for (const f of rec.features || []) s.insFeat.run(id, f)
     const f = ftsColumns(rec)
     s.delFts.run(id)
     s.insFts.run(id, f.head, f.body)
@@ -149,7 +154,11 @@ export class SyncSession {
     // 内容は同じ。媒体の更新日時や元データ（検索用には使わない項目）だけ変わった場合は軽く更新
     if (old.source_updated_at !== rec.source_updated_at || old.raw_hash !== rec.raw_hash) {
       s.refresh.run(rec.source_updated_at, old.id)
-      if (old.raw_hash !== rec.raw_hash) s.upRaw.run(old.id, rec.raw_json, rec.raw_hash, now)
+      if (old.raw_hash !== rec.raw_hash) {
+        s.upRaw.run(old.id, rec.raw_json, rec.raw_hash, now)
+        s.delFeat.run(old.id) // 元データが変わると働き方タグも変わり得る
+        for (const f of rec.features || []) s.insFeat.run(old.id, f)
+      }
       old.source_updated_at = rec.source_updated_at
       old.raw_hash = rec.raw_hash
       this.stats.refreshed++
@@ -163,8 +172,8 @@ export class SyncSession {
     const o = this.st.getOld.get(id)
     if (!o) return []
     const prefs = JSON.parse(o.prefs || '[]').sort()
-    const cmp = { ...o, prefectures: prefs }
-    const recCmp = { ...rec, prefectures: [...rec.prefectures].sort() }
+    const cmp = { ...o, prefectures: prefs, features: JSON.parse(o.feats || '[]').sort() }
+    const recCmp = { ...rec, prefectures: [...rec.prefectures].sort(), features: [...(rec.features || [])].sort() }
     return CONTENT_FIELDS.filter((f) => JSON.stringify(cmp[f] ?? null) !== JSON.stringify(recCmp[f] ?? null))
   }
 

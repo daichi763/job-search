@@ -34,7 +34,7 @@ if (args.includes('--bench')) {
   console.log(`条件: ${JSON.stringify(q)}\n該当 ${r.total.toLocaleString()} 件（${ms.toFixed(1)} ms）\n`)
   for (const j of r.jobs) {
     const sal = j.salary_min || j.salary_max ? `${j.salary_min ? Math.round(j.salary_min / 10000) : '?'}〜${j.salary_max ? Math.round(j.salary_max / 10000) : '?'}万円` : '年収不明'
-    console.log(`[${j.source}] ${j.title}\n   ${j.company || ''} / ${j.locations_text || ''} / ${sal}`)
+    console.log(`[${j.source}] ${j.title}\n   ${j.company || ''} / ${j.locations_text || ''} / ${sal}${j.features?.length ? ' / ' + j.features.join(',') : ''}`)
   }
 }
 db.close()

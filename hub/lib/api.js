@@ -11,8 +11,11 @@
 //   GET /api/v1/sources           媒体ごとの件数と最終同期
 //   GET /api/v1/prefectures       都道府県ごとの件数
 //   GET /api/v1/changes           変更履歴（追加・更新・掲載終了・削除）
+//   GET /api/v1/facets            絞り込みの選択肢（職種・雇用形態・働き方の特徴）
+//   GET /api/v1/jobs.csv          検索結果のCSVダウンロード（Excelで開ける）
 // ============================================================
 import { searchJobs } from './search.js'
+import { FEATURES } from './features.js'
 
 export const SOURCES = ['circus', 'hitolink', 'jobins', 'kintone']
 const SOURCE_LABELS = { circus: 'circus', hitolink: 'ヒトリンク', jobins: 'ジョビンズ', kintone: '自社DB（kintone）' }
@@ -71,6 +74,7 @@ export function jobSummary(j) {
     gender: j.gender,
     education: j.education,
     experience: parseJson(j.experience_json),
+    features: j.features ?? undefined,
     reward: { type: j.reward_type, rate: j.reward_rate, amount: man(j.reward_amount), text: j.reward_text },
     url: j.url,
     source_published_at: j.source_published_at,
@@ -95,6 +99,7 @@ export function jobDetail(db, j, { includeRaw = false } = {}) {
     company_url: j.company_url,
     industries: parseJson(j.industries_json),
     prefectures: prefs,
+    features: db.prepare(`SELECT feature FROM job_features WHERE job_id=? ORDER BY feature`).all(j.id).map((x) => x.feature),
     positions: parseJson(j.positions_json),
     career_stage: j.career_stage,
     overtime: j.overtime,
@@ -117,24 +122,24 @@ function dataUpdatedAt(db) {
 }
 
 // ---- 各API ----
-function apiJobs(db, p) {
-  const perPage = intParam(p, 'per_page', { min: 1, max: MAX_PER_PAGE }) ?? 20
-  const page = intParam(p, 'page', { min: 1 }) ?? 1
-  const offset = (page - 1) * perPage
-  if (offset > MAX_OFFSET) bad(`${MAX_OFFSET}件目より後は取得できません。条件を絞ってください`)
+function buildQuery(p, { perPage, offset }) {
   const sources = list(p.get('source'))
   for (const s of sources) if (!SOURCES.includes(s)) bad(`source は ${SOURCES.join(' / ')} で指定してください`)
+  const feats = list(p.get('features'))
+  for (const f of feats) if (!FEATURES[f]) bad(`features は ${Object.keys(FEATURES).join(' / ')} で指定してください`)
   const salaryMin = intParam(p, 'salary_min', { min: 0, max: 100000 })
   const salaryMax = intParam(p, 'salary_max', { min: 0, max: 100000 })
-  const q = {
+  return {
     keyword: (p.get('q') || '').slice(0, 200),
     source: sources.join(',') || undefined,
     prefecture: list(p.get('prefecture')).join(',') || undefined,
     salaryMin: salaryMin != null ? salaryMin * 10000 : undefined,
     salaryMax: salaryMax != null ? salaryMax * 10000 : undefined,
     age: intParam(p, 'age', { min: 15, max: 100 }) ?? undefined,
-    employment: p.get('employment') || undefined,
-    category: p.get('category') || undefined,
+    employment: list(p.get('employment')).join(',') || undefined,
+    category: list(p.get('category')).join(',') || undefined,
+    features: feats.join(',') || undefined,
+    excludeKeys: list(p.get('exclude')).join(',') || undefined,
     company: p.get('company') || undefined,
     rewardType: enumParam(p, 'reward_type', ['rate', 'fixed'], undefined),
     changedSince: isoParam(p, 'changed_since') ?? undefined,
@@ -143,6 +148,14 @@ function apiJobs(db, p) {
     limit: perPage,
     offset,
   }
+}
+
+function apiJobs(db, p) {
+  const perPage = intParam(p, 'per_page', { min: 1, max: MAX_PER_PAGE }) ?? 20
+  const page = intParam(p, 'page', { min: 1 }) ?? 1
+  const offset = (page - 1) * perPage
+  if (offset > MAX_OFFSET) bad(`${MAX_OFFSET}件目より後は取得できません。条件を絞ってください`)
+  const q = buildQuery(p, { perPage, offset })
   const r = searchJobs(db, q)
   const detail = p.get('fields') === 'full'
   return {
@@ -204,7 +217,71 @@ function apiChanges(db, p) {
   return { data, meta: { has_more: more, next_after_id: more ? data[data.length - 1].change_id : null } }
 }
 
-// ルーティング。戻り値: { status, body }
+function apiFacets(db) {
+  // 職種は媒体ごとに表記がばらばらなので、「・」「/」などで区切った語の出現数上位を返す
+  const cat = new Map()
+  for (const r of db.prepare(`SELECT job_categories_json AS c, job_category AS s FROM jobs WHERE status='open'`).iterate()) {
+    const arr = parseJson(r.c)
+    const words = (arr.length ? arr : String(r.s || '').split(/[・/／、,]/)).map((w) => String(w).trim()).filter((w) => w && w.length <= 30)
+    for (const w of new Set(words)) cat.set(w, (cat.get(w) || 0) + 1)
+  }
+  const emp = db.prepare(`SELECT employment AS v, COUNT(*) AS n FROM jobs WHERE status='open' AND employment IS NOT NULL AND employment <> ''
+                          GROUP BY employment ORDER BY n DESC LIMIT 30`).all()
+  const feats = Object.fromEntries(db.prepare(`SELECT f.feature, COUNT(*) AS n FROM job_features f JOIN jobs j ON j.id=f.job_id
+                                               WHERE j.status='open' GROUP BY f.feature`).all().map((r) => [r.feature, r.n]))
+  return {
+    data: {
+      categories: [...cat.entries()].sort((a, b) => b[1] - a[1]).slice(0, 300).map(([value, count]) => ({ value, count })),
+      employments: emp.map((r) => ({ value: r.v, count: r.n })),
+      features: Object.entries(FEATURES).map(([value, label]) => ({ value, label, count: feats[value] || 0 })),
+    },
+  }
+}
+
+// CSV（Excel で文字化けしないよう UTF-8 BOM 付き）。最大 MAX_CSV 件
+export const MAX_CSV = 5000
+const CSV_COLUMNS = [
+  ['ID', (j) => j.id], ['媒体', (j) => SOURCE_LABELS[j.source] || j.source], ['求人タイトル', (j) => j.title], ['会社名', (j) => j.company],
+  ['職種', (j) => j.job_category], ['業種', (j) => j.industry], ['雇用形態', (j) => j.employment], ['勤務地', (j) => j.locations],
+  ['年収下限(万円)', (j) => j.salary_min], ['年収上限(万円)', (j) => j.salary_max], ['年齢下限', (j) => j.age_min], ['年齢上限', (j) => j.age_max],
+  ['性別条件', (j) => j.gender], ['学歴条件', (j) => j.education], ['経験', (j) => (j.experience || []).join(' / ')],
+  ['働き方', (j) => (j.features || []).map((f) => FEATURES[f] || f).join(' / ')],
+  ['成果報酬', (j) => j.reward.type === 'rate' && j.reward.rate != null ? `${j.reward.rate}%` : j.reward.type === 'fixed' && j.reward.amount != null ? `${j.reward.amount}万円` : (j.reward.text || '')],
+  ['残業', (j) => j.overtime], ['休日', (j) => j.holiday], ['仕事内容', (j) => j.description], ['応募条件', (j) => j.requirements],
+  ['媒体URL', (j) => j.url], ['媒体での最終更新', (j) => j.source_updated_at], ['取り込み日時', (j) => j.first_seen_at],
+]
+const csvCell = (v) => {
+  if (v == null) return ''
+  let s = String(v).replace(/\r\n?/g, '\n')
+  if (/^[=+\-@\t]/.test(s)) s = "'" + s // Excel の数式として実行されるのを防ぐ
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+function apiJobsCsv(db, p) {
+  const limit = intParam(p, 'limit', { min: 1, max: MAX_CSV }) ?? 1000
+  const q = buildQuery(p, { perPage: limit, offset: 0 })
+  // ID 指定（ids=circus:1,jobins:2）があればその求人だけ（画面で選んだ求人のダウンロード用）
+  const ids = list(p.get('ids')).slice(0, MAX_CSV)
+  let rows
+  if (ids.length) {
+    rows = ids.map((k) => getByKey(db, k)).filter(Boolean)
+  } else {
+    rows = []
+    for (let off = 0; off < limit; off += MAX_PER_PAGE) {
+      const r = searchJobs(db, { ...q, limit: Math.min(MAX_PER_PAGE, limit - off), offset: off })
+      rows.push(...r.jobs)
+      if (r.jobs.length < MAX_PER_PAGE) break
+    }
+  }
+  const lines = [CSV_COLUMNS.map((c) => c[0]).join(',')]
+  for (const row of rows) {
+    const j = jobDetail(db, row)
+    lines.push(CSV_COLUMNS.map(([, f]) => csvCell(f(j))).join(','))
+  }
+  const d = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 16).replace(/[-:T]/g, '')
+  return { status: 200, csv: '\uFEFF' + lines.join('\r\n') + '\r\n', filename: `jobs_${d}.csv` }
+}
+
+// ルーティング。戻り値: { status, body } または { status, csv, filename }
 export function handleApiV1(db, pathname, params) {
   try {
     let r
@@ -213,6 +290,8 @@ export function handleApiV1(db, pathname, params) {
     else if (pathname === '/api/v1/sources') r = apiSources(db)
     else if (pathname === '/api/v1/prefectures') r = apiPrefectures(db, params)
     else if (pathname === '/api/v1/changes') r = apiChanges(db, params)
+    else if (pathname === '/api/v1/facets') r = apiFacets(db)
+    else if (pathname === '/api/v1/jobs.csv') return apiJobsCsv(db, params)
     else return { status: 404, body: { error: { code: 'not_found', message: 'このAPIはありません' } } }
     return r.status ? r : { status: 200, body: r }
   } catch (e) {

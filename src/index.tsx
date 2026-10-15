@@ -1175,7 +1175,7 @@ const relayV1 = async (c: any) => {
   try {
     const r = await fetch(`${hubBase(c)}${url.pathname}${url.search}`, { method: c.req.method, headers, signal: AbortSignal.timeout(20000) })
     const out = new Headers()
-    for (const h of ['content-type', 'access-control-allow-origin', 'access-control-allow-headers', 'access-control-allow-methods', 'retry-after', 'x-response-time']) {
+    for (const h of ['content-type', 'content-disposition', 'access-control-allow-origin', 'access-control-allow-headers', 'access-control-allow-methods', 'retry-after', 'x-response-time']) {
       const v = r.headers.get(h); if (v) out.set(h, v)
     }
     out.set('Cache-Control', 'no-store')

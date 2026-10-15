@@ -105,6 +105,12 @@ const server = http.createServer((req, res) => {
     try {
       const r = handleApiV1(db, url.pathname, url.searchParams)
       const ms = Math.round(performance.now() - t0)
+      if (r.csv != null) {
+        return send(res, 200, r.csv, 'text/csv; charset=utf-8', {
+          ...cors, 'X-Response-Time': `${ms}ms`,
+          'Content-Disposition': `attachment; filename="${r.filename}"; filename*=UTF-8''${encodeURIComponent(r.filename)}`,
+        })
+      }
       if (r.status === 200 && r.body.meta) r.body.meta.took_ms = ms
       return send(res, r.status, r.body, undefined, { ...cors, 'X-Response-Time': `${ms}ms` })
     } catch (e) {
