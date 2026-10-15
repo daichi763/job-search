@@ -135,6 +135,15 @@ async function main() {
     const full = pick(result.judged)
     const pre = result.preJudged
     console.log(`\n=== 精度確認（全件を ${m.smart} で判定した場合と、2段階で判定した場合の比較・候補 ${result.judged.length}件） ===`)
+    // 比較のために全件を優秀モデルで判定しているので、上の費用は通常より高い。通常の実行での費用を見積もる
+    const fin = s.usage.byStage['精査（判定）']
+    if (fin?.usd != null && s.usage.usd != null) {
+      const est = (mode) => {
+        const n = Math.min(result.judged.length, Math.ceil(topN * engineConfig(env, mode).finalFactor))
+        return s.usage.usd - fin.usd * (1 - n / result.judged.length)
+      }
+      console.log(`※上の費用は比較のため全件を優秀モデルで判定した分を含みます。--compare なしの見込み: standard 約${Math.round(est('standard') * 150)}円 / economy 約${Math.round(est('economy') * 150)}円`)
+    }
     for (const mode of ['economy', 'standard']) {
       const f = engineConfig(env, mode).finalFactor
       const n = Math.ceil(topN * f)
