@@ -11,12 +11,12 @@ function dataVersion(db) {
   try { return db.prepare(`SELECT MAX(id) AS v, MAX(finished_at) AS f FROM sync_runs`).get() } catch { return null }
 }
 
-export function searchJobs(db, q = {}) {
+// 検索条件 → WHERE 句（画面の検索・API・AI検索の対象抽出で共通）
+export function buildWhere(q = {}) {
   const where = []
   if (q.status === 'closed') where.push(`j.status = 'closed'`)
   else if (q.status !== 'all') where.push(`j.status = 'open'`)
   const args = []
-  let from = 'jobs j'
 
   if (q.keyword && String(q.keyword).trim()) {
     const { match, singleChars } = toMatchQuery(q.keyword)
@@ -72,6 +72,27 @@ export function searchJobs(db, q = {}) {
   if (q.company) { where.push(`j.company LIKE ?`); args.push(`%${q.company}%`) }
   if (q.rewardType) { where.push(`j.reward_type = ?`); args.push(q.rewardType) }
   if (q.changedSince) { where.push(`j.last_changed_at >= ?`); args.push(q.changedSince) }
+  // 求人を指定（「媒体:ID」のカンマ区切り。手動検索で選んだ求人だけをAIにかける用途）
+  if (q.jobKeys) {
+    const ks = [].concat(q.jobKeys).flatMap((v) => String(v).split(',')).map((w) => w.trim()).filter((w) => w.includes(':')).slice(0, 5000)
+    where.push(ks.length ? `(j.source || ':' || j.source_job_id) IN (${ks.map(() => '?').join(',')})` : '0')
+    args.push(...ks)
+  }
+  return { w: where.length ? where.join(' AND ') : '1=1', args }
+}
+
+// 条件に合う求人のID（件数の上限なし。AI検索の対象を決める用途）
+export function poolIds(db, q = {}) {
+  const { w, args } = buildWhere(q)
+  return db.prepare(`SELECT j.id FROM jobs j WHERE ${w} ORDER BY j.id`).all(...args).map((r) => r.id)
+}
+
+// 表示用の求人番号（ジョビンズは画面に出る「求人ID」、それ以外は媒体の求人ID）
+const REF_NO = `CASE WHEN j.source='jobins' THEN COALESCE((SELECT json_extract(r.raw_json,'$.vacancy_no') FROM job_raw r WHERE r.job_id=j.id), j.source_job_id) ELSE j.source_job_id END AS ref_no`
+
+export function searchJobs(db, q = {}) {
+  const { w, args } = buildWhere(q)
+  const from = 'jobs j'
 
   const order = {
     updated: 'j.last_changed_at DESC',
@@ -81,7 +102,6 @@ export function searchJobs(db, q = {}) {
   }[q.sort || 'updated'] || 'j.last_changed_at DESC'
   const limit = Math.min(Math.max(parseInt(q.limit ?? 20, 10) || 20, 1), 200)
   const offset = Math.max(parseInt(q.offset ?? 0, 10) || 0, 0)
-  const w = where.length ? where.join(' AND ') : '1=1'
 
   const ver = JSON.stringify(dataVersion(db))
   if (ver !== cacheVersion) { countCache.clear(); cacheVersion = ver }
@@ -92,7 +112,7 @@ export function searchJobs(db, q = {}) {
     if (countCache.size > 2000) countCache.clear()
     countCache.set(key, total)
   }
-  const rows = db.prepare(`SELECT j.*, (SELECT group_concat(feature) FROM job_features f WHERE f.job_id=j.id) AS features_csv
+  const rows = db.prepare(`SELECT j.*, ${REF_NO}, (SELECT group_concat(feature) FROM job_features f WHERE f.job_id=j.id) AS features_csv
                            FROM ${from} WHERE ${w} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...args, limit, offset)
   for (const r of rows) { r.features = r.features_csv ? r.features_csv.split(',') : []; delete r.features_csv }
   return { total, limit, offset, jobs: rows }
