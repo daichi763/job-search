@@ -198,3 +198,6 @@ HUB_AI_FALLBACK_FAST_MODELS=gpt-5-mini,gpt-5-nano
 ```
 使えないモデル（契約・提供状況）は自動で次の候補に切り替わり、ログに表示される。
 件数や点数の上限は `HUB_AI_SCREEN_STANDARD` `HUB_AI_DEEP_MAX` `HUB_AI_CAP_UNMET` などで調整できる（`lib/ai/engine.js` の `engineConfig`）。
+
+## AI検索（新方式）
+求人DBの全求人からAIが探す新しい検索エンジンと評価コマンドは **[AI.md](./AI.md)** を参照。
