@@ -16,6 +16,7 @@
 //     --top=20                提案件数
 //     --out=結果.json         結果を保存（未指定なら hub/data/ai-results/ に保存）
 //     --dry                   AIを呼ばず、母集団の件数とキーワードの当たり具合だけ確認
+//     --compare               精査を最後まで行い、「途中で止めていたら提案がどう変わったか」を表示（精度確認用）
 // ============================================================
 import fs from 'node:fs'
 import path from 'node:path'
@@ -83,7 +84,8 @@ async function main() {
     console.log('\n' + profileToText(profile) + '\n')
   }
 
-  const result = await runAiSearch(env, db, criteria, {
+  const runOpt = opt.compare ? { config: { earlyStop: null } } : {}
+  const result = await runAiSearch(env, db, criteria, { ...runOpt,
     profile, keepScreen: true, costMode: opt.cost, depth: opt.depth || 'standard', precision: opt.precision || 'high', log,
     onProgress: (p) => { if (p.stage !== 'screen' || /終わり/.test(p.message) || (p.screened || 0) % 400 === 0) log(`${p.message}（${p.elapsedSec}秒・トークン ${p.usage.tokens.toLocaleString()}）`) },
   })
@@ -115,10 +117,50 @@ async function main() {
   console.log(`段階別: ${Object.entries(s.usage.byStage).map(([k, v]) => `${k} ${(v.input + v.output).toLocaleString()}トークン${v.usd != null ? `（約${Math.round(v.usd * 150)}円）` : ''}`).join(' / ')}`)
   console.log(`費用モード: ${s.costMode}${s.stopReason === 'enough' ? ' / 十分な候補が集まったため精査を早めに終了' : s.stopReason === 'budget' ? ' / 費用の上限で精査を終了' : ''}`)
 
+  if (opt.compare) {
+    // 実際の精査結果を使って、途中終了した場合の提案を再現し、最後まで精査した場合と比べる
+    const { engineConfig, dupKey } = await import('../lib/ai/engine.js')
+    const topN = Math.max(1, Math.min(100, Number(criteria.topN) || 20))
+    const byId = new Map(result.judged.map((r) => [r.job.id, r]))
+    const pick = (list) => {
+      const seen = new Set(), out = []
+      for (const r of [...list].sort((a, b) => b.score - a.score || b.rawScore - a.rawScore)) {
+        const k = dupKey(r.job) || r.job.id
+        if (seen.has(k)) continue
+        seen.add(k)
+        if (r.score >= engineConfig(env).minScore && r.eligibility !== 'unmet') out.push(r)
+      }
+      return out.slice(0, topN)
+    }
+    const full = pick(result.judged)
+    console.log(`\n=== 精度確認（途中で精査を止めた場合との比較・精査 ${result.judged.length}件） ===`)
+    for (const mode of ['economy']) {
+      const ec = engineConfig(env, mode)
+      const es = ec.earlyStop
+      const target = Math.ceil(topN * es.need), minJudge = Math.ceil(topN * es.minJudge)
+      const firstN = Math.max(ec.deepBatch * 4, Math.ceil(topN * ec.deepFirst)), step = Math.max(ec.deepBatch * 2, Math.ceil(topN / 2))
+      let n = 0, stop = result.deepOrder.length
+      for (let pos = 0; pos < result.deepOrder.length;) {
+        pos += pos === 0 ? firstN : step
+        n = Math.min(pos, result.deepOrder.length)
+        const part = result.deepOrder.slice(0, n).map((id) => byId.get(id)).filter(Boolean)
+        const good = new Set(part.filter((r) => r.eligibility !== 'unmet' && r.score >= es.good).map((r) => dupKey(r.job) || r.job.id)).size
+        if (n >= minJudge && good >= target) { stop = n; break }
+      }
+      const early = pick(result.deepOrder.slice(0, stop).map((id) => byId.get(id)).filter(Boolean))
+      const fullKeys = new Set(full.map((r) => r.job.id))
+      const same = early.filter((r) => fullKeys.has(r.job.id)).length
+      const missed = full.filter((r) => !early.some((e) => e.job.id === r.job.id))
+      console.log(`[${mode}] 精査 ${stop}件で終了 → 提案${topN}件中 ${same}件が一致${missed.length ? ` / 外れた求人: ${missed.map((r) => `${r.score}点 ${String(r.job.title).slice(0, 30)}`).join('、')}` : ''}`)
+      const top5 = full.slice(0, 5).filter((r) => early.some((e) => e.job.id === r.job.id)).length
+      console.log(`         上位5件のうち ${top5}件が一致`)
+    }
+  }
+
   const out = opt.out || path.join(HUB_DIR, 'data', 'ai-results', `ai_${new Date().toISOString().replace(/[:.]/g, '-')}.json`)
   fs.mkdirSync(path.dirname(out), { recursive: true })
   const slim = (r) => ({ ...r, job: { id: r.job.id, key: `${r.job.source}:${r.job.source_job_id}`, vacancy_no: r.job.vacancy_no, title: r.job.title, company: r.job.company, url: r.job.url } })
-  fs.writeFileSync(out, JSON.stringify({ criteria, profile, plan: P, summary: s, recommended: result.recommended.map(slim), reference: result.reference.map(slim), judged: result.judged.map(slim), screenLog: result.screenLog }, null, 2))
+  fs.writeFileSync(out, JSON.stringify({ criteria, profile, plan: P, summary: s, recommended: result.recommended.map(slim), reference: result.reference.map(slim), judged: result.judged.map(slim), screenLog: result.screenLog, deepOrder: result.deepOrder }, null, 2))
   console.log(`結果を保存しました: ${out}`)
 }
 main().catch((e) => { console.error('エラー:', e.message); process.exitCode = 1 }).finally(() => db.close())

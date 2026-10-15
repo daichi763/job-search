@@ -22,9 +22,12 @@ const int = (v, d) => { const n = parseInt(v ?? '', 10); return Number.isFinite(
 
 // 費用モード: economy（安い）/ standard（既定）/ quality（精度優先）
 const COST_MODES = {
-  economy:  { screenStandard: 1200, deepFirst: 1.5, deepMaxFactor: 2.5, judgeEffort: 'low',    descChars: 1500 },
-  standard: { screenStandard: 2000, deepFirst: 2,   deepMaxFactor: 4,   judgeEffort: 'medium', descChars: 2000 },
-  quality:  { screenStandard: 3000, deepFirst: 3,   deepMaxFactor: 6,   judgeEffort: 'high',   descChars: 2800 },
+  // earlyStop: 精査を途中で終える条件（null=最後まで精査）。
+  //   検証の結果、一次審査の順位と精査の点数はあまり一致せず（最高点の求人が精査の最後のほうに出ることがある）、
+  //   途中終了は上位の取りこぼしにつながるため、standard / quality では使わない。
+  economy:  { screenStandard: 1200, deepFirst: 2, deepMaxFactor: 3, judgeEffort: 'low',    descChars: 2000, earlyStop: { minJudge: 1.5, good: 80, need: 1.25 } },
+  standard: { screenStandard: 2000, deepFirst: 4, deepMaxFactor: 4, judgeEffort: 'medium', descChars: 2800, earlyStop: null },
+  quality:  { screenStandard: 3000, deepFirst: 6, deepMaxFactor: 6, judgeEffort: 'high',   descChars: 2800, earlyStop: null },
 }
 export function engineConfig(env = {}, mode) {
   const cm = COST_MODES[mode || env.HUB_AI_COST_MODE] || COST_MODES.standard
@@ -44,7 +47,7 @@ export function engineConfig(env = {}, mode) {
     capUnmet: int(env.HUB_AI_CAP_UNMET, 55),               // 必須要件を満たさない求人の上限点
     capUnknown: int(env.HUB_AI_CAP_UNKNOWN, 84),           // 書類があるのに必須要件を確認できない求人の上限点
     minScore: int(env.HUB_AI_MIN_SCORE, 60),               // 提案する最低点
-    goodScore: int(env.HUB_AI_GOOD_SCORE, 80),             // 「十分に良い」とみなす点（精査の打ち切り判定）
+    earlyStop: env.HUB_AI_EARLY_STOP === '0' ? null : cm.earlyStop, // 精査の途中終了（HUB_AI_EARLY_STOP=0 で無効）
     maxUsd: env.HUB_AI_MAX_USD ? Number(env.HUB_AI_MAX_USD) : null, // 1回の検索の費用上限（米ドル。超えたら精査を打ち切る）
   }
 }
@@ -303,11 +306,12 @@ function reqHead(s, n) {
   const cut = t.search(/【?(歓迎|尚可|あれば尚|優遇)/)
   return (cut > 20 ? t.slice(0, cut) : t).slice(0, n)
 }
-export function jobBrief(j, { req = 130, desc = 70 } = {}) {
+export function jobBrief(j, { req = 220, desc = 150 } = {}) {
   return [
-    oneLine(j.title, 60), j.company ? oneLine(j.company, 20) : '', j.job_category ? oneLine(j.job_category, 30) : '',
+    oneLine(j.title, 90), j.company ? oneLine(j.company, 30) : '', j.job_category ? `職種:${oneLine(j.job_category, 50)}` : '',
+    j.locations_text ? `地:${oneLine(j.locations_text, 40)}` : '',
     (j.salary_min || j.salary_max) ? `${man(j.salary_min)}-${man(j.salary_max)}万` : '',
-    j.employment && !/正社員/.test(j.employment) ? oneLine(j.employment, 10) : '',
+    j.employment && !/正社員/.test(j.employment) ? oneLine(j.employment, 12) : '',
     j.features.length ? j.features.map((f) => FEATURES[f] || f).join('・') : '',
     j.requirements ? `必須:${reqHead(j.requirements, req)}` : '', j.description ? `内容:${oneLine(j.description, desc)}` : '',
   ].filter(Boolean).join('/')
@@ -526,8 +530,10 @@ function jobForWriting(j, r) {
     j.features.length ? `働き方: ${j.features.map((f) => FEATURES[f] || f).join('・')}` : '',
     `必須要件の判定: ${r.must.map((m) => `${mark[m.status]}${m.req}（${m.evidence}）`).join(' / ') || 'なし'}`,
     `審査メモ: ${r.fit} / 位置づけ: ${r.angle || '-'} / 点数: ${r.score}`,
-    `応募条件: ${oneLine(j.requirements, 900)}`,
-    `仕事内容: ${oneLine(j.description, 900)}`,
+    `応募条件: ${oneLine(j.requirements, 1500)}`,
+    `仕事内容: ${oneLine(j.description, 2000)}`,
+    j.benefits ? `待遇・その他: ${oneLine(j.benefits, 400)}` : '',
+    j.holiday ? `休日: ${oneLine(j.holiday, 150)}` : '',
   ].filter(Boolean).join('\n')
 }
 async function writeReasons(env, ctx, items) {
@@ -640,7 +646,9 @@ export async function runAiSearch(env, db, criteria, options = {}) {
   //   「十分に良い求人」が提案件数より少し多く集まったら打ち切る（費用の大半はここ）
   const deepN = directDeep ? screenIds.length : Math.min(cfg.deepMax, Math.ceil(topN * cfg.deepMaxFactor))
   const order = directDeep ? screenIds : pickForDeep([...screen.keys()], screen, score, ctx.plan.angles, deepN, cfg.deepMinScreen)
-  const target = topN + Math.ceil(topN * 0.25)
+  const es = cfg.earlyStop
+  const target = es ? Math.ceil(topN * es.need) : Infinity
+  const minJudge = es ? Math.ceil(topN * es.minJudge) : Infinity
   const firstN = directDeep ? order.length : Math.min(order.length, Math.max(cfg.deepBatch * 4, Math.ceil(topN * cfg.deepFirst)))
   progress('deep', `有望な求人の求人票を全文で精査しています（最大 ${order.length}件。十分な候補が集まり次第終了）…`, { deepSize: order.length })
   const judged = []
@@ -652,12 +660,13 @@ export async function runAiSearch(env, db, criteria, options = {}) {
     pos += size
     const r = await deepJudge(env, ctx, wave, () => {})
     judged.push(...r)
-    const good = new Set(judged.filter((x) => x.eligibility !== 'unmet' && x.score >= cfg.goodScore).map((x) => dupKey(x.job) || x.job.id)).size
+    const good = new Set(judged.filter((x) => x.eligibility !== 'unmet' && x.score >= (es?.good ?? 85)).map((x) => dupKey(x.job) || x.job.id)).size
     progress('deep', `精査中… ${judged.length} / ${order.length}件（十分に良い候補 ${good}件）`, { judged: judged.length, good })
-    if (!directDeep && good >= target) { stopReason = 'enough'; break }
+    if (!directDeep && es && judged.length >= minJudge && good >= target) { stopReason = 'enough'; break }
     const usd = ctx.usage.usd
     if (cfg.maxUsd != null && usd != null && usd >= cfg.maxUsd * 0.85) { stopReason = 'budget'; break }
   }
+  const deepOrder = order.slice(0, judged.length ? order.length : 0)
   if (stopReason === 'enough') progress('deep', `十分な候補が集まったため精査を終了しました（${judged.length}件を精査）`)
   if (stopReason === 'budget') progress('deep', `費用の上限（$${cfg.maxUsd}）に近づいたため精査を終了しました（${judged.length}件を精査）`)
 
@@ -693,10 +702,10 @@ export async function runAiSearch(env, db, criteria, options = {}) {
 
   const summary = {
     elapsedSec: Math.round((Date.now() - t0) / 1000), poolSize: pool.ids.length, screened: screen.size, judged: judged.length,
-    recommended: recommended.length, usage: ctx.usage.summary(), depth, precision, costMode: cfg.costMode, stopReason, cancelled: !!ctx.isCancelled?.(),
+    recommended: recommended.length, usage: ctx.usage.summary(), depth, precision, costMode: cfg.costMode, stopReason, deepPlanned: order.length, cancelled: !!ctx.isCancelled?.(),
   }
   progress('done', `完了: ${recommended.length}件を提案`, summary)
   // 振り返り用: 一次審査の点数（職種別の分布を見て、取りこぼしを確認できるように）
   const screenLog = options.keepScreen ? [...screen.entries()].map(([id, s]) => ({ id, s, kw: Math.round((score.get(id)?.total || 0) * 100) / 100 })) : undefined
-  return { plan: ctx.plan, pool: { size: pool.ids.length, query: pool.query, excluded: pool.excluded }, recommended, reference, judged, summary, screenLog }
+  return { deepOrder, plan: ctx.plan, pool: { size: pool.ids.length, query: pool.query, excluded: pool.excluded }, recommended, reference, judged, summary, screenLog }
 }
