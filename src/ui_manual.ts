@@ -32,7 +32,7 @@ export function renderManualPage(): string {
         <button id="syncBtn" class="text-sm bg-white text-emerald-700 hover:bg-emerald-50 font-semibold rounded-full px-4 py-1.5 transition shadow-sm">
           <i class="fas fa-rotate mr-1"></i>今すぐ全件同期
         </button>
-        <a href="/" class="text-sm bg-white/20 hover:bg-white/30 rounded-full px-4 py-1.5 transition">
+        <a href="/ai" class="text-sm bg-white/20 hover:bg-white/30 rounded-full px-4 py-1.5 transition">
           <i class="fas fa-robot mr-1"></i>AI検索に戻る
         </a>
       </div>

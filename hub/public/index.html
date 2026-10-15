@@ -16,7 +16,7 @@
 <body class="bg-slate-50 text-slate-800">
 <header class="bg-white border-b sticky top-0 z-10">
   <div class="max-w-7xl mx-auto px-4 py-3 flex flex-wrap items-center gap-4">
-    <a id="back-link" href="/" class="hidden text-sm text-blue-600 hover:underline">← AI検索に戻る</a>
+    <a id="back-link" href="/ai" class="hidden text-sm text-blue-600 hover:underline">← AI検索に戻る</a>
     <h1 class="text-lg font-bold">手動検索 <span class="text-xs font-normal text-slate-500">（全媒体の求人DB・毎晩更新）</span></h1>
     <div id="source-summary" class="flex flex-wrap gap-2 text-sm"></div>
   </div>
@@ -76,6 +76,12 @@
   </aside>
 
   <section id="results-section">
+    <div id="ai-handoff" class="hidden mb-2 flex flex-wrap items-center gap-2 text-sm bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">
+      <span id="ai-selected-count" class="text-indigo-800"></span>
+      <button id="ai-review-button" class="bg-indigo-600 hover:bg-indigo-700 text-white rounded px-3 py-1">選んだ求人をAIで審査</button>
+      <button id="ai-clear-button" class="text-indigo-700 underline">選択を解除</button>
+      <span class="text-xs text-slate-500">求職者の書類・要望と照らして、合う順に並べ、推薦文を付けます</span>
+    </div>
     <div class="flex items-center justify-between mb-2 text-sm text-slate-600">
       <div id="result-count">読み込み中…</div>
       <div id="pager" class="flex gap-2"></div>
@@ -99,6 +105,8 @@ const COLOR = { circus: 'bg-orange-100 text-orange-800', hitolink: 'bg-green-100
 const CHANGE = { added: '追加', updated: '更新', closed: '掲載終了', reopened: '再掲載', deleted: '削除' }
 const PAGE_SIZE = 30
 let offset = 0
+// AIで審査する求人（ページをまたいで選べる。ブラウザに一時保存）
+const picked = new Set(JSON.parse(sessionStorage.getItem('aiPicked') || '[]'))
 
 const $ = (s) => document.querySelector(s)
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
@@ -154,6 +162,7 @@ async function search() {
   $('#result-list').innerHTML = r.jobs.map((j) => `
     <article class="job-card bg-white border rounded-lg p-3 hover:border-blue-400 cursor-pointer" data-id="${j.id}">
       <div class="flex items-start gap-2">
+        ${API_BASE ? `<input type="checkbox" class="pick-job mt-1" data-key="${esc(j.source)}:${esc(j.source_job_id)}" ${picked.has(`${j.source}:${j.source_job_id}`) ? 'checked' : ''} title="AIで審査する求人に追加">` : ''}
         ${badge(j.source)}
         ${j.status === 'closed' ? '<span class="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700">掲載終了</span>' : ''}
         <h2 class="font-semibold clamp2 flex-1">${esc(j.title || '(タイトルなし)')}</h2>
@@ -208,9 +217,30 @@ $('#reset-button').addEventListener('click', () => setTimeout(() => { offset = 0
 document.addEventListener('click', (e) => {
   const p = e.target.closest('[data-offset]')
   if (p && !p.disabled) { offset = Math.max(0, Number(p.dataset.offset)); search(); scrollTo({ top: 0 }) ; return }
+  if (e.target.classList.contains('pick-job')) return
   const c = e.target.closest('.job-card')
   if (c) openJob(c.dataset.id)
 })
+// ---- AI検索への受け渡し ----
+function renderPicked() {
+  sessionStorage.setItem('aiPicked', JSON.stringify([...picked]))
+  const box = document.getElementById('ai-handoff')
+  if (!box) return
+  box.classList.toggle('hidden', !API_BASE || !picked.size)
+  $('#ai-selected-count').textContent = `${picked.size}件を選択中`
+}
+document.addEventListener('change', (e) => {
+  if (!e.target.classList.contains('pick-job')) return
+  const k = e.target.dataset.key
+  if (e.target.checked) { if (picked.size >= 300) { e.target.checked = false; alert('AIで審査できるのは一度に300件までです'); return } picked.add(k) } else picked.delete(k)
+  renderPicked()
+})
+$('#ai-review-button')?.addEventListener('click', () => {
+  if (!picked.size) return
+  location.href = '/ai?jobKeys=' + encodeURIComponent([...picked].join(','))
+})
+$('#ai-clear-button')?.addEventListener('click', () => { picked.clear(); document.querySelectorAll('.pick-job').forEach((b) => { b.checked = false }); renderPicked() })
+renderPicked()
 $('#dialog-close').addEventListener('click', () => $('#job-dialog').close())
 $('#job-dialog').addEventListener('click', (e) => { if (e.target.id === 'job-dialog') e.target.close() })
 

@@ -53,8 +53,24 @@ async function main() {
     fs.unlinkSync(path.join(cfg.backupDir, f))
     log(`古いバックアップを削除: ${f}`)
   }
+  // 作業用DB（求職者・書類・検索結果）も同じ場所に保存（小さいので7世代残す）
+  const wsPath = process.env.HUB_WORKSPACE_PATH || path.join(path.dirname(cfg.dbPath), 'workspace.sqlite')
+  if (fs.existsSync(wsPath)) {
+    const wtmp = path.join(cfg.backupDir, `workspace_${stamp}.sqlite`)
+    const wsrc = new DatabaseSync(wsPath, { readOnly: true })
+    await backup(wsrc, wtmp)
+    wsrc.close()
+    const wchk = new DatabaseSync(wtmp); wchk.exec('PRAGMA journal_mode = DELETE')
+    const wn = wchk.prepare('SELECT COUNT(*) AS n FROM candidates').get().n; wchk.close()
+    for (const ext of ['-wal', '-shm']) { try { fs.unlinkSync(wtmp + ext) } catch {} }
+    await pipeline(fs.createReadStream(wtmp), zlib.createGzip({ level: 6 }), fs.createWriteStream(`${wtmp}.gz`, { mode: 0o600 }))
+    fs.unlinkSync(wtmp)
+    log(`作業用DBのバックアップ完了: ${wtmp}.gz（求職者 ${wn.toLocaleString()} 人）`)
+    const wfiles = fs.readdirSync(cfg.backupDir).filter((f) => /^workspace_.*\.sqlite\.gz$/.test(f)).sort().reverse()
+    for (const f of wfiles.slice(7)) fs.unlinkSync(path.join(cfg.backupDir, f))
+  }
   // 途中で失敗して残った未圧縮ファイルを掃除
-  for (const f of fs.readdirSync(cfg.backupDir).filter((f) => /^jobs_hub_.*\.sqlite(-wal|-shm)?$/.test(f))) {
+  for (const f of fs.readdirSync(cfg.backupDir).filter((f) => /^(jobs_hub|workspace)_.*\.sqlite(-wal|-shm)?$/.test(f))) {
     fs.unlinkSync(path.join(cfg.backupDir, f))
   }
 }

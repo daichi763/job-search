@@ -110,6 +110,7 @@ export function criteriaText(c = {}) {
   if (c.salaryMin) f.push(`希望年収: ${c.salaryMin}万円以上`)
   if (c.employment?.length) f.push(`雇用形態: ${[].concat(c.employment).join('・')}`)
   if (c.jobCategories?.length) f.push(`希望職種: ${[].concat(c.jobCategories).join('・')}`)
+  if (c.desiredJobs) f.push(`希望職種（参考・絞り込みには使わない）: ${String(c.desiredJobs).slice(0, 200)}`)
   if (c.features?.length) f.push(`働き方: ${[].concat(c.features).map((x) => FEATURES[x] || x).join('・')}`)
   if (c.overtimeMax) f.push(`残業: ${c.overtimeMax}`)
   if (c.holiday?.length) f.push(`休日: ${[].concat(c.holiday).join('・')}`)

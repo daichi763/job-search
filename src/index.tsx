@@ -13,6 +13,7 @@ import {
   type User,
 } from './lib/auth'
 import { renderLoginPage, renderUsersPage, renderAccountPage, userBadge } from './ui_auth'
+import { renderAiPage } from './ui_ai'
 
 type Bindings = Env
 
@@ -1212,7 +1213,9 @@ const faviconResponse = (c: any) =>
 app.get('/favicon.ico', faviconResponse)
 app.get('/favicon.svg', faviconResponse)
 
-app.get('/', (c) => {
+// トップは新しいAI検索（求人DB方式）。旧AI検索（媒体に直接ログインする方式）は /legacy に残す（切り戻し用）
+app.get('/', (c) => c.redirect('/ai'))
+app.get('/legacy', (c) => {
   return c.html(withBadge(c, renderPage()))
 })
 
@@ -1258,6 +1261,37 @@ app.get('/hub-api/api/*', async (c) => {
     return c.json({ error: 'hub_unavailable', message: String(e?.message || e) }, 502)
   }
 })
+
+// ---------------------------------------------------------
+// 新しいAI検索（求人DB方式）: 画面 /ai と API /api/ai/* → hub-ai（127.0.0.1:3101）へ中継
+//   ・ログインした担当者（id・名前・権限）を x-hub-user で渡す
+//   ・合言葉は INGEST_TOKEN（worker/.env と同じ値）
+//   ・中継先は .dev.vars の HUB_AI_URL で変更可
+// ---------------------------------------------------------
+const hubAiBase = (c: any) => ((c.env as any).HUB_AI_URL || 'http://127.0.0.1:3101').replace(/\/$/, '')
+const toB64 = (s: string) => btoa(String.fromCharCode(...new TextEncoder().encode(s)))
+app.all('/api/ai/*', async (c) => {
+  const u = c.get('user')
+  if (!u) return c.json({ ok: false, error: 'ログインしてください' }, 401)
+  const url = new URL(c.req.url)
+  const path = url.pathname.replace(/^\/api\/ai/, '') || '/'
+  const headers: Record<string, string> = {
+    'x-hub-token': (c.env as any).INGEST_TOKEN || '',
+    'x-hub-user': toB64(JSON.stringify({ id: u.id, name: u.name, role: u.role })),
+  }
+  const init: RequestInit = { method: c.req.method, headers, signal: AbortSignal.timeout(120000) }
+  if (!['GET', 'HEAD'].includes(c.req.method)) {
+    headers['content-type'] = 'application/json'
+    init.body = await c.req.text()
+  }
+  try {
+    const r = await fetch(`${hubAiBase(c)}${path}${url.search}`, init)
+    return new Response(r.body, { status: r.status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } })
+  } catch (e: any) {
+    return c.json({ ok: false, error: 'AI検索サーバー（hub-ai）に接続できません。VPSで pm2 list を確認してください', detail: String(e?.message || e) }, 502)
+  }
+})
+app.get('/ai', (c) => c.html(withBadge(c, renderAiPage(c.get('user')!))))
 
 // 外部向け検索API v1（別アプリ用）→ hub の検索サーバーへ中継（GET / OPTIONS のみ）
 //   APIキー（hub/.env の HUB_API_KEYS）の確認や回数制限は hub 側で行う

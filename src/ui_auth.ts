@@ -38,7 +38,7 @@ const nav = (me: { name: string; role: string }, active: string) => `
   <header class="bg-gradient-to-r from-indigo-600 to-blue-600 text-white shadow">
     <nav class="max-w-5xl mx-auto px-4 py-3 flex flex-wrap items-center gap-3">
       <a href="/" class="font-bold mr-auto"><i class="fas fa-magnifying-glass-chart mr-2"></i>求人横断検索AI</a>
-      <a href="/" class="text-sm hover:underline">AI検索</a>
+      <a href="/ai" class="text-sm hover:underline">AI検索</a>
       <a href="/manual" class="text-sm hover:underline">手動検索</a>
       ${me.role === 'admin' ? `<a href="/admin/users" class="text-sm ${active === 'users' ? 'underline font-semibold' : 'hover:underline'}">担当者の管理</a>` : ''}
       <a href="/account" class="text-sm ${active === 'account' ? 'underline font-semibold' : 'hover:underline'}"><i class="fas fa-user mr-1"></i>${esc(me.name)}</a>

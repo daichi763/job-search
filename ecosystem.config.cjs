@@ -53,5 +53,23 @@ module.exports = {
       max_restarts: 15,
       restart_delay: 5000,
     },
+    {
+      // AI検索サーバー（127.0.0.1:3101 のサーバー内部専用）。画面 /ai から webapp 経由で使う
+      //   求職者・書類・検索結果は hub/data/workspace.sqlite。AI検索は順番待ちで1件ずつ実行
+      name: 'hub-ai',
+      script: 'bin/ai-server.js',
+      cwd: HUB_CWD,
+      interpreter: 'node',
+      interpreter_args: '--no-warnings',
+      env: { NODE_ENV: 'production' },
+      watch: false,
+      instances: 1,
+      exec_mode: 'fork',
+      max_memory_restart: '2G',
+      kill_timeout: 10000,
+      min_uptime: 10000,
+      max_restarts: 15,
+      restart_delay: 5000,
+    },
   ],
 }
