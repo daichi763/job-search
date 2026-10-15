@@ -16,7 +16,7 @@
 //     --top=20                提案件数
 //     --out=結果.json         結果を保存（未指定なら hub/data/ai-results/ に保存）
 //     --dry                   AIを呼ばず、母集団の件数とキーワードの当たり具合だけ確認
-//     --compare               精査を最後まで行い、「途中で止めていたら提案がどう変わったか」を表示（精度確認用）
+//     --compare               候補の全件を賢いモデルでも判定し、「2段階の精査（安いモデルで予備判定→上位だけ最終判定）」と提案がどう違うかを表示（精度確認用・費用は増える）
 // ============================================================
 import fs from 'node:fs'
 import path from 'node:path'
@@ -57,7 +57,7 @@ const db = openDb(cfg.dbPath, { readonly: true })
 
 async function main() {
   const m = aiModels(env)
-  log(`モデル: 理解・精査=${m.smart}${opt.precision === 'top' ? `（精査は ${m.top}）` : ''} / 一次審査=${m.fast}（使えない場合は ${m.fallbackSmart.join('→')} / ${m.fallbackFast.join('→')}）`)
+  log(`モデル: 理解・最終判定=${m.smart}${opt.precision === 'top' ? `（精査は ${m.top}）` : ''} / 一次審査・予備判定=${m.fast}（使えない場合は ${m.fallbackSmart.join('→')} / ${m.fallbackFast.join('→')}）`)
 
   const pool = buildPool(db, criteria)
   log(`確定条件: ${JSON.stringify(criteriaToQuery(criteria))}`)
@@ -84,7 +84,7 @@ async function main() {
     console.log('\n' + profileToText(profile) + '\n')
   }
 
-  const runOpt = opt.compare ? { config: { earlyStop: null } } : {}
+  const runOpt = opt.compare ? { config: { earlyStop: null, comparePre: true } } : {}
   const result = await runAiSearch(env, db, criteria, { ...runOpt,
     profile, keepScreen: true, costMode: opt.cost, depth: opt.depth || 'standard', precision: opt.precision || 'high', log,
     onProgress: (p) => { if (p.stage !== 'screen' || /終わり/.test(p.message) || (p.screened || 0) % 400 === 0) log(`${p.message}（${p.elapsedSec}秒・トークン ${p.usage.tokens.toLocaleString()}）`) },
@@ -112,55 +112,51 @@ async function main() {
     result.reference.forEach(show)
   }
   const s = result.summary
-  console.log(`\n所要 ${s.elapsedSec}秒 / 母集団 ${s.poolSize.toLocaleString()} / 一次審査 ${s.screened.toLocaleString()} / 精査 ${s.judged} / トークン ${s.usage.tokens.toLocaleString()}${s.usage.usd != null ? ` / 費用の目安 約$${s.usage.usd}（約${Math.round(s.usage.usd * 150)}円）` : ''}`)
+  console.log(`\n所要 ${s.elapsedSec}秒 / 母集団 ${s.poolSize.toLocaleString()} / 一次審査 ${s.screened.toLocaleString()} / 精査 ${s.preJudged ? `予備${s.preJudged}→最終${s.finalJudged}` : s.judged} / トークン ${s.usage.tokens.toLocaleString()}${s.usage.usd != null ? ` / 費用の目安 約$${s.usage.usd}（約${Math.round(s.usage.usd * 150)}円）` : ''}`)
   console.log(`モデル別: ${Object.entries(s.usage.byModel).map(([k, v]) => `${k} ${v.calls}回`).join(' / ')}`)
   console.log(`段階別: ${Object.entries(s.usage.byStage).map(([k, v]) => `${k} ${(v.input + v.output).toLocaleString()}トークン${v.usd != null ? `（約${Math.round(v.usd * 150)}円）` : ''}`).join(' / ')}`)
   console.log(`費用モード: ${s.costMode}${s.stopReason === 'enough' ? ' / 十分な候補が集まったため精査を早めに終了' : s.stopReason === 'budget' ? ' / 費用の上限で精査を終了' : ''}`)
 
-  if (opt.compare) {
-    // 実際の精査結果を使って、途中終了した場合の提案を再現し、最後まで精査した場合と比べる
+  if (opt.compare && result.preJudged?.length) {
+    // 全件を賢いモデルで判定した結果を基準に、「安いモデルの予備判定で上位だけ残した場合」の提案を再現して比べる
     const { engineConfig, dupKey } = await import('../lib/ai/engine.js')
     const topN = Math.max(1, Math.min(100, Number(criteria.topN) || 20))
-    const byId = new Map(result.judged.map((r) => [r.job.id, r]))
+    const minScore = engineConfig(env).minScore
     const pick = (list) => {
       const seen = new Set(), out = []
       for (const r of [...list].sort((a, b) => b.score - a.score || b.rawScore - a.rawScore)) {
         const k = dupKey(r.job) || r.job.id
         if (seen.has(k)) continue
         seen.add(k)
-        if (r.score >= engineConfig(env).minScore && r.eligibility !== 'unmet') out.push(r)
+        if (r.score >= minScore && r.eligibility !== 'unmet') out.push(r)
       }
       return out.slice(0, topN)
     }
     const full = pick(result.judged)
-    console.log(`\n=== 精度確認（途中で精査を止めた場合との比較・精査 ${result.judged.length}件） ===`)
-    for (const mode of ['economy']) {
-      const ec = engineConfig(env, mode)
-      const es = ec.earlyStop
-      const target = Math.ceil(topN * es.need), minJudge = Math.ceil(topN * es.minJudge)
-      const firstN = Math.max(ec.deepBatch * 4, Math.ceil(topN * ec.deepFirst)), step = Math.max(ec.deepBatch * 2, Math.ceil(topN / 2))
-      let n = 0, stop = result.deepOrder.length
-      for (let pos = 0; pos < result.deepOrder.length;) {
-        pos += pos === 0 ? firstN : step
-        n = Math.min(pos, result.deepOrder.length)
-        const part = result.deepOrder.slice(0, n).map((id) => byId.get(id)).filter(Boolean)
-        const good = new Set(part.filter((r) => r.eligibility !== 'unmet' && r.score >= es.good).map((r) => dupKey(r.job) || r.job.id)).size
-        if (n >= minJudge && good >= target) { stop = n; break }
-      }
-      const early = pick(result.deepOrder.slice(0, stop).map((id) => byId.get(id)).filter(Boolean))
-      const fullKeys = new Set(full.map((r) => r.job.id))
-      const same = early.filter((r) => fullKeys.has(r.job.id)).length
-      const missed = full.filter((r) => !early.some((e) => e.job.id === r.job.id))
-      console.log(`[${mode}] 精査 ${stop}件で終了 → 提案${topN}件中 ${same}件が一致${missed.length ? ` / 外れた求人: ${missed.map((r) => `${r.score}点 ${String(r.job.title).slice(0, 30)}`).join('、')}` : ''}`)
-      const top5 = full.slice(0, 5).filter((r) => early.some((e) => e.job.id === r.job.id)).length
-      console.log(`         上位5件のうち ${top5}件が一致`)
+    const pre = result.preJudged
+    console.log(`\n=== 精度確認（全件を ${m.smart} で判定した場合と、2段階で判定した場合の比較・候補 ${result.judged.length}件） ===`)
+    for (const mode of ['economy', 'standard']) {
+      const f = engineConfig(env, mode).finalFactor
+      const n = Math.ceil(topN * f)
+      const ranked = [...pre].sort((a, b) => (a.eligibility === 'unmet') - (b.eligibility === 'unmet') || b.rawScore - a.rawScore)
+      const seen = new Set(), keep = new Set()
+      for (const r of ranked) { const k = dupKey(r.job) || r.job.id; if (seen.has(k)) continue; seen.add(k); keep.add(r.job.id); if (keep.size >= n) break }
+      const got = new Set(pre.map((r) => r.job.id))
+      const two = pick(result.judged.filter((r) => keep.has(r.job.id) || !got.has(r.job.id)))
+      const same = two.filter((r) => full.some((x) => x.job.id === r.job.id)).length
+      // 同じ点数の求人が入れ替わっただけのものは「取りこぼし」に数えない
+      const floor = two.length >= full.length ? Math.min(...two.map((r) => r.score)) : -1
+      const missed = full.filter((r) => !two.some((e) => e.job.id === r.job.id))
+      const real = missed.filter((r) => r.score > floor)
+      const loss = full.reduce((a, r) => a + r.score, 0) - two.reduce((a, r) => a + r.score, 0)
+      console.log(`[${mode}] 上位${n}件を最終判定 → 提案${full.length}件中 ${same}件が同じ求人${missed.length - real.length ? `（${missed.length - real.length}件は同点の求人との入れ替え）` : ''} / 取りこぼし ${real.length}件${real.length ? `: ${real.map((r) => `${r.score}点 ${String(r.job.title).slice(0, 30)}`).join('、')}` : ''} / 提案の合計点の差 ${loss}点`)
     }
   }
 
   const out = opt.out || path.join(HUB_DIR, 'data', 'ai-results', `ai_${new Date().toISOString().replace(/[:.]/g, '-')}.json`)
   fs.mkdirSync(path.dirname(out), { recursive: true })
   const slim = (r) => ({ ...r, job: { id: r.job.id, key: `${r.job.source}:${r.job.source_job_id}`, vacancy_no: r.job.vacancy_no, title: r.job.title, company: r.job.company, url: r.job.url } })
-  fs.writeFileSync(out, JSON.stringify({ criteria, profile, plan: P, summary: s, recommended: result.recommended.map(slim), reference: result.reference.map(slim), judged: result.judged.map(slim), screenLog: result.screenLog, deepOrder: result.deepOrder }, null, 2))
+  fs.writeFileSync(out, JSON.stringify({ criteria, profile, plan: P, summary: s, recommended: result.recommended.map(slim), reference: result.reference.map(slim), judged: result.judged.map(slim), preJudged: result.preJudged?.map(slim), screenLog: result.screenLog, deepOrder: result.deepOrder }, null, 2))
   console.log(`結果を保存しました: ${out}`)
 }
 main().catch((e) => { console.error('エラー:', e.message); process.exitCode = 1 }).finally(() => db.close())

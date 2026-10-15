@@ -136,6 +136,32 @@ test('AI検索の全体: 理解→絞込→一次審査→精査、満たさな�
   f.server.close()
 })
 
+test('2段階の精査: 安いモデルが全候補を予備判定し、上位だけ優秀モデルが最終判定する', async () => {
+  const db = setupDb()
+  const f = await fakeOpenAI((j) => {
+    const sys = j.messages[0].content, u = j.messages[1].content
+    if (sys.includes('計画')) return { understanding: '営業', priorities: [], dealbreakers: [], mustHave: [], angles: [{ type: '王道', label: '営業', why: '', keywords: ['営業'] }] }
+    if (sys.includes('ふるい分け')) { const n = (u.match(/^\[\d+\]/gm) || []).length; return { s: Array.from({ length: n }, (_, i) => [i, 4, 1, 1]) } }
+    if (sys.includes('提案する文章')) { const n = (u.match(/===== 求人\[\d+\] =====/g) || []).length; return { r: Array.from({ length: n }, (_, i) => ({ i, reason: 'x', concerns: [], checkPoints: [] })) } }
+    const blocks = u.split(/===== 求人\[(\d+)\] =====/).slice(1), r = []
+    for (let k = 0; k < blocks.length; k += 2) {
+      const text = blocks[k + 1]
+      // 予備判定（m-fast）は法人営業を高く、最終判定（m-smart）は別の点数を付ける
+      const sc = j.model === 'm-fast' ? (text.includes('法人営業') ? 90 : 60) : 80
+      r.push({ i: Number(blocks[k]), score: sc, must: [{ req: '経験', status: 'met', evidence: '' }], angle: '王道' })
+    }
+    return { r }
+  })
+  const env = { OPENAI_BASE_URL: f.url, OPENAI_API_KEY: 'k', HUB_AI_MODEL_SMART: 'm-smart', HUB_AI_MODEL_FAST: 'm-fast', HUB_AI_FALLBACK_MODELS: 'm-smart', HUB_AI_FALLBACK_FAST_MODELS: 'm-fast' }
+  const res = await runAiSearch(env, db, { freeText: '営業', topN: 1 }, { config: { finalFactor: 1, deepMaxFactor: 10, deepMinScreen: 0 } })
+  assert.ok(res.summary.preJudged >= 2)
+  assert.equal(res.summary.finalJudged, 1)                                 // 上位1件だけ最終判定
+  assert.ok(res.judged.every((r) => r.model === 'm-smart'))                // 提案の点数は優秀モデルの判定
+  assert.ok(res.judged[0].job.title.includes('法人営業'))                   // 予備判定の上位が最終判定に進む
+  assert.ok(res.summary.usage.byStage['精査（予備判定）'] && res.summary.usage.byStage['精査（判定）'])
+  f.server.close()
+})
+
 test('一次審査の点数換算・精査対象の選び方・同じ求人のまとめ', async () => {
   const { screenPoint, pickForDeep, dupKey } = await import('../lib/ai/engine.js')
   assert.equal(screenPoint(5, 1, 1), 95)

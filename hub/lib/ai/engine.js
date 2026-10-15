@@ -25,9 +25,11 @@ const COST_MODES = {
   // earlyStop: 精査を途中で終える条件（null=最後まで精査）。
   //   検証の結果、一次審査の順位と精査の点数はあまり一致せず（最高点の求人が精査の最後のほうに出ることがある）、
   //   途中終了は上位の取りこぼしにつながるため、standard / quality では使わない。
-  economy:  { screenStandard: 1200, deepFirst: 2, deepMaxFactor: 3, judgeEffort: 'low',    descChars: 2000, earlyStop: { minJudge: 1.5, good: 80, need: 1.25 } },
-  standard: { screenStandard: 2000, deepFirst: 4, deepMaxFactor: 4, judgeEffort: 'medium', descChars: 2800, earlyStop: null },
-  quality:  { screenStandard: 3000, deepFirst: 6, deepMaxFactor: 6, judgeEffort: 'high',   descChars: 2800, earlyStop: null },
+  // finalFactor: 精査を2段にする。安いモデル（fast）が候補を全文で予備判定し、上位「提案件数×この倍率」だけを
+  //   賢いモデル（smart）が最終判定する（null=全件を smart で判定）。検証では ×2 以上で「全件を smart」と同じ提案になった。
+  economy:  { screenStandard: 1500, deepFirst: 3, deepMaxFactor: 4, judgeEffort: 'medium', descChars: 2800, finalFactor: 1.5, earlyStop: null },
+  standard: { screenStandard: 2000, deepFirst: 6, deepMaxFactor: 6, judgeEffort: 'medium', descChars: 2800, finalFactor: 2,   earlyStop: null },
+  quality:  { screenStandard: 3000, deepFirst: 6, deepMaxFactor: 6, judgeEffort: 'high',   descChars: 2800, finalFactor: null, earlyStop: null },
 }
 export function engineConfig(env = {}, mode) {
   const cm = COST_MODES[mode || env.HUB_AI_COST_MODE] || COST_MODES.standard
@@ -47,6 +49,8 @@ export function engineConfig(env = {}, mode) {
     capUnmet: int(env.HUB_AI_CAP_UNMET, 55),               // 必須要件を満たさない求人の上限点
     capUnknown: int(env.HUB_AI_CAP_UNKNOWN, 84),           // 書類があるのに必須要件を確認できない求人の上限点
     minScore: int(env.HUB_AI_MIN_SCORE, 60),               // 提案する最低点
+    finalFactor: env.HUB_AI_FINAL_FACTOR === '0' ? null : env.HUB_AI_FINAL_FACTOR ? Number(env.HUB_AI_FINAL_FACTOR) : cm.finalFactor,
+    preEffort: env.HUB_AI_PRE_EFFORT || 'high',            // 予備判定（fast）の推論の深さ
     earlyStop: env.HUB_AI_EARLY_STOP === '0' ? null : cm.earlyStop, // 精査の途中終了（HUB_AI_EARLY_STOP=0 で無効）
     maxUsd: env.HUB_AI_MAX_USD ? Number(env.HUB_AI_MAX_USD) : null, // 1回の検索の費用上限（米ドル。超えたら精査を打ち切る）
   }
@@ -481,7 +485,7 @@ export function finalizeScore(r, { hasProfile, cfg }) {
 }
 
 const STATUS = ['met', 'unmet', 'unknown']
-async function deepJudge(env, ctx, jobs, onBatch) {
+async function deepJudge(env, ctx, jobs, onBatch, opt = {}) {
   const cfg = ctx.cfg
   const head = contextBlock(ctx, { short: false })
   const batches = []
@@ -494,8 +498,8 @@ async function deepJudge(env, ctx, jobs, onBatch) {
     let arr = []
     try {
       const { data, model } = await chatJson(env, {
-        models: ctx.models.deepList, system: DEEP_SYSTEM, effort: ctx.precision === 'top' ? 'high' : cfg.judgeEffort,
-        maxTokens: 3000 + 1500 * batch.length, usage: ctx.usage, label: '精査', stage: '精査（判定）',
+        models: opt.models || ctx.models.deepList, system: DEEP_SYSTEM, effort: opt.effort || (ctx.precision === 'top' ? 'high' : cfg.judgeEffort),
+        maxTokens: 3000 + 1500 * batch.length, usage: ctx.usage, label: opt.label || '精査', stage: opt.stage || '精査（判定）',
         user: `${head}\n\n${body}\n\n各求人[i]を審査してJSONで返してください。`,
       })
       arr = (Array.isArray(data.r) ? data.r : Array.isArray(data.results) ? data.results : []).map((x) => ({ ...x, _model: model }))
@@ -513,7 +517,7 @@ async function deepJudge(env, ctx, jobs, onBatch) {
         reason: '', concerns: [], checkPoints: [], model: r._model,
       }
       results.push(item)
-      ctx.onJudged?.(item)
+      if (!opt.pre) ctx.onJudged?.(item)
     }
     done += batch.length
     onBatch?.(done, jobs.length)
@@ -650,23 +654,43 @@ export async function runAiSearch(env, db, criteria, options = {}) {
   const target = es ? Math.ceil(topN * es.need) : Infinity
   const minJudge = es ? Math.ceil(topN * es.minJudge) : Infinity
   const firstN = directDeep ? order.length : Math.min(order.length, Math.max(cfg.deepBatch * 4, Math.ceil(topN * cfg.deepFirst)))
-  progress('deep', `有望な求人の求人票を全文で精査しています（最大 ${order.length}件。十分な候補が集まり次第終了）…`, { deepSize: order.length })
+  progress('deep', `有望な求人 ${order.length}件の求人票を全文で精査します…`, { deepSize: order.length })
   const judged = []
   let stopReason = null
-  for (let pos = 0; pos < order.length;) {
+  let finalOrder = order, preJudged = null
+  // 2段精査: 安いモデルで全候補を予備判定 → 上位だけ賢いモデルで最終判定
+  const finalN = cfg.finalFactor ? Math.ceil(topN * cfg.finalFactor) : Infinity
+  // 担当者が手で選んだ求人（directDeep）は全件を賢いモデルで判定する
+  if (!directDeep && ((cfg.finalFactor && order.length > finalN) || cfg.comparePre)) {
+    progress('deep', `候補 ${order.length}件の求人票を全文で予備判定しています…`)
+    preJudged = await deepJudge(env, ctx, loadJobs(db, order, { full: true }), () => {}, { models: ctx.models.fastList, effort: cfg.preEffort, stage: '精査（予備判定）', label: '予備判定', pre: true })
+    if (!cfg.comparePre && cfg.finalFactor && order.length > finalN) {
+      const ranked = [...preJudged].sort((a, b) => (a.eligibility === 'unmet') - (b.eligibility === 'unmet') || b.rawScore - a.rawScore)
+      const seen = new Set(), pick = []
+      for (const r of ranked) { const k = dupKey(r.job) || r.job.id; if (seen.has(k)) continue; seen.add(k); pick.push(r.job.id); if (pick.length >= finalN) break }
+      // 予備判定で落ちた求人（応答が欠けたもの）は念のため最終判定へ
+      const got = new Set(preJudged.map((r) => r.job.id))
+      for (const id of order) if (!got.has(id)) pick.push(id)
+      finalOrder = order.filter((id) => pick.includes(id))
+      progress('deep', `予備判定の上位 ${finalOrder.length}件を最終判定しています…`, { preJudged: preJudged.length })
+    }
+  }
+  for (let pos = 0; pos < finalOrder.length;) {
     if (ctx.isCancelled?.()) { stopReason = 'cancelled'; break }
-    const size = pos === 0 ? firstN : Math.max(cfg.deepBatch * 2, Math.ceil(topN / 2))
-    const wave = loadJobs(db, order.slice(pos, pos + size), { full: true })
+    const size = finalOrder !== order ? finalOrder.length : pos === 0 ? firstN : Math.max(cfg.deepBatch * 2, Math.ceil(topN / 2))
+    const wave = loadJobs(db, finalOrder.slice(pos, pos + size), { full: true })
     pos += size
     const r = await deepJudge(env, ctx, wave, () => {})
     judged.push(...r)
     const good = new Set(judged.filter((x) => x.eligibility !== 'unmet' && x.score >= (es?.good ?? 85)).map((x) => dupKey(x.job) || x.job.id)).size
-    progress('deep', `精査中… ${judged.length} / ${order.length}件（十分に良い候補 ${good}件）`, { judged: judged.length, good })
+    progress('deep', `精査中… ${judged.length} / ${finalOrder.length}件（十分に良い候補 ${good}件）`, { judged: judged.length, good })
     if (!directDeep && es && judged.length >= minJudge && good >= target) { stopReason = 'enough'; break }
     const usd = ctx.usage.usd
     if (cfg.maxUsd != null && usd != null && usd >= cfg.maxUsd * 0.85) { stopReason = 'budget'; break }
   }
   const deepOrder = order.slice(0, judged.length ? order.length : 0)
+  // 予備判定だけの求人は提案には使わない（参考：必須要件を満たさない求人の一覧にだけ入れる）
+  const preOnly = preJudged && finalOrder !== order ? preJudged.filter((r) => !finalOrder.includes(r.job.id)) : []
   if (stopReason === 'enough') progress('deep', `十分な候補が集まったため精査を終了しました（${judged.length}件を精査）`)
   if (stopReason === 'budget') progress('deep', `費用の上限（$${cfg.maxUsd}）に近づいたため精査を終了しました（${judged.length}件を精査）`)
 
@@ -695,17 +719,29 @@ export async function runAiSearch(env, db, criteria, options = {}) {
   const want = Math.min(others.length, Math.max(0, Math.floor(topN * 0.2) - recommended.filter((r) => r.angle && r.angle !== '王道').length))
   for (let k = 0; k < want; k++) recommended.splice(recommended.length - 1 - k, 1, others[k])
   recommended.sort((a, b) => b.score - a.score)
-  const reference = uniq.filter((r) => r.eligibility === 'unmet' && r.rawScore >= 75).slice(0, 10)
+  const refPool = [...uniq, ...preOnly.filter((r) => !groups.has(dupKey(r.job)) && !uniq.some((u) => u.job.id === r.job.id))]
+  const reference = refPool.filter((r) => r.eligibility === 'unmet' && r.rawScore >= 75).sort((a, b) => b.rawScore - a.rawScore).slice(0, 10)
+  for (const r of reference) r.reason = r.reason || r.fit
   for (const r of [...uniq]) if (!recommended.includes(r)) r.reason = r.reason || r.fit
   progress('write', `提案する ${recommended.length}件の推薦文を書いています…`)
   await writeReasons(env, ctx, recommended)
 
   const summary = {
     elapsedSec: Math.round((Date.now() - t0) / 1000), poolSize: pool.ids.length, screened: screen.size, judged: judged.length,
-    recommended: recommended.length, usage: ctx.usage.summary(), depth, precision, costMode: cfg.costMode, stopReason, deepPlanned: order.length, cancelled: !!ctx.isCancelled?.(),
+    recommended: recommended.length, usage: ctx.usage.summary(), depth, precision, costMode: cfg.costMode, stopReason, deepPlanned: order.length, preJudged: preJudged?.length || 0, finalJudged: judged.length, cancelled: !!ctx.isCancelled?.(),
   }
   progress('done', `完了: ${recommended.length}件を提案`, summary)
   // 振り返り用: 一次審査の点数（職種別の分布を見て、取りこぼしを確認できるように）
   const screenLog = options.keepScreen ? [...screen.entries()].map(([id, s]) => ({ id, s, kw: Math.round((score.get(id)?.total || 0) * 100) / 100 })) : undefined
-  return { deepOrder, plan: ctx.plan, pool: { size: pool.ids.length, query: pool.query, excluded: pool.excluded }, recommended, reference, judged, summary, screenLog }
+  return { deepOrder, preJudged: options.keepScreen ? preJudged : undefined, plan: ctx.plan, pool: { size: pool.ids.length, query: pool.query, excluded: pool.excluded }, recommended, reference, judged, summary, screenLog }
+}
+
+// 評価用: 指定のモデルで精査（判定）だけを行う（モデル比較用）
+export async function _deepForTest(env, db, criteria, profile, plan, ids, { models, effort, costMode } = {}) {
+  const cfg = engineConfig(env, costMode)
+  if (effort) cfg.judgeEffort = effort
+  const ctx = { criteria, cfg, precision: 'high', usage: new Usage(), plan, profileText: profileToText(profile),
+    profileBrief: profile ? profileBrief(profile) : null, models: { deepList: models } }
+  const r = await deepJudge(env, ctx, loadJobs(db, ids, { full: true }), () => {})
+  return { results: r, usage: ctx.usage.summary() }
 }
