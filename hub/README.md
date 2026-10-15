@@ -110,6 +110,34 @@ zcat ~/backups/hub/jobs_hub_YYYY-MM-DD_HHMM.sqlite.gz > data/jobs_hub.sqlite
 node --no-warnings bin/status.js
 ```
 
+## 閲覧画面（取得したデータをブラウザで見る）
+
+```bash
+# 1. hub/.env にログイン用のID・パスワードを設定（パスワード未設定では起動しない）
+cat >> /home/ubuntu/webapp/hub/.env <<'ENV'
+HUB_VIEWER_USER=admin
+HUB_VIEWER_PASSWORD=ここに12文字以上のパスワード
+ENV
+chmod 600 /home/ubuntu/webapp/hub/.env
+
+# 2. 常駐起動（PM2。既存の webapp / worker とは別プロセス）
+cd /home/ubuntu/webapp/hub
+pm2 start bin/server.js --name hub-viewer --interpreter node --interpreter-args="--no-warnings"
+pm2 save
+```
+- URL: `http://<VPSのIP>:3100/`（ポートは `HUB_PORT` で変更）
+- 検索: キーワード・媒体・都道府県・年収・年齢・会社名・雇用形態・成果報酬・掲載状態・並び順
+- 求人をクリックすると詳細（仕事内容・応募条件・変更履歴・媒体の元データ全項目）を表示
+- DBは読み取り専用で開く。同期中も閲覧できる
+- ログインに10回失敗した接続元は15分間締め出す
+- ⚠ 通信は暗号化されていない（http）。段階3で HTTPS 化する
+
+| API（読み取りのみ） | 内容 |
+|---|---|
+| `GET /api/overview` | 媒体別件数・最終同期・都道府県一覧 |
+| `GET /api/jobs?keyword=&source=&prefecture=&salaryMin=&age=&company=&employment=&rewardType=&status=&sort=&limit=&offset=` | 検索 |
+| `GET /api/jobs/:id` | 求人の詳細（元データ・変更履歴を含む） |
+
 ## 既存アプリとの関係
 - 同期中に既存アプリでAI検索が実行中なら、終わるまで待つ（最大30分。circus/ヒトリンクの同時ログイン競合を避けるため）
 - 二重起動は `hub/data/sync.lock` で防止

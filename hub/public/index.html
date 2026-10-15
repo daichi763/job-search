@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="data:,">
+<title>求人データハブ</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  .clamp2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden }
+  pre.raw { white-space:pre-wrap; word-break:break-all; font-size:12px }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+<header class="bg-white border-b sticky top-0 z-10">
+  <div class="max-w-7xl mx-auto px-4 py-3 flex flex-wrap items-center gap-4">
+    <h1 class="text-lg font-bold">求人データハブ <span class="text-xs font-normal text-slate-500">（閲覧専用）</span></h1>
+    <div id="source-summary" class="flex flex-wrap gap-2 text-sm"></div>
+  </div>
+</header>
+
+<main class="max-w-7xl mx-auto px-4 py-4 grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-4">
+  <aside id="filter-panel" class="bg-white rounded-lg border p-4 space-y-3 h-fit lg:sticky lg:top-20">
+    <form id="search-form" class="space-y-3">
+      <label class="block text-sm">キーワード
+        <input name="keyword" id="search-input" class="mt-1 w-full border rounded px-2 py-1.5" placeholder="例: 法人営業 未経験">
+      </label>
+      <label class="block text-sm">媒体
+        <select name="source" class="mt-1 w-full border rounded px-2 py-1.5">
+          <option value="">すべて</option>
+          <option value="circus">circus</option><option value="hitolink">ヒトリンク</option>
+          <option value="jobins">ジョビンズ</option><option value="kintone">kintone（自社）</option>
+        </select>
+      </label>
+      <label class="block text-sm">都道府県
+        <select name="prefecture" id="pref-select" class="mt-1 w-full border rounded px-2 py-1.5"><option value="">すべて</option></select>
+      </label>
+      <div class="grid grid-cols-2 gap-2 text-sm">
+        <label>年収(万円)以上<input name="salaryMinMan" type="number" min="0" class="mt-1 w-full border rounded px-2 py-1.5"></label>
+        <label>年齢<input name="age" type="number" min="15" max="80" class="mt-1 w-full border rounded px-2 py-1.5"></label>
+      </div>
+      <label class="block text-sm">会社名<input name="company" class="mt-1 w-full border rounded px-2 py-1.5"></label>
+      <label class="block text-sm">雇用形態<input name="employment" class="mt-1 w-full border rounded px-2 py-1.5" placeholder="例: 正社員"></label>
+      <div class="grid grid-cols-2 gap-2 text-sm">
+        <label>成果報酬
+          <select name="rewardType" class="mt-1 w-full border rounded px-2 py-1.5">
+            <option value="">すべて</option><option value="rate">料率(%)</option><option value="fixed">固定額</option>
+          </select>
+        </label>
+        <label>掲載状態
+          <select name="status" class="mt-1 w-full border rounded px-2 py-1.5">
+            <option value="">掲載中</option><option value="closed">掲載終了</option><option value="all">すべて</option>
+          </select>
+        </label>
+      </div>
+      <label class="block text-sm">並び順
+        <select name="sort" class="mt-1 w-full border rounded px-2 py-1.5">
+          <option value="updated">最近変更された順</option><option value="new">新しく取り込んだ順</option>
+          <option value="salary_desc">年収の高い順</option><option value="salary_asc">年収の低い順</option>
+        </select>
+      </label>
+      <div class="flex gap-2">
+        <button class="flex-1 bg-blue-600 text-white rounded py-2 hover:bg-blue-700">検索</button>
+        <button type="reset" id="reset-button" class="px-3 border rounded hover:bg-slate-50">クリア</button>
+      </div>
+    </form>
+    <details class="text-sm">
+      <summary class="cursor-pointer text-slate-600">同期の状況</summary>
+      <div id="sync-status" class="mt-2 space-y-2"></div>
+    </details>
+  </aside>
+
+  <section id="results-section">
+    <div class="flex items-center justify-between mb-2 text-sm text-slate-600">
+      <div id="result-count">読み込み中…</div>
+      <div id="pager" class="flex gap-2"></div>
+    </div>
+    <div id="result-list" class="space-y-2"></div>
+    <div id="pager-bottom" class="flex justify-center gap-2 mt-4 text-sm"></div>
+  </section>
+</main>
+
+<dialog id="job-dialog" class="w-full max-w-4xl rounded-lg p-0 backdrop:bg-black/40">
+  <div class="flex justify-between items-center border-b px-5 py-3 sticky top-0 bg-white">
+    <div id="dialog-title" class="font-bold"></div>
+    <button id="dialog-close" class="text-2xl leading-none px-2" aria-label="閉じる">×</button>
+  </div>
+  <div id="dialog-body" class="p-5 space-y-4 text-sm max-h-[80vh] overflow-y-auto"></div>
+</dialog>
+
+<script>
+const LABEL = { circus: 'circus', hitolink: 'ヒトリンク', jobins: 'ジョビンズ', kintone: 'kintone' }
+const COLOR = { circus: 'bg-orange-100 text-orange-800', hitolink: 'bg-green-100 text-green-800', jobins: 'bg-purple-100 text-purple-800', kintone: 'bg-sky-100 text-sky-800' }
+const CHANGE = { added: '追加', updated: '更新', closed: '掲載終了', reopened: '再掲載', deleted: '削除' }
+const PAGE_SIZE = 30
+let offset = 0
+
+const $ = (s) => document.querySelector(s)
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+const man = (y) => (y == null ? '?' : Math.round(y / 10000).toLocaleString())
+const salary = (j) => (j.salary_min == null && j.salary_max == null ? '年収不明' : `${man(j.salary_min)}〜${man(j.salary_max)}万円`)
+const reward = (j) => j.reward_type === 'rate' && j.reward_rate != null ? `報酬 ${j.reward_rate}%` : j.reward_type === 'fixed' && j.reward_amount != null ? `報酬 ${man(j.reward_amount)}万円` : ''
+const jst = (iso) => (iso ? new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) : '-')
+const badge = (s) => `<span class="text-xs px-2 py-0.5 rounded-full ${COLOR[s] || 'bg-slate-100'}">${esc(LABEL[s] || s)}</span>`
+
+async function api(path) {
+  const r = await fetch(path, { credentials: 'same-origin' })
+  if (!r.ok) throw new Error(`${r.status}`)
+  return r.json()
+}
+
+async function loadOverview() {
+  const o = await api('/api/overview')
+  $('#source-summary').innerHTML = o.bySource.map((s) => `${badge(s.source)} <span>${(s.open || 0).toLocaleString()}件</span>`).join('') +
+    `<span class="text-slate-500">合計 ${o.bySource.reduce((a, s) => a + (s.open || 0), 0).toLocaleString()}件</span>`
+  $('#pref-select').innerHTML = '<option value="">すべて</option>' + o.prefectures.map((p) => `<option value="${esc(p.prefecture)}">${esc(p.prefecture)}（${p.n.toLocaleString()}）</option>`).join('')
+  const ch = {}
+  for (const c of o.changes24h) (ch[c.source] ||= []).push(`${CHANGE[c.change_type] || c.change_type} ${c.n.toLocaleString()}`)
+  $('#sync-status').innerHTML = o.lastRuns.map((r) => `
+    <div class="border rounded p-2">
+      <div class="flex justify-between">${badge(r.source)}<span class="${r.status === 'done' ? 'text-green-700' : 'text-amber-700'}">${esc(r.status)}</span></div>
+      <div class="text-xs text-slate-500 mt-1">最終: ${jst(r.finished_at || r.started_at)}</div>
+      <div class="text-xs">取得 ${(r.fetched || 0).toLocaleString()} / 媒体 ${(r.remote_total || 0).toLocaleString()}</div>
+      <div class="text-xs">24時間: ${esc((ch[r.source] || ['変更なし']).join('・'))}</div>
+      ${r.close_note ? `<div class="text-xs text-amber-700 mt-1">${esc(r.close_note)}</div>` : ''}
+    </div>`).join('')
+}
+
+function query() {
+  const f = new FormData($('#search-form'))
+  const q = new URLSearchParams()
+  for (const [k, v] of f) if (v !== '') q.set(k, v)
+  if (q.get('salaryMinMan')) { q.set('salaryMin', String(Number(q.get('salaryMinMan')) * 10000)); q.delete('salaryMinMan') }
+  q.set('limit', PAGE_SIZE); q.set('offset', offset)
+  return q
+}
+
+async function search() {
+  $('#result-count').textContent = '検索中…'
+  const q = query()
+  history.replaceState(null, '', '?' + q.toString())
+  let r
+  try { r = await api('/api/jobs?' + q.toString()) } catch (e) { $('#result-count').textContent = `エラー: ${e.message}`; return }
+  $('#result-count').textContent = `${r.total.toLocaleString()} 件（${r.ms} ms）  ${r.total ? `${offset + 1}〜${Math.min(offset + PAGE_SIZE, r.total)}件目` : ''}`
+  $('#result-list').innerHTML = r.jobs.map((j) => `
+    <article class="job-card bg-white border rounded-lg p-3 hover:border-blue-400 cursor-pointer" data-id="${j.id}">
+      <div class="flex items-start gap-2">
+        ${badge(j.source)}
+        ${j.status === 'closed' ? '<span class="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700">掲載終了</span>' : ''}
+        <h2 class="font-semibold clamp2 flex-1">${esc(j.title || '(タイトルなし)')}</h2>
+      </div>
+      <div class="text-sm text-slate-600 mt-1 flex flex-wrap gap-x-4 gap-y-1">
+        <span>${esc(j.company || '')}</span><span>${esc(j.locations_text || '')}</span>
+        <span class="font-medium text-slate-800">${salary(j)}</span>
+        ${j.age_min || j.age_max ? `<span>${j.age_min ?? ''}〜${j.age_max ?? ''}歳</span>` : ''}
+        ${j.employment ? `<span>${esc(j.employment)}</span>` : ''}
+        ${reward(j) ? `<span class="text-emerald-700">${reward(j)}</span>` : ''}
+      </div>
+      <div class="text-xs text-slate-400 mt-1">${esc(j.job_category || '')}　最終変更 ${jst(j.last_changed_at)}</div>
+    </article>`).join('') || '<div class="text-slate-500 p-6 text-center">該当する求人はありません</div>'
+  const pages = Math.ceil(r.total / PAGE_SIZE), cur = Math.floor(offset / PAGE_SIZE) + 1
+  const btn = (label, o, dis) => `<button class="px-3 py-1 border rounded bg-white ${dis ? 'opacity-40' : 'hover:bg-slate-100'}" ${dis ? 'disabled' : ''} data-offset="${o}">${label}</button>`
+  const html = pages > 1 ? btn('前へ', offset - PAGE_SIZE, cur <= 1) + `<span class="px-2 py-1">${cur} / ${pages.toLocaleString()}</span>` + btn('次へ', offset + PAGE_SIZE, cur >= pages) : ''
+  $('#pager').innerHTML = html; $('#pager-bottom').innerHTML = html
+}
+
+async function openJob(id) {
+  const j = await api('/api/jobs/' + id)
+  $('#dialog-title').innerHTML = `${badge(j.source)} ${esc(j.title || '')}`
+  const row = (k, v) => (v == null || v === '' || (Array.isArray(v) && !v.length) ? '' : `<tr><th class="text-left align-top pr-4 py-1 text-slate-500 whitespace-nowrap font-normal">${k}</th><td class="py-1">${Array.isArray(v) ? esc(v.join('、')) : esc(v)}</td></tr>`)
+  const text = (k, v) => (v ? `<div><div class="font-semibold mb-1">${k}</div><div class="whitespace-pre-wrap bg-slate-50 rounded p-3">${esc(v)}</div></div>` : '')
+  $('#dialog-body').innerHTML = `
+    <table class="w-full">
+      ${row('会社', j.company)}${row('会社URL', j.company_url)}${row('職種', j.job_categories.length ? j.job_categories : j.job_category)}
+      ${row('業種', j.industries.length ? j.industries : j.industry)}${row('雇用形態', j.employment)}
+      ${row('勤務地', j.locations_text)}${row('都道府県', j.prefectures)}${row('想定年収', salary(j))}
+      ${row('応募可能年齢', j.age_min || j.age_max ? `${j.age_min ?? ''}〜${j.age_max ?? ''}歳` : '')}
+      ${row('性別条件', j.gender)}${row('学歴条件', j.education)}${row('経験', j.experience)}${row('ポジション', j.positions)}
+      ${row('残業', j.overtime)}${row('休日', j.holiday)}
+      ${row('成果報酬', [reward(j), j.reward_text].filter(Boolean).join(' / '))}
+      ${row('掲載状態', j.status === 'open' ? '掲載中' : `掲載終了（${jst(j.closed_at)}）`)}
+      ${row('媒体の求人ID', j.source_job_id)}${row('媒体での掲載開始', jst(j.source_published_at))}${row('媒体での最終更新', jst(j.source_updated_at))}
+      ${row('取り込み日時', jst(j.first_seen_at))}${row('内容の最終変更', `${jst(j.last_changed_at)}（版 ${j.version}）`)}
+    </table>
+    ${j.url ? `<a href="${esc(j.url)}" target="_blank" rel="noopener noreferrer" class="inline-block text-blue-600 underline">媒体で求人を開く ↗</a>` : ''}
+    ${text('仕事内容', j.description)}${text('応募条件', j.requirements)}${text('福利厚生・その他', j.benefits)}
+    <div><div class="font-semibold mb-1">変更履歴</div>
+      <ul class="text-xs space-y-1">${j.changes.map((c) => `<li>${jst(c.changed_at)}　${CHANGE[c.change_type] || c.change_type}${c.changed_fields?.length ? `（${esc(c.changed_fields.join('、'))}）` : ''}</li>`).join('') || '<li>なし</li>'}</ul>
+    </div>
+    <details><summary class="cursor-pointer font-semibold">媒体の元データ（すべての項目）</summary>
+      <pre class="raw bg-slate-900 text-slate-100 rounded p-3 mt-2">${esc(JSON.stringify(j.raw, null, 2))}</pre>
+    </details>`
+  $('#job-dialog').showModal()
+}
+
+$('#search-form').addEventListener('submit', (e) => { e.preventDefault(); offset = 0; search() })
+$('#reset-button').addEventListener('click', () => setTimeout(() => { offset = 0; search() }))
+document.addEventListener('click', (e) => {
+  const p = e.target.closest('[data-offset]')
+  if (p && !p.disabled) { offset = Math.max(0, Number(p.dataset.offset)); search(); scrollTo({ top: 0 }) ; return }
+  const c = e.target.closest('.job-card')
+  if (c) openJob(c.dataset.id)
+})
+$('#dialog-close').addEventListener('click', () => $('#job-dialog').close())
+$('#job-dialog').addEventListener('click', (e) => { if (e.target.id === 'job-dialog') e.target.close() })
+
+// URLの条件を復元（ブラウザの再読み込みやURL共有に対応）
+const init = new URLSearchParams(location.search)
+for (const [k, v] of init) {
+  const el = $(`#search-form [name="${k}"]`)
+  if (el) el.value = v
+}
+if (init.get('salaryMin')) $('#search-form [name="salaryMinMan"]').value = Number(init.get('salaryMin')) / 10000
+offset = Number(init.get('offset') || 0)
+loadOverview().then(() => { for (const [k, v] of init) { const el = $(`#search-form [name="${k}"]`); if (el && el.tagName === 'SELECT') el.value = v } search() }).catch((e) => { $('#result-count').textContent = `読み込みエラー: ${e.message}` })
+</script>
+</body>
+</html>
