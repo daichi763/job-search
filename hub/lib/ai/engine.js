@@ -664,7 +664,9 @@ export async function runAiSearch(env, db, criteria, options = {}) {
   // 担当者が手で選んだ求人（directDeep）は全件を賢いモデルで判定する
   if (!directDeep && ((cfg.finalFactor && order.length > finalN) || cfg.comparePre)) {
     progress('deep', `候補 ${order.length}件の求人票を全文で予備判定しています…`)
-    preJudged = await deepJudge(env, ctx, loadJobs(db, order, { full: true }), () => {}, { models: ctx.models.fastList, effort: cfg.preEffort, stage: '精査（予備判定）', label: '予備判定', pre: true })
+    preJudged = await deepJudge(env, ctx, loadJobs(db, order, { full: true }),
+      (d, n) => progress('deep', `予備判定中… ${d.toLocaleString()} / ${n.toLocaleString()}件`, { preJudging: d, preTotal: n }),
+      { models: ctx.models.fastList, effort: cfg.preEffort, stage: '精査（予備判定）', label: '予備判定', pre: true })
     if (!cfg.comparePre && cfg.finalFactor && order.length > finalN) {
       const ranked = [...preJudged].sort((a, b) => (a.eligibility === 'unmet') - (b.eligibility === 'unmet') || b.rawScore - a.rawScore)
       const seen = new Set(), pick = []

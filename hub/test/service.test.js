@@ -46,7 +46,7 @@ const req = (svc, method, path, body, user = admin) => {
   return svc.handle({ method, path: p, query: new URLSearchParams(q), body, user })
 }
 async function waitDone(svc, id) {
-  for (let i = 0; i < 200; i++) {
+  for (let i = 0; i < 400; i++) {
     await svc.tick()
     const r = await req(svc, 'GET', `/searches/${id}`)
     if (['done', 'error', 'cancelled'].includes(r.body.status)) return r.body
@@ -128,4 +128,42 @@ test('順番待ち・開始前の中止・再起動で中断された検索の�
     assert.equal(ws.prepare(`SELECT status FROM ai_searches WHERE id='q2'`).get().status, 'cancelled')
     assert.equal((await req(svc, 'POST', '/searches', { criteria: {} })).status, 400) // 要望も書類もない
   } finally { svc.close() }
+})
+
+
+test('複数の担当者が同時に検索できる（上限までは並行・超えた分は順番待ち）／経過に時間・トークン・母集団が出る', async () => {
+  const f = await fakeOpenAI()
+  // 偽のOpenAIを少し遅くして、同時に走っている状態を作る
+  const orig = f.server.listeners('request')[0]
+  f.server.removeAllListeners('request')
+  let inFlight = 0, maxInFlight = 0
+  f.server.on('request', (rq, rs) => { inFlight++; maxInFlight = Math.max(maxInFlight, inFlight); rs.on('finish', () => inFlight--); setTimeout(() => orig(rq, rs), 30) })
+  const env = { OPENAI_BASE_URL: f.url, OPENAI_API_KEY: 'k', HUB_AI_MODEL_SMART: 'm-smart', HUB_AI_MODEL_FAST: 'm-fast', HUB_AI_FALLBACK_MODELS: 'm-smart', HUB_AI_FALLBACK_FAST_MODELS: 'm-fast', HUB_AI_MAX_PARALLEL: '2', HUB_AI_CONCURRENCY: '1' }
+  const ws = openWorkspace(':memory:')
+  const svc = createService({ env, jobsDb: setupJobs(), ws, log: () => {} })
+  try {
+    const ids = []
+    for (const u of [admin, staff, { id: 3, name: '担当B', role: 'staff' }]) {
+      const r = await req(svc, 'POST', '/searches', { criteria: { freeText: '営業', locations: ['東京都'], topN: 2 } }, u)
+      assert.ok(r.body.ok); ids.push(r.body.id)
+    }
+    await svc.tick()
+    const st = (await req(svc, 'GET', '/status')).body
+    assert.equal(st.maxParallel, 2); assert.equal(st.runningCount, 2); assert.equal(st.queued, 1)  // 2件が同時に実行中・1件が順番待ち
+    const q = (await req(svc, 'GET', `/searches/${ids[2]}`)).body
+    assert.equal(q.status, 'queued'); assert.equal(q.queuePosition, 1); assert.equal(q.runningCount, 2)
+    const results = []
+    for (const id of ids) results.push(await waitDone(svc, id))
+    assert.deepEqual(results.map((r) => r.status), ['done', 'done', 'done'])
+    assert.deepEqual(results.map((r) => r.user_name), ['大森大地', '担当A', '担当B'])  // 誰の検索かが分かる
+    // 経過（詳細）: モデル・確定条件・母集団・各段階に「（N秒・トークン N）」が付く
+    const log = results[0].log.map((l) => l.msg)
+    assert.ok(log.some((m) => m.startsWith('モデル: 理解・最終判定=m-smart / 一次審査・予備判定=m-fast')), log.join('\n'))
+    assert.ok(log.some((m) => m.startsWith('確定条件: {') && m.includes('東京都')))
+    assert.ok(log.some((m) => /^母集団: \d+件（学歴で除外 0 \/ 性別で除外 0）$/.test(m)))
+    assert.ok(log.some((m) => /^探し方を決めました（切り口 1つ）（\d+秒・トークン [\d,]+/.test(m)), log.join('\n'))
+    assert.ok(log.some((m) => /^一次審査が終わりました（有望 \d+件）（\d+秒・トークン [\d,]+/.test(m)))
+    assert.ok(log.some((m) => /^完了: \d+件を提案（\d+秒・トークン [\d,]+/.test(m)))
+    assert.ok(maxInFlight >= 2, `同時に送られた数 ${maxInFlight}`)
+  } finally { svc.close(); f.server.close() }
 })

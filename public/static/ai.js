@@ -242,13 +242,15 @@
     var done = ['done', 'cancelled', 'error'].indexOf(s.status) >= 0
     $('#cancel-button').classList.toggle('hidden', done)
     $('#progress-icon').className = 'fas mr-1 ' + (s.status === 'done' ? 'fa-circle-check text-emerald-600' : s.status === 'error' ? 'fa-triangle-exclamation text-red-600' : s.status === 'cancelled' ? 'fa-ban text-slate-500' : s.status === 'queued' ? 'fa-hourglass-half text-amber-500' : 'fa-spinner fa-spin text-indigo-600')
-    $('#progress-title').textContent = s.status === 'queued' ? '順番待ち（' + (s.queuePosition || '?') + '番目）' : s.status === 'running' ? 'AIが検索しています' : s.status === 'done' ? '検索が終わりました' : s.status === 'cancelled' ? '中止しました' : 'エラーで止まりました'
+    $('#progress-title').textContent = s.status === 'queued' ? '順番待ち（' + (s.queuePosition || '?') + '番目・実行中 ' + (s.runningCount != null ? s.runningCount : '?') + '件）' : s.status === 'running' ? 'AIが検索しています' : s.status === 'done' ? '検索が終わりました' : s.status === 'cancelled' ? '中止しました' : 'エラーで止まりました'
     $('#progress-message').textContent = s.status === 'error' ? (s.error || s.message || '') : (s.message || '')
     var pct = s.status === 'queued' ? 3 : done ? 100 : (STAGE_PCT[s.stage] || 10)
     var m = /(\d[\d,]*)\s*\/\s*(\d[\d,]*)件/.exec(s.message || '')
     if (s.stage === 'screen' && m) pct = 18 + 27 * (Number(m[1].replace(/,/g, '')) / Math.max(1, Number(m[2].replace(/,/g, ''))))
     $('#progress-bar').style.width = Math.min(100, Math.round(pct)) + '%'
-    $('#progress-log').innerHTML = (s.log || []).map(function (l) { return '<li>' + new Date(l.t).toLocaleTimeString('ja-JP') + ' ' + esc(l.msg) + '</li>' }).join('')
+    var logEl = $('#progress-log'), atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 24
+    logEl.innerHTML = (s.log || []).map(function (l) { return '<li>[' + new Date(l.t).toLocaleTimeString('ja-JP', { hour12: false }) + '] ' + esc(l.msg) + '</li>' }).join('')
+    if (atBottom) logEl.scrollTop = logEl.scrollHeight  // 最新の行が見えるように（さかのぼって読んでいるときは動かさない）
   }
   function renderPlan(p) {
     $('#plan-section').classList.remove('hidden')

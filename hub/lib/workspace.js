@@ -246,7 +246,7 @@ export function createSearch(db, { candidateId, user, criteria, options }) {
     .run(id, candidateId ? Number(candidateId) : null, user?.id ?? null, user?.name ?? null, JSON.stringify(criteria), JSON.stringify(options || {}))
   return id
 }
-export function getSearchRaw(db, id) { return db.prepare('SELECT * FROM ai_searches WHERE id=?').get(String(id)) }
+export function getSearchRaw(db, id) { return db.prepare('SELECT rowid AS _rowid, * FROM ai_searches WHERE id=?').get(String(id)) }
 
 export function getSearch(db, id, { withResults = true } = {}) {
   const r = getSearchRaw(db, id)
@@ -257,7 +257,8 @@ export function getSearch(db, id, { withResults = true } = {}) {
     usd: r.usd, error: r.error, created_at: r.created_at, started_at: r.started_at, finished_at: r.finished_at,
   }
   if (r.status === 'queued') {
-    out.queuePosition = db.prepare(`SELECT COUNT(*) AS n FROM ai_searches WHERE status IN ('queued','running') AND created_at <= ? AND id != ?`).get(r.created_at, r.id).n + 1
+    out.queuePosition = db.prepare(`SELECT COUNT(*) AS n FROM ai_searches WHERE status='queued' AND (created_at < ? OR (created_at = ? AND rowid < ?))`).get(r.created_at, r.created_at, r._rowid).n + 1
+    out.runningCount = db.prepare(`SELECT COUNT(*) AS n FROM ai_searches WHERE status='running'`).get().n
   }
   if (withResults && ['done', 'cancelled', 'error'].includes(r.status)) {
     const rows = db.prepare('SELECT kind, rank, job_key, score, data_json FROM ai_results WHERE search_id=? ORDER BY kind, rank').all(r.id)
@@ -279,8 +280,9 @@ export function listSearches(db, { candidateId, userId, limit = 50, offset = 0 }
   return { total, items }
 }
 
-export function nextQueued(db) {
-  return db.prepare(`SELECT id FROM ai_searches WHERE status='queued' ORDER BY created_at, rowid LIMIT 1`).get()?.id || null
+export function nextQueued(db, exclude = []) {
+  const ex = exclude.length ? `AND id NOT IN (${exclude.map(() => '?').join(',')})` : ''
+  return db.prepare(`SELECT id FROM ai_searches WHERE status='queued' ${ex} ORDER BY created_at, rowid LIMIT 1`).get(...exclude)?.id || null
 }
 export function markRunning(db, id) {
   db.prepare(`UPDATE ai_searches SET status='running', started_at=?, message='開始しました' WHERE id=? AND status='queued'`).run(now(), id)

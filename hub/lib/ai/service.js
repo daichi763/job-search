@@ -1,11 +1,13 @@
 // ============================================================
 // AI検索サービス（hub-ai）の中身
 //   ・求職者・書類・紹介済み・AI検索の API（webapp から中継される。担当者は x-hub-user ヘッダで受け取る）
-//   ・AI検索は順番待ち（キュー）で1件ずつ実行する（同時に走らせると費用と負荷が読めなくなるため）
+//   ・AI検索は同時に HUB_AI_MAX_PARALLEL 件（既定3件）まで実行し、それを超えた分は順番待ちにする
+//     （媒体にはログインしないので、複数の担当者が同時に検索しても競合しない。上限は OpenAI の
+//      利用制限とサーバーの負荷に合わせて決める）
 //   ・進捗は作業DBに書き、画面は数秒おきに読みに来る
 //   ・書類（PDF）は受け取ったその場で文字にして個人情報を伏せ、PDFそのものは保存しない
 // ============================================================
-import { runAiSearch } from './engine.js'
+import { runAiSearch, buildPool, criteriaToQuery } from './engine.js'
 import { pdfToText, maskPII, buildProfile, profileToText } from './profile.js'
 import { aiModels, Usage } from './llm.js'
 import * as W from '../workspace.js'
@@ -46,7 +48,8 @@ export function normalizeCriteria(b = {}) {
 export function createService({ env, jobsDb, ws, log = console.log }) {
   const m = aiModels(env)
   const jdb = () => (typeof jobsDb === 'function' ? jobsDb() : jobsDb) // 求人DBは開き直されることがあるので毎回取り出す
-  let running = null // 実行中の検索ID
+  const maxParallel = Math.max(1, Math.min(10, parseInt(env.HUB_AI_MAX_PARALLEL || '3', 10) || 3))
+  const running = new Set() // 実行中の検索ID
 
   // ---------- 経歴の作成（書類が変わったときだけ作り直す） ----------
   async function ensureProfile(candidateId, usage) {
@@ -62,20 +65,28 @@ export function createService({ env, jobsDb, ws, log = console.log }) {
 
   // ---------- 1件の検索を実行 ----------
   async function runOne(id) {
-    running = id
+    running.add(id)
     W.markRunning(ws, id)
     const raw = W.getSearchRaw(ws, id)
     const criteria = JSON.parse(raw.criteria_json)
     const options = JSON.parse(raw.options_json || '{}')
     const logLines = []
-    const push = (msg, stage) => {
-      logLines.push({ t: new Date().toISOString(), msg })
-      if (logLines.length > 60) logLines.shift()
-      W.updateProgress(ws, id, { stage, message: msg, log: logLines })
+    const t0 = Date.now()
+    let lastUsage = { tokens: 0, usd: 0 }
+    // 経過時間・トークン・費用の目安を各行の末尾に付ける（CLI の ai-search.js と同じ書式）
+    const tail = (u = lastUsage) => `（${Math.round((Date.now() - t0) / 1000)}秒・トークン ${(u.tokens || 0).toLocaleString()}${u.usd != null ? `・約${Math.round(u.usd * 150)}円` : ''}）`
+    const push = (msg, stage, { withTail = true } = {}) => {
+      const line = withTail ? `${msg}${tail()}` : msg
+      logLines.push({ t: new Date().toISOString(), msg: line })
+      if (logLines.length > 120) logLines.shift()
+      W.updateProgress(ws, id, { stage, message: line, log: logLines })
     }
     const usage = new Usage()
     try {
       let profile = null
+      const md = aiModels(env)
+      push(`モデル: 理解・最終判定=${options.precision === 'top' ? `${md.smart}（精査は ${md.top}）` : md.smart} / 一次審査・予備判定=${md.fast}（使えない場合は ${md.fallbackSmart.join('→')} / ${md.fallbackFast.join('→')}）`, 'plan', { withTail: false })
+      if (running.size > 1) push(`同時に実行中の検索: ${running.size}件（上限 ${maxParallel}件）`, 'plan', { withTail: false })
       if (raw.candidate_id) {
         // 紹介済みの求人は自動で除外
         const refs = W.referralKeys(ws, raw.candidate_id)
@@ -86,43 +97,63 @@ export function createService({ env, jobsDb, ws, log = console.log }) {
           if (profile) push('経歴をまとめました', 'profile')
         }
       }
-      if (criteria.excludeKeys?.length) push(`紹介済みなど ${criteria.excludeKeys.length}件の求人を除外します`, 'pool')
+      if (criteria.excludeKeys?.length) push(`紹介済みなど ${criteria.excludeKeys.length}件の求人を除外します`, 'pool', { withTail: false })
+      try {
+        const pool = buildPool(jdb(), criteria)
+        push(`確定条件: ${JSON.stringify(criteriaToQuery(criteria))}`, 'pool', { withTail: false })
+        push(`母集団: ${pool.ids.length.toLocaleString()}件（学歴で除外 ${pool.excluded.education.toLocaleString()} / 性別で除外 ${pool.excluded.gender.toLocaleString()}）`, 'pool', { withTail: false })
+      } catch (e) { log(`[hub-ai] ${id} 母集団の事前集計に失敗: ${e.message}`) }
       const result = await runAiSearch(env, jdb(), criteria, {
         profile, costMode: options.costMode, depth: options.depth || 'standard', precision: options.precision === 'top' ? 'top' : 'high',
         isCancelled: () => W.cancelRequested(ws, id),
         onProgress: (p) => {
-          if (p.stage === 'screen' && !/終わり/.test(p.message) && (p.screened || 0) % 500 !== 0) {
-            W.updateProgress(ws, id, { stage: p.stage, message: p.message }); return
-          }
+          if (p.usage) lastUsage = { tokens: p.usage.tokens + (usage.tokens || 0), usd: p.usage.usd == null ? null : p.usage.usd + (usage.usd || 0) }
+          // 一次審査は400件ごと、予備判定は30件ごとに経過へ残す（それ以外は「現在の状況」だけ更新）
+          const quiet = (p.stage === 'screen' && p.screened != null && !/終わり/.test(p.message) && p.screened % 400 !== 0) ||
+                        (p.preJudging != null && p.preJudging % 30 !== 0 && p.preJudging !== p.preTotal)
+          if (quiet) { W.updateProgress(ws, id, { stage: p.stage, message: `${p.message}${tail()}` }); return }
+          if (p.stage === 'done') return // 完了の行は、書類の読み取り費用も合わせて最後に1回だけ出す
           push(p.message, p.stage)
           if (p.plan) W.updateProgress(ws, id, { plan: p.plan })
         },
-        log: (msg) => push(msg),
+        log: (msg) => push(msg, undefined, { withTail: false }),
       })
       const cancelled = W.cancelRequested(ws, id)
       // 書類の読み取りの費用も合算
       const total = (result.summary.usage.usd ?? 0) + (usage.usd ?? 0)
       const summary = { ...result.summary, profileUsd: usage.usd, totalUsd: Math.round(total * 1000) / 1000, hasProfile: !!profile, excluded: criteria.excludeKeys?.length || 0 }
       W.finishSearch(ws, id, { status: cancelled ? 'cancelled' : 'done', result, usd: summary.totalUsd, summary })
-      push(cancelled ? `中止しました（それまでの結果 ${result.recommended.length}件）` : `完了: ${result.recommended.length}件を提案（費用の目安 約${Math.round(total * 150)}円）`, 'done')
+      lastUsage = { tokens: (result.summary.usage.tokens || 0) + (usage.tokens || 0), usd: total }
+      push(cancelled ? `中止しました（それまでの結果 ${result.recommended.length}件）` : `完了: ${result.recommended.length}件を提案`, 'done')
       log(`[hub-ai] ${id} ${cancelled ? 'cancelled' : 'done'} rec=${result.recommended.length} usd=${summary.totalUsd} ${result.summary.elapsedSec}s`)
     } catch (e) {
       log(`[hub-ai] ${id} error: ${e.stack || e.message}`)
       W.finishSearch(ws, id, { status: 'error', error: String(e.message || e).slice(0, 500), usd: usage.usd ?? null, summary: null })
       push(`エラー: ${e.message}`, 'done')
     } finally {
-      running = null
+      running.delete(id)
+      setImmediate(() => tick().catch(() => {}))
     }
   }
 
   // ---------- 順番待ちを1件ずつ処理 ----------
+  //   空きがあれば、順番待ちの古いものから開始する（終わるのは待たない）
   let ticking = false
   async function tick() {
-    if (ticking || running) return
+    if (ticking) return
     ticking = true
     try {
-      for (let id = W.nextQueued(ws); id; id = W.nextQueued(ws)) await runOne(id)
+      while (running.size < maxParallel) {
+        const id = W.nextQueued(ws, [...running])
+        if (!id) break
+        runOne(id).catch((e) => log(`[hub-ai] ${id} runOne: ${e.message}`))
+      }
     } finally { ticking = false }
+  }
+  // テスト用: 実行中の検索がすべて終わるまで待つ
+  async function drain() {
+    await tick()
+    while (running.size) { await new Promise((r) => setTimeout(r, 10)); await tick() }
   }
   const recovered = W.recoverInterrupted(ws)
   if (recovered) log(`[hub-ai] 再起動で中断された検索 ${recovered}件を「中断」にしました`)
@@ -226,10 +257,10 @@ export function createService({ env, jobsDb, ws, log = console.log }) {
     }
     if (path === '/status' && method === 'GET') {
       const q = ws.prepare(`SELECT COUNT(*) AS n FROM ai_searches WHERE status='queued'`).get().n
-      return ok({ running, queued: q, models: { smart: m.smart, fast: m.fast } })
+      return ok({ running: [...running], runningCount: running.size, maxParallel, queued: q, models: { smart: m.smart, fast: m.fast } })
     }
     return bad('not_found', 404)
   }
 
-  return { handle, tick, close: () => clearInterval(timer), get running() { return running } }
+  return { handle, tick, drain, close: () => clearInterval(timer), get running() { return [...running] }, maxParallel }
 }

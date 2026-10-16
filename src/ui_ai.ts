@@ -147,7 +147,7 @@ export function renderAiPage(me: { id: number; name: string; role: string }): st
         </details>
 
         <button id="run-button" type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-semibold rounded-lg py-2.5"><i class="fas fa-wand-magic-sparkles mr-1"></i>AIで検索する</button>
-        <p class="text-[11px] text-slate-400 text-center">1回あたり数分・約70〜80円（標準）。ほかの検索が実行中のときは順番待ちになります。</p>
+        <p class="text-[11px] text-slate-400 text-center">1回あたり数分・約70〜80円（標準）。複数の担当者が同時に検索できます（同時に実行できる数を超えたときだけ順番待ち）。</p>
       </form>
     </section>
 
@@ -160,7 +160,7 @@ export function renderAiPage(me: { id: number; name: string; role: string }): st
         </div>
         <p id="progress-message" class="text-sm mt-2"></p>
         <div class="mt-2 h-1.5 bg-slate-100 rounded overflow-hidden"><div id="progress-bar" class="h-full bg-indigo-500 transition-all" style="width:5%"></div></div>
-        <details class="mt-2"><summary class="text-[11px] text-slate-500">経過を表示</summary><ol id="progress-log" class="mt-1 text-[11px] text-slate-500 space-y-0.5 max-h-40 overflow-y-auto"></ol></details>
+        <details id="progress-details" class="mt-2" open><summary class="text-[11px] text-slate-500 cursor-pointer">経過（詳細）</summary><ol id="progress-log" class="mt-1 text-[11px] leading-relaxed font-mono text-slate-600 bg-slate-50 rounded p-2 space-y-0.5 max-h-72 overflow-y-auto whitespace-pre-wrap break-all"></ol></details>
       </section>
 
       <section id="plan-section" class="hidden bg-indigo-50/60 border border-indigo-100 rounded-xl p-4">
