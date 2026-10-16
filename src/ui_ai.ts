@@ -175,7 +175,19 @@ export function renderAiPage(me: { id: number; name: string; role: string }): st
             <button class="result-tab tab-active pb-1" data-tab="recommended">提案 <span id="recommended-count">0</span></button>
             <button class="result-tab pb-1 text-slate-500" data-tab="reference">参考（要件不足） <span id="reference-count">0</span></button>
           </div>
-          <p id="result-summary" class="text-[11px] text-slate-500"></p>
+          <div class="flex flex-wrap items-center gap-2">
+            <label class="text-xs text-slate-600"><i class="fas fa-arrow-down-wide-short mr-1"></i>並べ替え
+              <select id="result-sort" class="ml-1 border rounded px-1.5 py-1 text-xs bg-white">
+                <option value="ai">AIのおすすめ順</option>
+                <option value="score">点数の高い順</option>
+                <option value="rewardYen">紹介報酬の高い順（金額の目安）</option>
+                <option value="rewardRate">紹介報酬の割合が高い順</option>
+                <option value="salaryMax">年収の上限が高い順</option>
+                <option value="salaryMin">年収の下限が高い順</option>
+              </select>
+            </label>
+            <p id="result-summary" class="text-[11px] text-slate-500"></p>
+          </div>
         </div>
         <p id="reward-legend" class="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500">紹介報酬:
           <span class="rounded px-1.5 py-0.5 bg-rose-600 text-white font-bold">割合 30%以上</span>

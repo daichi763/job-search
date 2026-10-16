@@ -10,7 +10,7 @@
   var FEATURE_LABEL = { remote: 'リモート可', flex: 'フレックス', side_job: '副業可', no_transfer: '転勤なし', holidays_120: '年休120日+', weekend_off: '土日祝休み', inexperienced_ok: '未経験可', short_time: '時短可' }
   var STAGE_PCT = { profile: 8, plan: 12, pool: 18, screen: 45, deep: 80, write: 92, done: 100 }
 
-  var state = { candidate: null, searchId: null, timer: null, result: null, tab: 'recommended', jobKeys: [] }
+  var state = { candidate: null, searchId: null, timer: null, result: null, tab: 'recommended', jobKeys: [], sort: (function () { try { return localStorage.getItem('aiResultSort') || 'ai' } catch (e) { return 'ai' } })(), view: [] }
 
   function api(path, opts) {
     opts = opts || {}
@@ -290,6 +290,44 @@
       renderResults()
     })
   })
+  // 並べ替え。値がない求人は常に最後。同じ値ならAIのおすすめ順
+  function rewardYen(r) {
+    var w = rewardInfo(r); if (!w) return null
+    if (w.kind === 'fixed') return Number(r.reward_amount)
+    if (w.kind === 'rate') { var base = r.salary_max || r.salary_min; var rate = r.reward_rate != null ? Number(r.reward_rate) : parseFloat(w.short); return base ? base * rate / 100 : null }
+    return null
+  }
+  // 割合の高い順 → そのあとに固定額の高い順 → 不明
+  function rewardRate(r) { var w = rewardInfo(r); if (!w) return null; if (w.kind === 'rate') return 1e12 + parseFloat(w.short); if (w.kind === 'fixed') return Number(r.reward_amount); return null }
+  var SORTS = {
+    ai: null,
+    score: function (r) { return r.score },
+    rewardYen: rewardYen,
+    rewardRate: rewardRate,
+    salaryMax: function (r) { return r.salary_max || r.salary_min || null },
+    salaryMin: function (r) { return r.salary_min || r.salary_max || null },
+  }
+  function sortList(list) {
+    var key = SORTS[state.sort]
+    var rows = list.map(function (r, i) { return { r: r, i: i, v: key ? key(r) : null } })
+    if (key) rows.sort(function (a, b) {
+      var av = a.v == null || isNaN(a.v) ? null : a.v, bv = b.v == null || isNaN(b.v) ? null : b.v
+      if (av == null && bv == null) return a.i - b.i
+      if (av == null) return 1
+      if (bv == null) return -1
+      return bv - av || a.i - b.i
+    })
+    return rows.map(function (x) { return x.r })
+  }
+  var sortSel = $('#result-sort')
+  if (sortSel) {
+    if (SORTS.hasOwnProperty(state.sort)) sortSel.value = state.sort; else state.sort = 'ai'
+    sortSel.addEventListener('change', function () {
+      state.sort = sortSel.value
+      try { localStorage.setItem('aiResultSort', state.sort) } catch (e) {}
+      renderResults()
+    })
+  }
   function referred(key) { return !!(state.candidate && state.candidate.referrals.some(function (r) { return r.job_key === key })) }
   function renderResults() {
     var s = state.result; if (!s) return
@@ -298,11 +336,13 @@
     var sm = s.summary || {}
     $('#result-summary').textContent = [jst(s.created_at), s.user_name, sm.poolSize != null ? '母集団 ' + sm.poolSize.toLocaleString() + '件' : '', sm.screened != null ? '一次審査 ' + sm.screened.toLocaleString() : '', sm.elapsedSec != null ? Math.round(sm.elapsedSec / 60 * 10) / 10 + '分' : '', s.usd != null ? yen(s.usd) : ''].filter(Boolean).join(' / ')
     var list = state.tab === 'reference' ? ref : rec
+    state.view = []
     if (!list.length) {
       $('#result-list').innerHTML = '<p class="text-sm text-slate-400">' + (s.status === 'error' ? 'エラーのため結果がありません。条件を見直して、もう一度実行してください。' : state.tab === 'reference' ? '必須要件を満たさないが内容は合う求人はありませんでした。' : '条件に合う求人が見つかりませんでした。条件をゆるめてお試しください。') + '</p>'
       return
     }
-    $('#result-list').innerHTML = list.map(card).join('')
+    state.view = sortList(list)
+    $('#result-list').innerHTML = state.view.map(card).join('')
   }
   function card(r, i) {
     var mark = { met: ['○', 'text-emerald-600'], unmet: ['×', 'text-red-600'], unknown: ['？', 'text-amber-600'] }
@@ -335,7 +375,7 @@
   }
   $('#result-list').addEventListener('click', function (e) {
     var s = state.result; if (!s) return
-    var list = state.tab === 'reference' ? s.reference : s.recommended
+    var list = state.view || []
     var b = e.target.closest('.mark-referral')
     if (b) {
       var r = list[Number(b.getAttribute('data-i'))]; if (!r || !state.candidate) return
