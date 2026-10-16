@@ -712,7 +712,7 @@ export async function runAiSearch(env, db, criteria, options = {}) {
   const uniq = []
   for (const r of judged) {
     const k = dupKey(r.job)
-    if (k && groups.has(k)) { groups.get(k).duplicates.push({ key: `${r.job.source}:${r.job.source_job_id}`, id: r.job.id, score: r.score, reward: r.job.reward_text || null }); continue }
+    if (k && groups.has(k)) { groups.get(k).duplicates.push({ key: `${r.job.source}:${r.job.source_job_id}`, id: r.job.id, score: r.score, reward: r.job.reward_text || null, reward_type: r.job.reward_type || null, reward_rate: r.job.reward_rate ?? null, reward_amount: r.job.reward_amount ?? null }); continue }
     r.duplicates = []
     if (k) groups.set(k, r)
     uniq.push(r)

@@ -177,6 +177,12 @@ export function renderAiPage(me: { id: number; name: string; role: string }): st
           </div>
           <p id="result-summary" class="text-[11px] text-slate-500"></p>
         </div>
+        <p id="reward-legend" class="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500">紹介報酬:
+          <span class="rounded px-1.5 py-0.5 bg-rose-600 text-white font-bold">割合 30%以上</span>
+          <span class="rounded px-1.5 py-0.5 bg-amber-100 text-amber-800 font-semibold">割合 30%未満</span>
+          <span class="rounded px-1.5 py-0.5 bg-teal-100 text-teal-800 font-semibold">固定額</span>
+          <span>（目安は年収の上限 × 割合）</span>
+        </p>
         <div id="result-list" class="mt-3 space-y-3">
           <p class="text-sm text-slate-400">左で条件を入力して「AIで検索する」を押してください。</p>
         </div>

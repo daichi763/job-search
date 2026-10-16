@@ -31,6 +31,27 @@
   }
   var man = function (v) { return v ? Math.round(v / 10000) : '?' }
   var jst = function (s) { if (!s) return ''; var d = new Date(String(s).replace(' ', 'T') + (/Z|\+/.test(s) ? '' : 'Z')); return isNaN(d) ? s : d.toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) }
+  // 紹介報酬（割合・固定）。割合が30%以上は色を変えて目立たせる
+  var REWARD_HIGH_RATE = 30
+  function rewardInfo(r) {
+    var t = r.reward_type, rate = r.reward_rate != null ? Number(r.reward_rate) : null, amt = r.reward_amount != null ? Number(r.reward_amount) : null
+    if (rate == null && t !== 'fixed' && r.reward) { var m = String(r.reward).match(/([\d.]+)\s*[%％]/); if (m) { rate = parseFloat(m[1]); t = 'rate' } }
+    if (t === 'rate' && rate != null) {
+      var base = r.salary_max || r.salary_min
+      var est = base ? Math.round(base * rate / 100 / 10000) : null
+      return { kind: 'rate', high: rate >= REWARD_HIGH_RATE, text: '理論年収の' + rate + '%', sub: est ? '目安 約' + est.toLocaleString() + '万円' : '', short: rate + '%' }
+    }
+    if (t === 'fixed' && amt != null) { var mn = Math.round(amt / 10000 * 10) / 10; return { kind: 'fixed', high: false, text: '一律' + mn.toLocaleString() + '万円', sub: '', short: mn + '万円' } }
+    if (r.reward) return { kind: 'other', high: false, text: String(r.reward).slice(0, 40), sub: '', short: String(r.reward).slice(0, 12) }
+    return null
+  }
+  function rewardBadge(r) {
+    var w = rewardInfo(r)
+    if (!w) return '<span class="reward-badge rounded px-1.5 py-0.5 bg-slate-50 text-slate-400"><i class="fas fa-hand-holding-dollar mr-1"></i>紹介報酬 不明</span>'
+    var cls = w.high ? 'bg-rose-600 text-white font-bold' : w.kind === 'rate' ? 'bg-amber-100 text-amber-800 font-semibold' : w.kind === 'fixed' ? 'bg-teal-100 text-teal-800 font-semibold' : 'bg-slate-100 text-slate-700'
+    var tip = w.kind === 'rate' ? (w.sub ? '目安は年収の上限で計算した金額です' : '') + (w.high ? '（' + REWARD_HIGH_RATE + '%以上）' : '') : ''
+    return '<span class="reward-badge rounded px-1.5 py-0.5 ' + cls + '"' + (tip ? ' title="' + esc(tip) + '"' : '') + '><i class="fas fa-hand-holding-dollar mr-1"></i>紹介報酬 ' + esc(w.text) + (w.sub ? ' <span class="font-normal opacity-80">（' + esc(w.sub) + '）</span>' : '') + '</span>'
+  }
   var yen = function (usd) { return usd == null ? '' : '約' + Math.round(usd * 150) + '円' }
   var setUrl = function () {
     var p = new URLSearchParams()
@@ -295,10 +316,11 @@
         '<div class="min-w-0 flex-1">' +
           '<div class="flex flex-wrap items-center gap-1 text-[10px]">' + (r.angle ? '<span class="rounded px-1.5 py-0.5 ' + angleColor + '">' + esc(r.angle) + (r.angleLabel ? '：' + esc(r.angleLabel) : '') + '</span>' : '') +
             '<span class="rounded px-1.5 py-0.5 bg-slate-100">' + esc(SOURCE_LABEL[r.source] || r.source) + (r.vacancy_no ? ' ' + esc(r.vacancy_no) : '') + '</span>' +
-            (r.duplicates && r.duplicates.length ? '<span class="rounded px-1.5 py-0.5 bg-slate-100" title="同じ求人がほかの媒体にもあります">ほか' + r.duplicates.map(function (d) { return esc(SOURCE_LABEL[d.key.split(':')[0]] || d.key) }).join('・') + '</span>' : '') +
+            (r.duplicates && r.duplicates.length ? '<span class="rounded px-1.5 py-0.5 bg-slate-100" title="同じ求人がほかの媒体にもあります">ほか' + r.duplicates.map(function (d) { var w = rewardInfo(d); return esc(SOURCE_LABEL[d.key.split(':')[0]] || d.key) + (w ? '<b class="' + (w.high ? 'text-rose-600' : '') + '">（' + esc(w.short) + '）</b>' : '') }).join('・') + '</span>' : '') +
             (isRef ? '<span class="rounded px-1.5 py-0.5 bg-slate-700 text-white">紹介済み</span>' : '') + '</div>' +
           '<h3 class="font-bold leading-snug mt-1">' + (r.url ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" class="hover:underline">' + esc(r.title) + ' <i class="fas fa-arrow-up-right-from-square text-[10px] text-slate-400"></i></a>' : esc(r.title)) + '</h3>' +
           '<p class="text-xs text-slate-600 mt-0.5">' + esc(r.company || '') + ' / ' + esc((r.locations || '').slice(0, 40)) + ' / 年収 ' + man(r.salary_min) + '〜' + man(r.salary_max) + '万' + (r.employment ? ' / ' + esc(r.employment) : '') + '</p>' +
+          '<p class="mt-1 text-xs">' + rewardBadge(r) + '</p>' +
           (r.features && r.features.length ? '<p class="mt-1 flex flex-wrap gap-1">' + r.features.map(function (f) { return '<span class="text-[10px] bg-sky-50 text-sky-700 rounded px-1.5">' + esc(FEATURE_LABEL[f] || f) + '</span>' }).join('') + '</p>' : '') +
           '<p class="text-sm mt-2 leading-relaxed">' + esc(r.reason || r.fit) + '</p>' +
           (r.must && r.must.length ? '<ul class="mt-2 text-xs space-y-0.5">' + r.must.map(function (m) { var k = mark[m.status] || mark.unknown; return '<li><b class="' + k[1] + '">' + k[0] + '</b> ' + esc(m.req) + (m.evidence ? ' <span class="text-slate-400">… ' + esc(m.evidence) + '</span>' : '') + '</li>' }).join('') + '</ul>' : '') +

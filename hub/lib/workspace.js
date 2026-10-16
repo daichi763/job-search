@@ -313,6 +313,7 @@ export function slimResult(r) {
     key: `${job.source}:${job.source_job_id}`, job_id: job.id, source: job.source, source_job_id: job.source_job_id, vacancy_no: job.vacancy_no || null,
     title: job.title, company: job.company, locations: job.locations_text, salary_min: job.salary_min, salary_max: job.salary_max,
     employment: job.employment, category: job.job_category, url: job.url, reward: job.reward_text || null,
+    reward_type: job.reward_type || null, reward_rate: job.reward_rate ?? null, reward_amount: job.reward_amount ?? null,
     features: job.features || [],
     score: r.score, rawScore: r.rawScore, capped: r.capped, eligibility: r.eligibility, angle: r.angle, angleLabel: r.angleLabel || null,
     must: r.must || [], fit: r.fit || '', reason: r.reason || '', concerns: r.concerns || [], checkPoints: r.checkPoints || [],

@@ -12,8 +12,8 @@ function setupJobs() {
   const db = openDb(':memory:')
   const s = new SyncSession(db, { source: 'hitolink', runId: 1, cfg: { closeAfterMisses: 1, maxCloseRatio: 1 } })
   const jobs = [
-    { sourceJobId: '1', title: '法人営業（IT商材）', company: 'A社', jobCategory: '営業', employment: '正社員', locations: ['東京都港区'], description: 'SaaSの提案営業', requirements: '法人営業経験3年以上', salaryMin: 5000000, salaryMax: 7000000 },
-    { sourceJobId: '2', title: 'カスタマーサクセス', company: 'B社', jobCategory: 'カスタマーサクセス', employment: '正社員', locations: ['東京都渋谷区'], description: '既存顧客の活用支援', requirements: '社会人経験2年以上', salaryMin: 4500000 },
+    { sourceJobId: '1', title: '法人営業（IT商材）', company: 'A社', jobCategory: '営業', employment: '正社員', locations: ['東京都港区'], description: 'SaaSの提案営業', requirements: '法人営業経験3年以上', salaryMin: 5000000, salaryMax: 7000000, reward: { type: 'rate', rate: 35, text: '理論年収の35%' } },
+    { sourceJobId: '2', title: 'カスタマーサクセス', company: 'B社', jobCategory: 'カスタマーサクセス', employment: '正社員', locations: ['東京都渋谷区'], description: '既存顧客の活用支援', requirements: '社会人経験2年以上', salaryMin: 4500000, reward: { type: 'fixed', amount: 600000 } },
     { sourceJobId: '3', title: '営業企画', company: 'C社', jobCategory: '企画', employment: '正社員', locations: ['東京都'], description: '営業戦略の立案', requirements: '営業経験', salaryMin: 5500000 },
   ]
   s.ingest(jobs.map((m) => ({ mapped: m, raw: {} })))
@@ -173,4 +173,26 @@ test('予備判定の同時送信数は HUB_AI_PRE_CONCURRENCY（既定8）', as
   assert.equal(engineConfig({}).preConcurrency, 8)
   assert.equal(engineConfig({ HUB_AI_PRE_CONCURRENCY: '12' }).preConcurrency, 12)
   assert.equal(engineConfig({ HUB_AI_PRE_CONCURRENCY: '999' }).preConcurrency, 32)
+})
+
+test('検索結果に紹介報酬（割合・固定）が入る／以前の結果には求人DBから補う', async () => {
+  const f = await fakeOpenAI()
+  const env = { OPENAI_BASE_URL: f.url, OPENAI_API_KEY: 'k', HUB_AI_MODEL_SMART: 'm-smart', HUB_AI_MODEL_FAST: 'm-fast', HUB_AI_FALLBACK_MODELS: 'm-smart', HUB_AI_FALLBACK_FAST_MODELS: 'm-fast' }
+  const ws = openWorkspace(':memory:')
+  const svc = createService({ env, jobsDb: setupJobs(), ws, log: () => {} })
+  try {
+    const r = await req(svc, 'POST', '/searches', { criteria: { freeText: '営業', locations: ['東京都'], topN: 5 } })
+    const s = await waitDone(svc, r.body.id)
+    assert.equal(s.status, 'done', s.error)
+    const all = [...s.recommended, ...s.reference]
+    const a = all.find((x) => x.source_job_id === '1'), b = all.find((x) => x.source_job_id === '2')
+    assert.ok(a && b, JSON.stringify(all.map((x) => x.source_job_id)))
+    assert.equal(a.reward_type, 'rate'); assert.equal(a.reward_rate, 35)
+    assert.equal(b.reward_type, 'fixed'); assert.equal(b.reward_amount, 600000)
+    // 以前の形式（reward_type なし）で保存された結果
+    ws.prepare('UPDATE ai_results SET data_json=? WHERE search_id=? AND job_key=?').run(JSON.stringify({ key: 'hitolink:1', source: 'hitolink', source_job_id: '1', title: 'x', score: 90 }), r.body.id, 'hitolink:1')
+    const s2 = (await req(svc, 'GET', `/searches/${r.body.id}`)).body
+    const a2 = [...s2.recommended, ...s2.reference].find((x) => x.source_job_id === '1')
+    assert.equal(a2.reward_type, 'rate'); assert.equal(a2.reward_rate, 35); assert.equal(a2.reward, '理論年収の35%')
+  } finally { svc.close(); f.server.close() }
 })

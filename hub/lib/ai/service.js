@@ -250,6 +250,7 @@ export function createService({ env, jobsDb, ws, log = console.log }) {
     }
     if ((mm = path.match(/^\/searches\/([\w-]+)$/)) && method === 'GET') {
       const s = W.getSearch(ws, mm[1], { withResults: query.get('results') !== '0' })
+      if (s) addRewards(s)
       return s ? ok(s) : bad('検索が見つかりません', 404)
     }
     if ((mm = path.match(/^\/searches\/([\w-]+)\/cancel$/)) && method === 'POST') {
@@ -260,6 +261,20 @@ export function createService({ env, jobsDb, ws, log = console.log }) {
       return ok({ running: [...running], runningCount: running.size, maxParallel, queued: q, models: { smart: m.smart, fast: m.fast } })
     }
     return bad('not_found', 404)
+  }
+
+  // 紹介報酬を保存していない以前の検索結果には、求人DBから補う（掲載終了で消えた求人は補えない）
+  function addRewards(s) {
+    const need = [...(s.recommended || []), ...(s.reference || [])].filter((r) => r.reward_type === undefined && r.source && r.source_job_id)
+    if (!need.length) return
+    let st
+    try { st = jdb().prepare('SELECT reward_type, reward_rate, reward_amount, reward_text FROM jobs WHERE source=? AND source_job_id=?') } catch { return }
+    for (const r of need) {
+      const j = st.get(r.source, String(r.source_job_id))
+      if (!j) continue
+      r.reward_type = j.reward_type || null; r.reward_rate = j.reward_rate ?? null; r.reward_amount = j.reward_amount ?? null
+      if (!r.reward) r.reward = j.reward_text || null
+    }
   }
 
   return { handle, tick, drain, close: () => clearInterval(timer), get running() { return [...running] }, maxParallel }
