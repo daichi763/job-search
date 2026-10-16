@@ -60,7 +60,7 @@ export function renderUsersPage(me: { id: number; name: string; role: string }):
       <div class="overflow-x-auto">
         <table id="user-table" class="w-full text-sm">
           <thead class="text-left text-slate-500 border-b">
-            <tr><th class="py-2 pr-3">名前</th><th class="pr-3">メールアドレス（ログインID）</th><th class="pr-3">権限</th><th class="pr-3">状態</th><th class="pr-3">最終ログイン</th><th></th></tr>
+            <tr><th class="py-2 pr-3">名前</th><th class="pr-3">メールアドレス（ログインID）</th><th class="pr-3">権限</th><th class="pr-3">状態</th><th class="pr-3">最終ログイン（日本時間）</th><th></th></tr>
           </thead>
           <tbody id="user-rows"><tr><td colspan="6" class="py-4 text-slate-400">読み込み中…</td></tr></tbody>
         </table>

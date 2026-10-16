@@ -53,7 +53,14 @@
   if (rows) {
     var me = Number(document.body.getAttribute('data-me'))
     var dlg = $('#user-dialog'), form = $('#user-form'), users = []
-    var fmt = function (s) { return s ? String(s).replace('T', ' ').slice(0, 16) : '—' }
+    // DBの時刻は世界標準時（UTC）。日本時間に直して秒まで表示する
+    var fmt = function (s) {
+      if (!s) return '—'
+      var d = new Date(String(s).replace(' ', 'T') + (/[zZ]|[+-]\d\d:?\d\d$/.test(s) ? '' : 'Z'))
+      if (isNaN(d)) return esc(s)
+      var j = new Date(d.getTime() + 9 * 3600 * 1000), p = function (n) { return String(n).padStart(2, '0') }
+      return j.getUTCFullYear() + '-' + p(j.getUTCMonth() + 1) + '-' + p(j.getUTCDate()) + ' ' + p(j.getUTCHours()) + ':' + p(j.getUTCMinutes()) + ':' + p(j.getUTCSeconds())
+    }
     function load() {
       api('/api/admin/users').then(function (d) {
         users = d.users || []

@@ -51,6 +51,7 @@ export function engineConfig(env = {}, mode) {
     minScore: int(env.HUB_AI_MIN_SCORE, 60),               // 提案する最低点
     finalFactor: env.HUB_AI_FINAL_FACTOR === '0' ? null : env.HUB_AI_FINAL_FACTOR ? Number(env.HUB_AI_FINAL_FACTOR) : cm.finalFactor,
     preEffort: env.HUB_AI_PRE_EFFORT || 'high',            // 予備判定（fast）の推論の深さ
+    preConcurrency: Math.min(32, Math.max(1, int(env.HUB_AI_PRE_CONCURRENCY, 8))), // 予備判定の同時送信数（精度には影響しない）
     earlyStop: env.HUB_AI_EARLY_STOP === '0' ? null : cm.earlyStop, // 精査の途中終了（HUB_AI_EARLY_STOP=0 で無効）
     maxUsd: env.HUB_AI_MAX_USD ? Number(env.HUB_AI_MAX_USD) : null, // 1回の検索の費用上限（米ドル。超えたら精査を打ち切る）
   }
@@ -493,7 +494,8 @@ async function deepJudge(env, ctx, jobs, onBatch, opt = {}) {
   for (let i = 0; i < jobs.length; i += cfg.deepBatch) batches.push(jobs.slice(i, i + cfg.deepBatch))
   const results = []
   let done = 0
-  await mapLimit(batches, Math.max(2, Math.ceil(cfg.concurrency / 2)), async (batch) => {
+  const limit = opt.pre ? cfg.preConcurrency : Math.max(2, Math.ceil(cfg.concurrency / 2))
+  await mapLimit(batches, limit, async (batch) => {
     if (ctx.isCancelled?.()) return
     const body = batch.map((j, i) => `===== 求人[${i}] =====\n${jobFull(j, cfg.descChars)}`).join('\n\n')
     let arr = []

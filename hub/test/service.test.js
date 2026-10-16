@@ -167,3 +167,10 @@ test('複数の担当者が同時に検索できる（上限までは並行・�
     assert.ok(maxInFlight >= 2, `同時に送られた数 ${maxInFlight}`)
   } finally { svc.close(); f.server.close() }
 })
+
+test('予備判定の同時送信数は HUB_AI_PRE_CONCURRENCY（既定8）', async () => {
+  const { engineConfig } = await import('../lib/ai/engine.js')
+  assert.equal(engineConfig({}).preConcurrency, 8)
+  assert.equal(engineConfig({ HUB_AI_PRE_CONCURRENCY: '12' }).preConcurrency, 12)
+  assert.equal(engineConfig({ HUB_AI_PRE_CONCURRENCY: '999' }).preConcurrency, 32)
+})

@@ -46,6 +46,7 @@ HUB_AI_CAP_UNMET=55           # 必須要件を満たさない求人の上限点
 HUB_AI_CAP_UNKNOWN=84         # 必須要件を確認できない求人の上限点
 HUB_AI_MIN_SCORE=60           # 提案する最低点
 HUB_AI_CONCURRENCY=8          # 1件の検索の中で、OpenAI に同時に送る数
+HUB_AI_PRE_CONCURRENCY=8      # 予備判定（精査の1段目）で同時に送る数。上げると速くなる（精度は変わらない）。利用制限に当たっても自動で待ってやり直す
 HUB_AI_MAX_PARALLEL=3         # 同時に実行できるAI検索の数（超えた分は順番待ち）
 ```
 

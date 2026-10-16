@@ -23,6 +23,7 @@ function d1(sql) {
   const out = execFileSync('npx', ['wrangler', 'd1', 'execute', 'webapp-production', where, '--json', '--command', sql], { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
   return JSON.parse(out)[0]?.results || []
 }
+const jst = (s) => s ? new Date(new Date(String(s).replace(' ', 'T') + 'Z').getTime() + 9 * 3600e3).toISOString().slice(0, 19).replace('T', ' ') + '（日本時間）' : '—'
 const q = (s) => `'${String(s).replace(/'/g, "''")}'`
 
 async function hashPassword(pw) {
@@ -51,7 +52,7 @@ async function askPassword() {
 async function main() {
   const email = String(opt.email || '').trim().toLowerCase()
   if (cmd === 'list') {
-    for (const u of d1('SELECT id, login_id, name, role, active, last_login_at FROM users ORDER BY id')) console.log(`${u.id}\t${u.role === 'admin' ? '管理者' : '担当者'}\t${u.active ? '有効' : '無効'}\t${u.name}\t${u.login_id}\t最終ログイン ${u.last_login_at || '—'}`)
+    for (const u of d1('SELECT id, login_id, name, role, active, last_login_at FROM users ORDER BY id')) console.log(`${u.id}\t${u.role === 'admin' ? '管理者' : '担当者'}\t${u.active ? '有効' : '無効'}\t${u.name}\t${u.login_id}\t最終ログイン ${jst(u.last_login_at)}`)
     return
   }
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('--email=メールアドレス を指定してください')
